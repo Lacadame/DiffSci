@@ -1,0 +1,21 @@
+FROM python:3.11
+
+WORKDIR '/'
+
+COPY porenet /porenet
+
+COPY tests /tests
+
+COPY requirements.txt /requirements.txt
+
+COPY setup.py /setup.py
+
+COPY saveddata /saveddata
+
+COPY savedmodels /savedmodels
+
+COPY notebooks /notebooks
+
+RUN pip install --no-cache-dir -r requirements.txt
+
+# CMD ["python", "scripts/20231211-test-run.py"]

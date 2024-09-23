@@ -1,0 +1,12 @@
+diffusers
+einops
+jaxtyping
+lightning
+matplotlib
+numpy
+safetensors
+scipy
+setuptools
+torch
+torchvision
+tqdm
