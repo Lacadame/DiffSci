@@ -12,7 +12,7 @@ from diffsci.utils import get_minibatch_sizes
 from . import preconditioners
 from . import noisesamplers
 from . import schedulers
-from diffsci.metrics import SinkhornLoss  # TODO: Put it in standard pattern 
+# from diffsci.metrics import SinkhornLoss  # TODO: Put it in standard pattern 
 from . import edmbatchnorm
 from . import integrators
 

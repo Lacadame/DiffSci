@@ -315,6 +315,11 @@ class PUNetG(torch.nn.Module):
         x = self.convout(x)
         return x
 
+    def set_conditional_embedding(
+            self,
+            conditional_embedding: torch.nn.Module | None = None):
+        self.conditional_embedding = conditional_embedding
+
 
 class PUNetGCond(PUNetG):
     def __init__(self,
