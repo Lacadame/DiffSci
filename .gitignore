@@ -119,3 +119,6 @@ notebooks/exploratory/**/*.ipynb
 *.ckpt
 *-ubyte
 *-ubyte.gz
+
+# Repopack output
+repopack-output.txt
