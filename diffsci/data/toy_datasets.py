@@ -4,8 +4,8 @@ import torch
 from torch import Tensor
 from jaxtyping import Shaped, Float
 
-from porenet.torchutils import broadcast_from_below
-from porenet.global_constants import SUM_STABILIZER
+from diffsci.torchutils import broadcast_from_below
+from diffsci.global_constants import SUM_STABILIZER
 
 
 class AnalyticalDataset(torch.utils.data.Dataset):

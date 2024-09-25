@@ -4,7 +4,7 @@ import torch
 from torch import Tensor
 from jaxtyping import Float
 
-from porenet.models import KarrasModule, KarrasModuleConfig
+from diffsci.models import KarrasModule, KarrasModuleConfig
 
 
 # TODO: Make conditional encoding here. I'll assume that the encoding is

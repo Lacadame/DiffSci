@@ -27,9 +27,9 @@ Project Organization
     |   ├── tutorials      <- Tutorials for understanding the usage.
     |   
     |
-    ├── porenet            <- Source code for use in this project.
+    ├── diffsci            <- Source code for use in this project.
     |   |
-    │   ├── __init__.py    <- Makes porenet a Python module
+    │   ├── __init__.py    <- Makes diffsci a Python module
     |   |
     |   ├── global_constants.py   <- All the global constants used in the project
     │   │

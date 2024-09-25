@@ -2,7 +2,7 @@ import warnings
 
 import torch
 
-from porenet.torchutils import broadcast_from_below
+from diffsci.torchutils import broadcast_from_below
 
 
 class PFSampler(object):

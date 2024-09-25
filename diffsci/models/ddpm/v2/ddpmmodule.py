@@ -3,8 +3,8 @@ import lightning
 from torch import Tensor
 from jaxtyping import Float
 
-from porenet.torchutils import broadcast_from_below
-from porenet.utils import get_minibatch_sizes
+from diffsci.torchutils import broadcast_from_below
+from diffsci.utils import get_minibatch_sizes
 from . import schedulers
 from . import integrators
 

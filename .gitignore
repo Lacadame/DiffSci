@@ -96,7 +96,7 @@ outputdata/*
 # output
 output/*
 
-# saved models, but I don't want to ignore anything in porenet/models
+# saved models, but I don't want to ignore anything in diffsci/models
 savedmodels/*
 !savedmodels/.gitkeep
 

@@ -1,9 +1,9 @@
-.. PoreNet documentation master file, created by
+.. SciDiff documentation master file, created by
    sphinx-quickstart.
    You can adapt this file completely to your liking, but it should at least
    contain the root `toctree` directive.
 
-PoreNet documentation!
+SciDiff documentation!
 ==============================================
 
 Contents:

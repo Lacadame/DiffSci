@@ -1,7 +1,7 @@
 import json
 import pathlib
 
-import porenet.models
+import diffsci.models
 
 
 def load_model(config_path, model_identifier,
@@ -38,7 +38,7 @@ def load_model(config_path, model_identifier,
     ConfigClass = eval(model_config['config'])
 
     # Load the model with its configuration
-    module = porenet.models.KarrasModule.load_from_checkpoint(
+    module = diffsci.models.KarrasModule.load_from_checkpoint(
         config_path/model_identifier,  # Adjust the path as needed
         model=ModelClass,
         config=ConfigClass,

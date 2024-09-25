@@ -5,14 +5,14 @@ import lightning
 from torch import Tensor
 from jaxtyping import Float
 
-from porenet.torchutils import (broadcast_from_below,
+from diffsci.torchutils import (broadcast_from_below,
                                 linear_interpolation,
                                 dict_unsqueeze)
-from porenet.utils import get_minibatch_sizes
+from diffsci.utils import get_minibatch_sizes
 from . import preconditioners
 from . import noisesamplers
 from . import schedulers
-from porenet.metrics import SinkhornLoss  # TODO: Put it in standard pattern 
+from diffsci.metrics import SinkhornLoss  # TODO: Put it in standard pattern 
 from . import edmbatchnorm
 from . import integrators
 

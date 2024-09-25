@@ -1,9 +1,9 @@
 import torch
 import lightning
 
-from porenet.torchutils import broadcast_from_below
+from diffsci.torchutils import broadcast_from_below
 
-from porenet.models import EulerMaruyamaSampler
+from diffsci.models import EulerMaruyamaSampler
 
 
 class SDEModule(lightning.LightningModule):
