@@ -638,8 +638,9 @@ class ResnetBlockC(torch.nn.Module):
         ----------
         input_channels : int
             The number of input channels
-        time_embed_dim : int
-            The dimension of the time embedding
+        time_embed_dim : int | None
+            The dimension of the time embedding. If None,
+            then no time embedding is used.
         output_channels : int | None
             The number of output channels. If None,
             then output_channels = input_channels
@@ -671,6 +672,8 @@ class ResnetBlockC(torch.nn.Module):
         self.convolution_type = convolution_type
         self.first_norm = first_norm
         self.second_norm = second_norm
+
+        self.has_time_embed = time_embed_dim is not None
 
         gnorm1_fn, gnorm2_fn = self.get_normalization_functions()
 
@@ -704,14 +707,16 @@ class ResnetBlockC(torch.nn.Module):
             magnitude_preserving = True
         else:
             magnitude_preserving = False
-        self.timeblock = ResnetTimeBlock(
-            time_embed_dim,
-            output_channels,
-            dimension=dimension,
-            magnitude_preserving=magnitude_preserving
-        )
 
-    def forward(self, x, te):
+        if self.has_time_embed:
+            self.timeblock = ResnetTimeBlock(
+                time_embed_dim,
+                output_channels,
+                dimension=dimension,
+                magnitude_preserving=magnitude_preserving
+            )
+
+    def forward(self, x, te=None):
         """
         Parameters
         ----------
@@ -724,9 +729,12 @@ class ResnetBlockC(torch.nn.Module):
         """
         # x : (B, C_in, D, H, W)
         # te : (B, C_embed)
+        if te is None:
+            assert not self.has_time_embed
         y = self.conv1(self.act(self.gnorm1(x)))  # (B, C_out, D, H, W)
-        yt = self.timeblock(te)
-        y = y + yt  # (B, C_out, D, H, W)
+        if self.has_time_embed:
+            yt = self.timeblock(te)
+            y = y + yt  # (B, C_out, D, H, W)
         y = self.conv2(
             self.dropout(self.act((self.gnorm2(y))))
         )  # (B, C_out, D, H, W)

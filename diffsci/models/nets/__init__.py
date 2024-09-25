@@ -14,6 +14,9 @@ from .autoencoders import (AutoencoderKLWrapper,
                            load_autoencoder)
 from .autoencoderldm2d import *
 from .autoencoderldm3d import *
+
+from .punetg_config import PUNetGConfig
+from .punetg_encdec import PUNetGEncoder, PUNetGDecoder
 from .punetg import PUNetG, PUNetGConfig, PUNetGCond
 from .adm import ADM, ADMConfig
 from .embedder import (TwoPointCorrelationEmbedder,

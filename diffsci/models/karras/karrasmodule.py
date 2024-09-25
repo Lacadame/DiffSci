@@ -5,14 +5,14 @@ import lightning
 from torch import Tensor
 from jaxtyping import Float
 
-from diffsci.torchutils import (broadcast_from_below,
+from porenet.torchutils import (broadcast_from_below,
                                 linear_interpolation,
                                 dict_unsqueeze)
-from diffsci.utils import get_minibatch_sizes
+from porenet.utils import get_minibatch_sizes
 from . import preconditioners
 from . import noisesamplers
 from . import schedulers
-from diffsci.metrics import SinkhornLoss  # TODO: Put it in standard pattern 
+from porenet.metrics import SinkhornLoss  # TODO: Put it in standard pattern 
 from . import edmbatchnorm
 from . import integrators
 
@@ -402,7 +402,6 @@ class KarrasModule(lightning.LightningModule):
                         nsteps,
                         record_history,
                         integrator=integrator)
-            result = self.decode(result, y)
             return result
 
     def propagate_white_noise(
@@ -415,12 +414,14 @@ class KarrasModule(lightning.LightningModule):
             integrator: None | str | integrators.Integrator = None
             ) -> Float[Tensor, "..."]:  # TODO: Put the actual shape
         x = x*self.config.noisescheduler.maximum_scale
-        return self.propagate_toward_sample(x,
-                                            y,
-                                            guidance,
-                                            nsteps,
-                                            record_history,
-                                            integrator=integrator)
+        result = self.propagate_toward_sample(x,
+                                              y,
+                                              guidance,
+                                              nsteps,
+                                              record_history,
+                                              integrator=integrator)
+        result = self.decode(result, y)
+        return result
 
     def propagate_toward_sample(
             self,

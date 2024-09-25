@@ -50,7 +50,10 @@ class EDMBatchNorm(torch.nn.Module):
 
     def unnormalize(self, input):
         x = input/self.sigma
-        x = x*torch.sqrt(self.running_var + self.eps) + self.running_mean
+
+        # QUICK FIX: Just for inference running mean not depending on
+        # self.use_running_mean flag. Should be fixed in the future.
+        x = x*torch.sqrt(self._running_var + self.eps) + self._running_mean
         return x
 
     @property

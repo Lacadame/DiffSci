@@ -1,6 +1,6 @@
 import torch
 
-from diffsci.global_constants import SCHEDULER_VARIANCE_STABILIZER
+from porenet.global_constants import SCHEDULER_VARIANCE_STABILIZER
 
 
 class SDEScheduler(torch.nn.Module):

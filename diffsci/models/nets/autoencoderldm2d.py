@@ -11,7 +11,7 @@ import numpy as np
 import importlib
 from einops import rearrange
 
-from diffsci.models.autoencoder import ldmlosses
+from porenet.models.autoencoder import ldmlosses
 
 
 def Normalize(in_channels, num_groups=32):

@@ -1,7 +1,7 @@
 import torch
 import diffusers
 
-import diffsci.models
+import diffnet.models
 
 
 class AutoencoderKLWrapper(torch.nn.Module):
@@ -167,7 +167,7 @@ def load_autoencoder(type: str,
                                           torch_dtype=torch.float32))
         vae_wrapper = AutoencoderTinyWrapper(vae_base_model)
     elif type == 'our_kl':
-        vae_base_model = (diffsci.models.AutoencoderKL(
+        vae_base_model = (diffnet.models.AutoencoderKL(
             in_channels=1,
             out_channels=1,
             ).from_pretrained(path, torch_dtype=torch.float32))

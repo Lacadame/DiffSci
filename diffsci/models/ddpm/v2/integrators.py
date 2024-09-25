@@ -4,7 +4,7 @@ import torch
 from torch import Tensor
 from jaxtyping import Float
 
-from diffsci.torchutils import broadcast_from_below
+from porenet.torchutils import broadcast_from_below
 from . import schedulers
 
 

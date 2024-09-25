@@ -1,7 +1,7 @@
 import torch
 import lightning
 
-from diffsci.torchutils import broadcast_from_below
+from porenet.torchutils import broadcast_from_below
 from . import DDPMSampler
 
 
