@@ -257,8 +257,8 @@ class KarrasModule(lightning.LightningModule):
             self.loss_metric = torch.nn.MSELoss(reduction="none")
         elif self.config.loss_metric == "huber":
             self.loss_metric = torch.nn.HuberLoss(reduction="none")
-        elif self.config.loss_metric == "sinkhorn":
-            self.config.loss_metric = SinkhornLoss()
+        # elif self.config.loss_metric == "sinkhorn":
+            # self.config.loss_metric = SinkhornLoss()
         else:
             raise ValueError(f"loss_type {self.loss_metric} not recognized")
 
@@ -629,6 +629,7 @@ class KarrasModule(lightning.LightningModule):
         sigma = self.config.noisesampler.sample(x.shape[0]).to(x)  # [nbatch]
         loss = self.loss_fn(x, sigma, y, mask)
         self.log("valid_loss", loss, prog_bar=True, sync_dist=True)
+        self.log("val_loss", loss, prog_bar=True, sync_dist=True)  # For compat
         return loss
 
     def configure_optimizers(self):
