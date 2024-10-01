@@ -110,10 +110,7 @@ reports/
 temp/
 
 # Ignore all notebooks in the exploratory directories
-notebooks/exploratory/**/*.ipynb
-
-# Do not ignore notebooks that start with GITSHARE
-!notebooks/exploratory/**/GITSHARE*.ipynb
+notebooks/exploratory/*
 
 # Ignore things that should not ever be there
 *.ckpt
