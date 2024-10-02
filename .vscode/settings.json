@@ -1,9 +1,20 @@
 {
     "editor.rulers": [
-    80
+    120
     ],
 
     "editor.tabSize": 4,
 
-    "editor.detectIndentation": false
+    "editor.detectIndentation": false,
+
+    "flake8.args": [
+        "--max-line-length=120",
+    ],
+
+    "python.linting.pylanceEnabled": false,
+    "python.linting.flake8Enabled": true,
+    "python.analysis.diagnosticSeverityOverrides": {
+        "reportGeneralTypeIssues": "none",
+        "reportOptionalMemberAccess": "none"
+    }
 }

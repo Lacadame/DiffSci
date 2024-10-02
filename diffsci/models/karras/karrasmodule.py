@@ -12,7 +12,6 @@ from diffsci.utils import get_minibatch_sizes
 from . import preconditioners
 from . import noisesamplers
 from . import schedulers
-# from diffsci.metrics import SinkhornLoss  # TODO: Put it in standard pattern 
 from . import edmbatchnorm
 from . import integrators
 
@@ -30,6 +29,7 @@ class KarrasModuleConfig(object):
                  loss_metric: str = "huber",
                  tag: str = "custom",
                  has_edm_batch_norm: bool = False,
+                 dynamic_loss_weight: int | None = None,
                  extra_args: None | dict[str, Any] = None):
         self.preconditioner = preconditioner
         self.noisesampler = noisesampler
@@ -37,6 +37,7 @@ class KarrasModuleConfig(object):
         self.loss_metric = loss_metric
         self.tag = tag
         self.has_edm_batch_norm = has_edm_batch_norm
+        self.dynamic_loss_weight = dynamic_loss_weight
         if extra_args is None:
             self.extra_args = dict()
         else:
@@ -47,7 +48,8 @@ class KarrasModuleConfig(object):
                  sigma_data: float = 0.5,
                  prior_mean: float = -1.2,
                  prior_std: float = 1.2,
-                 has_edm_batch_norm: bool = False):
+                 has_edm_batch_norm: bool = False,
+                 dynamic_loss_weight: int | None = None):
 
         preconditioner = preconditioners.EDMPreconditioner(
                             sigma_data=sigma_data
@@ -69,6 +71,7 @@ class KarrasModuleConfig(object):
                                   loss_metric=loss_metric,
                                   tag=tag,
                                   has_edm_batch_norm=has_edm_batch_norm,
+                                  dynamic_loss_weight=dynamic_loss_weight,
                                   extra_args=extra_args)
 
     @classmethod
@@ -167,6 +170,10 @@ class KarrasModuleConfig(object):
         elif tag == "conditionalSR3":
             return KarrasModuleConfig.conditionalSR3(**extra_args)
 
+    @property
+    def has_dynamic_loss_weight(self):
+        return self.dynamic_loss_weight is not None
+
 
 class KarrasModule(lightning.LightningModule):
     """
@@ -193,6 +200,7 @@ class KarrasModule(lightning.LightningModule):
         self.set_optimizer_and_scheduler()
         self.set_loss_metric()
         self.start_edm_batch_norm()
+        self.start_dynamic_loss_weight()
         self.norm = 1.0    # TODO: find better way to normalize latent space
 
     def export_description(self) -> dict[str, Any]:
@@ -282,10 +290,16 @@ class KarrasModule(lightning.LightningModule):
         broadcasted_sigma = broadcast_from_below(sigma, x)  # [nbatch, *1]
         noise = broadcasted_sigma*torch.randn_like(x)  # [nbatch, *shapex]
         x_noised = x + noise  # [nbatch, *shapex]
-        denoiser = self.get_denoiser(x_noised, sigma, y)  # [nbatch, *shapex]
+        denoiser, cond_noise = self.get_denoiser(x_noised, sigma, y)  # [nbatch, *shapex]
         weight = self.config.noisesampler.loss_weighting(
                     broadcasted_sigma
                 )  # [nbatch, *1]
+        bias = torch.zeros_like(weight)
+        if self.config.has_dynamic_loss_weight:
+            modifier = self.dynamic_loss_weight(cond_noise)  # [nbatch]
+            modifier = broadcast_from_below(modifier, x)  # [nbatch, *1]
+            weight = weight/torch.exp(modifier)
+            bias = bias + modifier
         # Compute the loss
         loss = self.loss_metric(denoiser, x)
 
@@ -294,10 +308,10 @@ class KarrasModule(lightning.LightningModule):
             # We assume that the mask is 1 where the data is absent
             mask = mask.expand_as(loss)
             adjusted_loss = loss * (1 - mask)
-            loss = (weight * adjusted_loss).mean()
+            loss = (weight * adjusted_loss + bias).mean()
         else:
             # Compute mean loss as usual if no mask is provided
-            loss = (weight * loss).mean()
+            loss = (weight * loss + bias).mean()
 
         return loss
 
@@ -307,7 +321,8 @@ class KarrasModule(lightning.LightningModule):
             sigma: Float[Tensor, "batch"],  # noqa: F821
             y: None | Float[Tensor, "batch *yshape"] = None,  # noqa: F821,
             guidance: float = 1.0
-            ) -> Float[Tensor, "batch *shape"]:  # noqa: F821
+            ) -> tuple[Float[Tensor, "batch *shape"],  # noqa: F821
+                       Float[Tensor, "batch"]]:  # noqa: F821
         """
         Parameters
         ---------
@@ -347,7 +362,7 @@ class KarrasModule(lightning.LightningModule):
                                     cond_noise)  # [nbatch, *shape]
         scaled_output = output_scale_factor*base_score  # [nbatch, *shape]
         denoiser = scaled_output + skip_scale_factor*x  # [nbatch, *shape]
-        return denoiser
+        return denoiser, cond_noise
 
     def get_score(
             self,
@@ -356,10 +371,10 @@ class KarrasModule(lightning.LightningModule):
             y: None | Float[Tensor, "batch *yshape"] = None,  # noqa: F821
             guidance: float = 1.0
             ) -> Float[Tensor, "batch *shape"]:  # noqa: F821
-        denoiser = self.get_denoiser(x,
-                                     sigma,
-                                     y,
-                                     guidance)  # [nbatch, *shapex]
+        denoiser, _ = self.get_denoiser(x,
+                                        sigma,
+                                        y,
+                                        guidance)  # [nbatch, *shapex]
         sigma_broadcasted = broadcast_from_below(sigma, x)  # [nbatch, *shapex]
         return (denoiser - x)/(sigma_broadcasted**2)
 
@@ -687,6 +702,39 @@ class KarrasModule(lightning.LightningModule):
             sigma_data = self.config.extra_args.get("sigma_data", 0.5)
             self.edm_batch_norm = edmbatchnorm.EDMBatchNorm(sigma=sigma_data)
 
+    def start_dynamic_loss_weight(self):
+        if self.config.has_dynamic_loss_weight:
+            self.dynamic_loss_weight = DynamicLossWeight(
+                self.config.dynamic_loss_weight
+            )
+        else:
+            self.dynamic_loss_weight = None
+
     @property
     def latent_model(self):
         return self.autoencoder is not None
+
+
+class DynamicLossWeight(torch.nn.Module):
+    def __init__(self, nhidden: int, scale: float = 1.0):
+        super().__init__()
+        self.nhidden = nhidden
+        self.register_buffer(
+            "fourier_weights",
+            torch.randn(nhidden)*scale
+        )  # [nhidden]
+        self.register_buffer(
+            "fourier_bias",
+            torch.rand(nhidden)*scale
+        )  # [nhidden]
+        self.linear = torch.nn.Linear(nhidden, 1)
+
+    def forward(self, x):
+        # x : [batch]
+        # returns : [batch]
+        x = x.unsqueeze(1)  # [batch, 1]
+        h = x*self.fourier_weights + self.fourier_bias  # [batch, nhidden]
+        h = torch.cos(h)  # [batch, nhidden]
+        h = self.linear(h)  # [batch, 1]
+        h = h.squeeze(1)  # [batch]
+        return h
