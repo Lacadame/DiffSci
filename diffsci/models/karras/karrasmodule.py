@@ -301,7 +301,7 @@ class KarrasModule(lightning.LightningModule):
             weight = weight/torch.exp(modifier)
             bias = bias + modifier
         # Compute the loss
-        loss = self.loss_metric(denoiser, x)
+        loss = self.loss_metric(denoiser, x)  # [nbatch]
 
         if mask is not None:
             # Apply the mask if it is provided
