@@ -408,7 +408,8 @@ class KarrasModule(lightning.LightningModule):
         else:
             batched_shape = [nsamples] + list(shape)
             white_noise = torch.randn(*batched_shape).to(self.device)
-            y = dict_to(y, self.device)
+            if y is not None:
+                y = dict_to(y, self.device)
             if self.latent_model:  # TODO: A stupid hack. Should be improved
                 white_noise = self.encode(white_noise, y)
                 white_noise = torch.randn_like(white_noise)
