@@ -7,7 +7,8 @@ from jaxtyping import Float
 
 from diffsci.torchutils import (broadcast_from_below,
                                 linear_interpolation,
-                                dict_unsqueeze)
+                                dict_unsqueeze,
+                                dict_to)
 from diffsci.utils import get_minibatch_sizes
 from . import preconditioners
 from . import noisesamplers
@@ -407,6 +408,7 @@ class KarrasModule(lightning.LightningModule):
         else:
             batched_shape = [nsamples] + list(shape)
             white_noise = torch.randn(*batched_shape).to(self.device)
+            y = dict_to(y, self.device)
             if self.latent_model:  # TODO: A stupid hack. Should be improved
                 white_noise = self.encode(white_noise, y)
                 white_noise = torch.randn_like(white_noise)
