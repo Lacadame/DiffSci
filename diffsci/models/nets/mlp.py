@@ -3,7 +3,8 @@ import torch
 
 class MLPUncond(torch.nn.Module):
     def __init__(self, dim, hidden_dims=[10],
-                 nonlinearity=torch.nn.ReLU()):
+                 nonlinearity=torch.nn.ReLU(),
+                 dropout=0.0):
 
         """
         A MLP with variable number of hidden layers, with no conditioning on y.
@@ -27,6 +28,8 @@ class MLPUncond(torch.nn.Module):
         for hidden_dim in hidden_dims:
             layers.append(torch.nn.Linear(in_dim, hidden_dim))
             layers.append(nonlinearity)
+            if dropout > 0:
+                layers.append(torch.nn.Dropout(dropout))
             in_dim = hidden_dim
         # Add the final output layer and convert to a sequential model
         layers.append(torch.nn.Linear(in_dim, dim))
@@ -58,7 +61,8 @@ class MLPUncond(torch.nn.Module):
 class MLPCond(torch.nn.Module):
 
     def __init__(self, dim, ydim, hidden_dims=[10],
-                 nonlinearity=torch.nn.ReLU()):
+                 nonlinearity=torch.nn.ReLU(),
+                 dropout=0.0):
 
         """
         A MLP with variable number of hidden layers, with conditioning on y.
@@ -85,6 +89,8 @@ class MLPCond(torch.nn.Module):
         for hidden_dim in hidden_dims:
             layers.append(torch.nn.Linear(in_dim, hidden_dim))
             layers.append(nonlinearity)
+            if dropout > 0:
+                layers.append(torch.nn.Dropout(dropout))
             in_dim = hidden_dim
         # Add the final output layer and convert to a sequential model
         layers.append(torch.nn.Linear(in_dim, dim))
