@@ -10,7 +10,8 @@ from .noisesamplers import (NoiseSampler,
                             EDMNoiseSampler,
                             VPNoiseSampler,
                             VENoiseSampler,
-                            BoundNoiseSampler)
+                            BoundNoiseSampler,
+                            NewNoiseSampler)
 from .schedulingfunctions import (SchedulingFunctions,
                                   EDMSchedulingFunctions,
                                   VPSchedulingFunctions,

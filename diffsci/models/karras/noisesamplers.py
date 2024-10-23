@@ -109,7 +109,7 @@ class BoundNoiseSampler(NoiseSampler):
     def loss_weighting(self,
                        sigma: Float[Tensor, '...'],
                        ) -> Float[Tensor, '...']:
-        
+
         # compute new weighting
         rev_t = self.T - sigma    # Only the EDM noise_fn is implemented
         R = self.R
@@ -143,3 +143,35 @@ def integrand(rev_t, inv_C, T, delta=0.5):
 def compute_integral(t_initial, t_final, inv_C, delta=0.5):
     result, error = quad(integrand, t_initial, t_final, args=(inv_C, t_final, delta,))
     return result
+
+
+class NewNoiseSampler(NoiseSampler):
+    def __init__(self,
+                 sigma_data: float = 0.5,
+                 prior_mean: float = -1.2,
+                 prior_std: float = 1.2,
+                 factor: float = 2.0,
+                 max_sigma: float = 80.0):          # TODO: Get this from the module
+        super().__init__()
+        self.register_buffer("sigma_data", torch.tensor(sigma_data))
+        self.register_buffer("prior_mean", torch.tensor(prior_mean))
+        self.register_buffer("prior_std", torch.tensor(prior_std))
+        self.register_buffer("factor", torch.tensor(factor))
+        self.register_buffer("max_sigma", torch.tensor(max_sigma))
+
+    def loss_weighting(self,
+                       sigma: Float[Tensor, '...']
+                       ) -> Float[Tensor, '...']:
+        karras_weight = (sigma**2 + self.sigma_data**2)/((sigma*self.sigma_data)**2)
+        factor = self.factor
+        max_sigma = self.max_sigma
+        weight_factor = factor - (factor-1)/max_sigma * sigma
+        return karras_weight * weight_factor
+
+    def sample(self,
+               shape: list[int]
+               ) -> Float[Tensor, '*shape']:  # noqa: F821
+        white_noise = torch.randn(shape).to(self.prior_mean.device)
+        logsigma = white_noise*self.prior_std + self.prior_mean
+        sigma = torch.exp(logsigma)
+        return sigma
