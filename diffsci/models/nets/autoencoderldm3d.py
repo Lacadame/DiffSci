@@ -711,6 +711,14 @@ class AutoencoderKL(pl.LightningModule):
     #     # return [opt_ae, opt_disc], []
     #     return [opt_ae]       # second entry to keep format
 
+    def configure_optimizers(self):
+        if self.lr_scheduler is not None:
+            lr_scheduler_config = {"scheduler": self.lr_scheduler,
+                                   "interval": self.lr_scheduler_interval}
+            return [self.optimizer], [lr_scheduler_config]
+        else:  # Just fo backward compatibility for some examples
+            return self.optimizer
+
     def set_optimizer_and_scheduler(self,
                                     optimizer=None,
                                     scheduler=None,
