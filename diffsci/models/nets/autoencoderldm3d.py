@@ -666,6 +666,7 @@ class AutoencoderKL(pl.LightningModule):
         inputs = batch
         reconstructions, posterior = self(inputs)
 
+        # TODO: Remove this, it is just to monitor CPU usage
         aeloss, log_dict_ae = self.loss(inputs,
                                         reconstructions,
                                         posterior,
@@ -680,6 +681,7 @@ class AutoencoderKL(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         # inputs = self.get_input(batch, self.image_key)
+
         inputs = batch
         reconstructions, posterior = self(inputs)
 
@@ -694,7 +696,7 @@ class AutoencoderKL(pl.LightningModule):
         # discloss, log_dict_disc = self.loss(inputs, reconstructions, posterior, 1, self.global_step,
         #                                     last_layer=self.get_last_layer(), split="val")
 
-        self.log("val/rec_loss", log_dict_ae["val/rec_loss"])
+        self.log("val_loss", log_dict_ae["val/rec_loss"])
         self.log_dict(log_dict_ae)
         # self.log_dict(log_dict_disc)
         return self.log_dict
