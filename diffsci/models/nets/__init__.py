@@ -20,3 +20,4 @@ from .embedder import (TwoPointCorrelationEmbedder,
                        PorosityEmbedder,
                        CompositeEmbedder)
 from . import commonlayers
+from .vae import VAE, Discriminator
