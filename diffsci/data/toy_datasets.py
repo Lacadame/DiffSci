@@ -71,7 +71,10 @@ class AnalyticalDataset(torch.utils.data.Dataset):
             sigma: Float[Tensor, "batch"],  # noqa: F821
             scale: None | Float[Tensor, "batch"] = None  # noqa: F821
             ) -> Float[Tensor, "batch *shape"]:  # noqa: F821
-        raise NotImplementedError
+        if scale is not None:
+            raise NotImplementedError("Optimal denoiser prediction not implemented with scale")
+        sigma_ = broadcast_from_below(sigma, x)
+        return sigma_**2*self.gradlogprob(x, sigma) + x
 
     def denoiser(self,
                  x: Shaped[Tensor, "num_samples *shape"],  # noqa: F821
@@ -186,13 +189,13 @@ class SinglePointDataset(AnalyticalDataset):
 
         return grad_logp
 
-    def optimal_denoiser_predictor(
-            self,
-            x: Float[Tensor, "batch *shape"],  # noqa: F821
-            sigma: Float[Tensor, "batch"],  # noqa: F821
-            scale: None | Float[Tensor, "batch"] = None  # noqa: F821
-            ) -> Float[Tensor, "batch *shape"]:  # noqa: F821
-        return self.x0.unsqueeze(0).expand(*x.shape)
+    # def optimal_denoiser_predictor(
+    #         self,
+    #         x: Float[Tensor, "batch *shape"],  # noqa: F821
+    #         sigma: Float[Tensor, "batch"],  # noqa: F821
+    #         scale: None | Float[Tensor, "batch"] = None  # noqa: F821
+    #         ) -> Float[Tensor, "batch *shape"]:  # noqa: F821
+    #     return self.x0.unsqueeze(0).expand(*x.shape)
 
 
 class SingleGaussianDataset(AnalyticalDataset):
@@ -362,28 +365,28 @@ class MixtureOfPointsDataset(AnalyticalDataset):
         grad_logp = (wfactors*terms).sum(dim=1)  # [b, *shape]
         return grad_logp
 
-    def optimal_denoiser_predictor(
-            self,
-            x: Float[Tensor, "batch *shape"],  # noqa: F821
-            sigma: Float[Tensor, "batch"],  # noqa: F821
-            scale: None | Float[Tensor, "batch"] = None  # noqa: F821
-            ) -> Float[Tensor, "batch *shape"]:  # noqa: F821
-        x = x.unsqueeze(1)  # [b, 1, *shape]
-        p = self.points.unsqueeze(0)  # [n, *shape]
-        if scale is not None:
-            scale_ = broadcast_from_below(scale, p)  # [batch, 1, *shape]
-            p = p*scale_  # [batch, n, shape]
-        diff = (x - p)  # [b, n, *shape]
-        sumdims = tuple(range(2, diff.dim()))
-        norm2 = torch.sum((diff**2), dim=sumdims)  # [b, n]
-        sigma_ = broadcast_from_below(sigma, norm2)
-        scores = -1/(2*sigma_**2) * norm2  # [b, n]
-        scores = scores + torch.log(self.weights)  # [b, n]
-        #  [b, n]
-        scores = scores - torch.logsumexp(scores, dim=1, keepdim=True)
-        factors = torch.exp(scores)  # [b, n]
-        factors = broadcast_from_below(factors, diff)  # [b, n, *shape]
-        return (factors*p).sum(dim=1)  # [b, *shape]
+    # def optimal_denoiser_predictor(
+    #         self,
+    #         x: Float[Tensor, "batch *shape"],  # noqa: F821
+    #         sigma: Float[Tensor, "batch"],  # noqa: F821
+    #         scale: None | Float[Tensor, "batch"] = None  # noqa: F821
+    #         ) -> Float[Tensor, "batch *shape"]:  # noqa: F821
+    #     x = x.unsqueeze(1)  # [b, 1, *shape]
+    #     p = self.points.unsqueeze(0)  # [n, *shape]
+    #     if scale is not None:
+    #         scale_ = broadcast_from_below(scale, p)  # [batch, 1, *shape]
+    #         p = p*scale_  # [batch, n, shape]
+    #     diff = (x - p)  # [b, n, *shape]
+    #     sumdims = tuple(range(2, diff.dim()))
+    #     norm2 = torch.sum((diff**2), dim=sumdims)  # [b, n]
+    #     sigma_ = broadcast_from_below(sigma, norm2)
+    #     scores = -1/(2*sigma_**2) * norm2  # [b, n]
+    #     scores = scores + torch.log(self.weights)  # [b, n]
+    #     #  [b, n]
+    #     scores = scores - torch.logsumexp(scores, dim=1, keepdim=True)
+    #     factors = torch.exp(scores)  # [b, n]
+    #     factors = broadcast_from_below(factors, diff)  # [b, n, *shape]
+    #     return (factors*p).sum(dim=1)  # [b, *shape]
 
 
 class MixtureOfGaussiansDataset(AnalyticalDataset):
@@ -688,8 +691,5 @@ class MixtureOf1DUniformsDataset(AnalyticalDataset):
             total_gradp += self.weights[i] * gradp
             total_p += self.weights[i] * p
 
-
         grad_logp = total_gradp / (total_p * sigma + epsilon)
         return grad_logp
-    
-    
