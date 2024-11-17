@@ -8,6 +8,73 @@ from .punetg_config import PUNetGConfig
 
 
 class PUNetG(torch.nn.Module):
+    
+    """
+    PUNetG is a UNet-style generative model for probabilistic generation task.
+
+    This model uses a combination of Gaussian Fourier projections for time embeddings,
+    convolutional layers, and both downward and upward UNet blocks for feature extraction
+    and reconstruction. It is designed to handle conditional embeddings for guided generation
+    and includes attention-based blocks at the bottleneck for enhanced modeling capacity.
+
+    Parameters
+    ----------
+    config : PUNetGConfig
+        Configuration object that contains hyperparameters and settings for the model,
+        including the number of model channels, scale of time projection, dropout rates, etc.
+
+    conditional_embedding : torch.nn.Module, optional
+        A module for generating conditional embeddings (e.g., text or class embeddings).
+        If provided, it is used to guide the generative process. Default is None.
+        When using the conditional data must be associated with de key 'y'. Other keys can be used
+        for other tipes of embedding depending on the application.
+
+    Attributes
+    ----------
+    config : PUNetGConfig
+        Stores the configuration object used to initialize the model.
+
+    time_projection : GaussianFourierProjection
+        A layer for projecting time information into the embedding space using Gaussian Fourier projections.
+
+    conditional_embedding : torch.nn.Module or None
+        Optional module for generating conditional embeddings for guided generation.
+
+    convin : torch.nn.Module
+        Initial convolutional layer for processing the input data.
+
+    convout : torch.nn.Module
+        Final convolutional layer for producing the output.
+
+    downward_blocks : torch.nn.ModuleList
+        List of downward UNet blocks for feature extraction.
+
+    downsamplers : torch.nn.ModuleList
+        List of downsampling layers that reduce the spatial dimensions.
+
+    upward_blocks : torch.nn.ModuleList
+        List of upward UNet blocks for feature reconstruction.
+
+    upsamplers : torch.nn.ModuleList
+        List of upsampling layers that increase the spatial dimensions.
+
+    before_block : torch.nn.Module
+        Non-attention block at the bottom of the UNet structure, applied before the attention blocks.
+
+    after_block : torch.nn.Module
+        Non-attention block at the bottom of the UNet structure, applied after the attention blocks.
+
+    attn_resnet_block : torch.nn.Module
+        Residual block with attention mechanism at the bottleneck.
+
+    attn_block : torch.nn.Module
+        Attention block at the bottleneck for enhanced feature extraction.
+
+    cond_dropout : torch.nn.Dropout
+        Dropout layer applied to conditional embeddings to prevent overfitting.
+
+
+    """
     def __init__(self,
                  config: PUNetGConfig,
                  conditional_embedding: torch.nn.Module | None = None):
@@ -42,6 +109,11 @@ class PUNetG(torch.nn.Module):
         return args
 
     def make_downward_blocks(self):
+        """
+
+        Create the donward blocks of the Unet architecture based on the number_resnet_downward_block parameter
+
+        """
         blocks = torch.nn.ModuleList()
         downsamplers = torch.nn.ModuleList()
         number_resnet_per_block = self.config.number_resnet_downward_block
@@ -58,6 +130,12 @@ class PUNetG(torch.nn.Module):
         return blocks, downsamplers
 
     def make_upward_blocks(self):
+
+        """
+
+        Create the upward blocks of the Unet architecture based on the number_resnet_upward_block parameter
+
+        """
         blocks = torch.nn.ModuleList()
         upsamplers = torch.nn.ModuleList()
         number_resnet_per_block = self.config.number_resnet_upward_block
@@ -322,6 +400,75 @@ class PUNetG(torch.nn.Module):
 
 
 class PUNetGCond(PUNetG):
+
+    """
+    PUNetGCond is a UNet-style generative model for conditional probabilistic generation task.
+
+    This model uses a combination of Gaussian Fourier projections for time embeddings,
+    convolutional layers, and both downward and upward UNet blocks for feature extraction
+    and reconstruction. It is designed to handle conditional embeddings for guided generation
+    and includes attention-based blocks at the bottleneck for enhanced modeling capacity.
+
+    Parameters
+    ----------
+    config : PUNetGConfig
+        Configuration object that contains hyperparameters and settings for the model,
+        including the number of model channels, scale of time projection, dropout rates, etc.
+
+    conditional_embedding : torch.nn.Module, optional
+        A module for generating conditional embeddings (e.g., text or class embeddings).
+        If provided, it is used to guide the generative process. Default is None.
+        When using the conditional data must be associated with de key 'y'. Other keys can be used
+        for other tipes of embedding depending on the application.
+
+    Attributes
+    ----------
+    config : PUNetGConfig
+        Stores the configuration object used to initialize the model.
+
+    time_projection : GaussianFourierProjection
+        A layer for projecting time information into the embedding space using Gaussian Fourier projections.
+
+    conditional_embedding : torch.nn.Module or None
+        Optional module for generating conditional embeddings for guided generation.
+
+    convin : torch.nn.Module
+        Initial convolutional layer for processing the input data.
+
+    convout : torch.nn.Module
+        Final convolutional layer for producing the output.
+
+    downward_blocks : torch.nn.ModuleList
+        List of downward UNet blocks for feature extraction.
+
+    downsamplers : torch.nn.ModuleList
+        List of downsampling layers that reduce the spatial dimensions.
+
+    upward_blocks : torch.nn.ModuleList
+        List of upward UNet blocks for feature reconstruction.
+
+    upsamplers : torch.nn.ModuleList
+        List of upsampling layers that increase the spatial dimensions.
+
+    before_block : torch.nn.Module
+        Non-attention block at the bottom of the UNet structure, applied before the attention blocks.
+
+    after_block : torch.nn.Module
+        Non-attention block at the bottom of the UNet structure, applied after the attention blocks.
+
+    attn_resnet_block : torch.nn.Module
+        Residual block with attention mechanism at the bottleneck.
+
+    attn_block : torch.nn.Module
+        Attention block at the bottleneck for enhanced feature extraction.
+
+    cond_dropout : torch.nn.Dropout
+        Dropout layer applied to conditional embeddings to prevent overfitting.
+
+    channel_conditional_items : list[str]
+        The key refering to the conditional information on the dictionary y.
+
+    """
     def __init__(self,
                  config: PUNetGConfig,
                  conditional_embedding: torch.nn.Module | None = None,
