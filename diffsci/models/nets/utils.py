@@ -2,6 +2,7 @@ import math
 
 import torch
 
+
 class GaussianFourierProjection(torch.nn.Module):
     def __init__(self, embed_dim, scale=30.0):
 
