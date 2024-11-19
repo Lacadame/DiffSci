@@ -423,6 +423,37 @@ class MixtureOfGaussiansDataset(AnalyticalDataset):
         noise = self.scale * torch.randn_like(means)
         return means + noise
 
+    def prob(self,
+             x: Float[Tensor, "batch *shape"],  # noqa: F821
+             sigma: Float[Tensor, "batch"]  # noqa: F821
+             ) -> Float[Tensor, "batch"]:  # noqa: F821
+        """
+        Calculate the probability of x.
+        Parameters:
+        ----------
+        x : torch.Tensor of shape (nbatch, *shape).
+        sigma : torch.Tensor of shape (nbatch).
+        Returns:
+        -------
+        prob : torch.Tensor of shape (nbatch,).
+        """
+        sigma_mod = torch.sqrt(sigma**2 + self.scale**2)  # [b]
+        x = x.unsqueeze(1)  # [b, 1, *shape]
+        p = self.means.unsqueeze(0)  # [1, n, *shape]
+        diff = (x - p)  # [b, n, *shape]
+        sumdims = tuple(range(2, diff.dim()))
+        norm2 = torch.sum((diff**2), dim=sumdims)  # [b, n]
+        expfactors = torch.exp(-0.5*norm2/(sigma_mod[:, None]**2))  # [b, n]
+        wfactors = expfactors * self.weights  # [b, n]
+        prob = wfactors.sum(dim=1)  # [b]
+        dims = x.shape[1:]
+        n = 1
+        for dim in dims:
+            n *= dim
+        # print(f'Dimension: {n}')
+        normalizer = 1/(2*math.pi*sigma_mod**2)**(n/2)
+        return prob * normalizer
+
     def gradlogprob(self,
                     x: Float[Tensor, "batch *shape"],  # noqa: F821
                     sigma: Float[Tensor, "batch"]  # noqa: F821
@@ -477,7 +508,7 @@ class DiagonalGaussianDataset(AnalyticalDataset):
                  num_samples: int,
                  x0: Float[Tensor, "*shape"],  # noqa: F821
                  diag_std: Float[Tensor, "*shape"]):    # noqa: F821
-        
+
         self.shape = x0.shape
         self.x0 = x0
         self.std = diag_std
@@ -579,7 +610,7 @@ class Single1DUniformDataset(AnalyticalDataset):
         b = self.b
         normal_dist = Normal(0, 1)
         sigma = broadcast_from_below(sigma, x)
-        
+
         pdf_a = normal_dist.log_prob((x - a) / sigma).exp()
         pdf_b = normal_dist.log_prob((x - b) / sigma).exp()
         phi_a = normal_dist.cdf((x - a) / sigma)
@@ -688,8 +719,5 @@ class MixtureOf1DUniformsDataset(AnalyticalDataset):
             total_gradp += self.weights[i] * gradp
             total_p += self.weights[i] * p
 
-
         grad_logp = total_gradp / (total_p * sigma + epsilon)
         return grad_logp
-    
-    
