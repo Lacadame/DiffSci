@@ -75,8 +75,15 @@ class Scheduler(torch.nn.Module):
                                      nsteps=nsteps)
         else:
             step = integrator.step
+        noise = None
         for i in range(nsteps):
-            x = step(x, t[i], dt[i], rhs, noise_strength=self.noise_injection)
+            if integrator.markovian:
+                x = step(x, t[i], dt[i], rhs, noise_strength=self.noise_injection)
+            else:
+                previous_t = t[i-1] if i > 0 else 0
+                x, noise = step(
+                    x, t[i], dt[i], rhs, noise_strength=self.noise_injection,
+                    previous_noise=noise, previous_t=previous_t)
             if record_history:
                 history[i+1] = x
         if record_history:
@@ -203,8 +210,15 @@ class Scheduler(torch.nn.Module):
                                      nsteps=nsteps)
         else:
             step = integrator.step
+        noise = None
+        time = None
         for i in range(initial_step, final_step):
-            x = step(x, t[i], dt[i], rhs, noise_strength=self.noise_injection)
+            if integrator.markovian:
+                x = step(x, t[i], dt[i], rhs, noise_strength=self.noise_injection)
+            else:
+                x, noise, time = step(
+                    x, t[i], dt[i], rhs, noise_strength=self.noise_injection,
+                    previous_noise=noise, previous_t=time)
             if record_history:
                 history[i+1] = x
         if record_history:
@@ -220,7 +234,7 @@ class Scheduler(torch.nn.Module):
         standard_factor = (self.scheduler_fns.scaling_fn(t)**2 *
                            self.scheduler_fns.noise_fn_deriv(t) /
                            self.scheduler_fns.noise_fn(t))
-        if type=='const':
+        if type == 'const':
             return self.langevin_const * standard_factor + 0*t
         else:
             raise NotImplementedError

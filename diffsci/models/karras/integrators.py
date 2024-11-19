@@ -17,6 +17,7 @@ ScoreFunction = Callable[[Float[Tensor, "batch *shape"],  # noqa: F821
 class Integrator(torch.nn.Module):
     stochastic = False
     need_fns = False
+    markovian = True
 
     def step(self, x: Float[Tensor, "batch *shape"],  # noqa: F821
              t: Float[Tensor, ""],  # noqa: F722
@@ -62,6 +63,38 @@ class EulerMaruyamaIntegrator(Integrator):
                 (noise_strength(t) *
                  torch.randn_like(x) *
                  torch.sqrt(torch.abs(dt))))
+
+
+class LeimkuhlerMatthewsIntegrator(Integrator):
+    # an analog of Euler Maruyama with non-independent Gaussian increments
+    stochastic = True
+    markovian = False
+
+    def __init__(self, interpolation=False) -> None:
+        super().__init__()
+        self.interpolation = interpolation
+
+    def step(self, x: Float[Tensor, "batch *shape"],  # noqa: F821
+             t: Float[Tensor, ""],  # noqa: F722
+             dt: Float[Tensor, ""],  # noqa: F722
+             rhs: ScoreFunction,
+             noise_strength: None | Any = None,     # TODO: Complete this type
+             previous_noise: None | Float[Tensor, "batch *shape"] = None,   # noqa: F821
+             previous_t: Float[Tensor, ""] = None):  # noqa: F722
+
+        assert (noise_strength is not None)
+        noise = torch.randn_like(x)
+        if previous_noise is None:
+            total_noise = noise
+        else:
+            if self.interpolation:
+                total_noise = noise * noise_strength(t) + previous_noise * noise_strength(previous_t)
+                total_noise = total_noise / (noise_strength(t) + noise_strength(previous_t))
+            else:
+                total_noise = (noise + previous_noise) / 2
+        x = (x + rhs(x, t)*dt +
+             (noise_strength(t) * total_noise * torch.sqrt(torch.abs(dt))))
+        return x, noise
 
 
 class KarrasIntegrator(Integrator):
@@ -117,5 +150,7 @@ def name_to_integrator(name: str) -> Integrator:
         return EulerMaruyamaIntegrator()
     elif name == "karras":
         return KarrasIntegrator()
+    elif name == "lm":
+        return LeimkuhlerMatthewsIntegrator()
     else:
         raise ValueError(f"Unknown integrator: {name}")

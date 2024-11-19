@@ -23,7 +23,8 @@ from .integrators import (Integrator,
                           EulerIntegrator,
                           HeunIntegrator,
                           EulerMaruyamaIntegrator,
-                          KarrasIntegrator)
+                          KarrasIntegrator,
+                          LeimkuhlerMatthewsIntegrator)
 from .edmbatchnorm import (EDMBatchNorm)
 from .callbacks import (ScheduleFreeCallback,
                         EDMBatchNormCallback,
