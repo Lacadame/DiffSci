@@ -42,6 +42,7 @@ class Scheduler(torch.nn.Module):
             assert stochastic_integrator.stochastic is True
         self.stochastic_integrator = stochastic_integrator
         self._temporary_integrator = None
+        self.langevin_const = 1.0
 
     def propagate(self,
                   x: Float[Tensor, "batch *shape"],  # noqa: F821
@@ -213,11 +214,16 @@ class Scheduler(torch.nn.Module):
 
     def langevin_factor(self,
                         t: Float[Tensor, "batch"],  # noqa: F821
+                        type: str = 'const',
                         ) -> Float[Tensor, "batch"]:  # noqa: F821
-        # TODO: Only the Song's Langevin factor is implemented
-        return (self.scheduler_fns.scaling_fn(t)**2 *
-                self.scheduler_fns.noise_fn_deriv(t) /
-                self.scheduler_fns.noise_fn(t))
+        # Only multiples of the Song's Langevin factor are implemented
+        standard_factor = (self.scheduler_fns.scaling_fn(t)**2 *
+                           self.scheduler_fns.noise_fn_deriv(t) /
+                           self.scheduler_fns.noise_fn(t))
+        if type=='const':
+            return self.langevin_const * standard_factor + 0*t
+        else:
+            raise NotImplementedError
 
     def noise_injection(self,
                         t: Float[Tensor, "batch"],  # noqa: F821
