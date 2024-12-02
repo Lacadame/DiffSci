@@ -211,14 +211,13 @@ class Scheduler(torch.nn.Module):
         else:
             step = integrator.step
         noise = None
-        time = None
         for i in range(initial_step, final_step):
             if integrator.markovian:
                 x = step(x, t[i], dt[i], rhs, noise_strength=self.noise_injection)
             else:
-                x, noise, time = step(
+                x, noise = step(
                     x, t[i], dt[i], rhs, noise_strength=self.noise_injection,
-                    previous_noise=noise, previous_t=time)
+                    previous_noise=noise, previous_t=t[i-1])
             if record_history:
                 history[i+1] = x
         if record_history:
