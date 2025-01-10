@@ -537,6 +537,39 @@ class KarrasModule(lightning.LightningModule):
             self.config.noisescheduler.unset_temporary_integrator()
         return result
 
+    def propagate_partial_toward_sample(
+            self,
+            x: Float[Tensor, "nsamples *shape"],  # noqa: F821
+            initial_step: int,
+            final_step: int = None,
+            y: None | Float[Tensor, "*yshape"] = None,  # noqa: F821
+            nsteps: int = 100,
+            record_history: bool = False,
+            integrator: None | str | integrators.Integrator = None
+            ) -> Float[Tensor, "nsamples *shape"]:  # noqa: F821
+        # TODO: Add the option of custom integration
+        if y is not None:
+            y = y.unsqueeze(0)  # Broadcasting will take care of the rest
+
+        def rhs(x, sigma):
+            with torch.inference_mode():
+                return self.get_score(x, sigma, y)
+        if final_step is None:
+            final_step = nsteps
+
+        if integrator is not None:
+            self.config.noisescheduler.set_temporary_integrator(integrator)
+        result = self.config.noisescheduler.propagate_partial(
+                                            x,
+                                            rhs,
+                                            nsteps,
+                                            initial_step,
+                                            final_step,
+                                            record_history=record_history)
+        if integrator is not None:
+            self.config.noisescheduler.unset_temporary_integrator()
+        return result
+
     def inpaint(
             self,
             x_orig: Float[Tensor, "nsamples *shape"],  # noqa: F821
