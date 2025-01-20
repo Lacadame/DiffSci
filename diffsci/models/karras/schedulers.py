@@ -383,6 +383,11 @@ class EDMScheduler(Scheduler):
             steps = self.scheduler_fns.inverse_noise_fn(steps)
         return steps
 
+    def step_from_time(self, t: Float[Tensor, "batch"], n: int):  # noqa: F821
+        exp = 1/self.expoent_steps
+        step = (n-1) * (t**(exp) - self.sigma_max**(exp)) / (self.sigma_min**(exp) - self.sigma_max**(exp))
+        return torch.round(step).int()
+
 
 class VPScheduler(Scheduler):
     def __init__(self,
