@@ -43,6 +43,7 @@ class Scheduler(torch.nn.Module):
         self.stochastic_integrator = stochastic_integrator
         self._temporary_integrator = None
         self.langevin_const = 1.0
+        self.langevin_interval = None
 
     def propagate(self,
                   x: Float[Tensor, "batch *shape"],  # noqa: F821
@@ -190,9 +191,9 @@ class Scheduler(torch.nn.Module):
             raise NotImplementedError
         dt = torch.diff(t)
         if record_history:
-            history_shape = [nsteps+1] + list(x.shape)
+            history_shape = [final_step - initial_step + 1] + list(x.shape)
             history = torch.zeros(history_shape).to(x)
-            history[initial_step] = x
+            history[0] = x
         rhs = functools.partial(self.rhs,
                                 score_fn=score_fn,
                                 backward=backward,
@@ -206,7 +207,7 @@ class Scheduler(torch.nn.Module):
         for i in range(initial_step, final_step):
             x = step(x, t[i], dt[i], rhs, noise_strength=self.noise_injection)
             if record_history:
-                history[i+1] = x
+                history[i-initial_step+1] = x
         if record_history:
             return history
         else:
@@ -220,8 +221,18 @@ class Scheduler(torch.nn.Module):
         standard_factor = (self.scheduler_fns.scaling_fn(t)**2 *
                            self.scheduler_fns.noise_fn_deriv(t) /
                            self.scheduler_fns.noise_fn(t))
-        if type=='const':
-            return self.langevin_const * standard_factor + 0*t
+        if type == 'const':
+            if self.langevin_interval is not None:
+                if len(t.shape) > 0:            # TODO: improve this hack
+                    t_ = t[0]
+                else:
+                    t_ = t
+                if t_ > self.langevin_interval[0] and t_ < self.langevin_interval[1]:
+                    return self.langevin_const * standard_factor + 0*t
+                else:
+                    return 0*t
+            else:
+                return self.langevin_const * standard_factor + 0*t
         else:
             raise NotImplementedError
 
