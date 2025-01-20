@@ -681,8 +681,8 @@ class MixtureOf1DUniformsDataset(AnalyticalDataset):
             phi_b = normal_dist.cdf((x - b) / sigma)
             prob_i = 1 / (b - a) * (phi_a - phi_b)
             total_prob += self.weights[i] * prob_i
-        print(total_prob.shape)
 
+        total_prob = total_prob.squeeze(-1)
         return total_prob
 
     def gradlogprob(self,
