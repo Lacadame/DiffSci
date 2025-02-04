@@ -19,60 +19,32 @@ Project Organization
     │
     ├── docs               <- A default Sphinx project; see sphinx-doc.org for details
     │
+    ├── notebooks          <- Jupyter notebooks
+    │   ├── exploratory    <- Notebooks for exploration and experiments
+    │   └── tutorials      <- Tutorial notebooks showing how to use the library
     │
-    ├── notebooks          <- Jupyter notebooks. Naming convention is a number (for ordering),
-    │   |                     the creator's initials, and a short `-` delimited description, e.g.
-    │   |                     `1.0-jqp-initial-data-exploration`.
-    |   ├── exploratory    <- Notebooks just to tinker and train models.
-    |   ├── tutorials      <- Tutorials for understanding the usage.
-    |   
-    |
     ├── diffsci            <- Source code for use in this project.
-    |   |
-    │   ├── __init__.py    <- Makes diffsci a Python module
-    |   |
-    |   ├── global_constants.py   <- All the global constants used in the project
-    │   │
-    │   ├── data           <- Scripts to download or generate data
-    │   │   └── toy_datasets.py
-    │   │
-    │   ├── features       <- Scripts to turn raw data into features for modeling
-    │   │   └── build_features.py
-    │   │
-    │   ├── models         <- Scripts to train models and then use trained models to make
-    │   │   │                 predictions
-    |   |   |
-    │   │   ├── nets      
-    │   │   ├── karras
-    |   |   ├── ddpm
-    |   |   └── trainers
-    │   │
-    │   └── metrics  <- Scripts to metrics for evaluating sampled models
-    │       └── metrics.py   
-    |
-    | 
-    ├── references         <- Data dictionaries, manuals, and all other explanatory materials.
+    │   ├── __init__.py    <- Makes diffsci a Python module
+    │   ├── models         <- Model implementations
+    │   │   ├── karras     <- Karras et al. diffusion models
+    │   │   ├── nets       <- Neural network architectures
+    │   │   └── trainers   <- Training utilities
+    │   └── utils          <- Utility functions
     │
-    ├── reports            <- Generated analysis as HTML, PDF, LaTeX, etc.
-    │   └── figures        <- Generated graphics and figures to be used in reporting
+    ├── tests             <- Unit tests
     │
-    ├── tests              <- Testing folder
-    |
-    ├── requirements.txt   <- The requirements file for reproducing the analysis environment, e.g.
-    │                         generated with `pip freeze > requirements.txt`
+    ├── requirements.txt   <- Project dependencies
     │
-    ├── saveddata
-    │   ├── external       <- Data from third party sources.
-    │   ├── interim        <- Intermediate data that has been transformed.
-    │   ├── processed      <- The final, canonical data sets for modeling.
-    │   └── raw            <- The original, immutable data dump.
-    |
-    ├── savedmodels        <- Trained and serialized models, model predictions, or model summaries
-    |
-    ├── setup.py           <- makes project pip installable (pip install -e .) so src can be imported
+    ├── saveddata         <- Data directory
+    │   ├── external      <- Data from third party sources
+    │   ├── interim       <- Intermediate data
+    │   ├── processed     <- Final, processed datasets
+    │   └── raw           <- Original, immutable data
     │
-    └── tox.ini            <- tox file with settings for running tox; see tox.readthedocs.io
-
+    ├── savedmodels      <- Trained models
+    ├── saveddata        <- Saved data files
+    │
+    └── setup.py         <- Makes project pip installable (pip install -e .)
 
 --------
 
