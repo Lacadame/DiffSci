@@ -413,6 +413,10 @@ class VPScheduler(Scheduler):
         steps = 1 + s*(self.epsilon_min - 1)
         return steps
 
+    def step_from_time(self, t: Float[Tensor, "batch"], n: int):  # noqa: F821
+        step = (n-1) * (t - 1) / (self.epsilon_min - 1)
+        return torch.round(step).int()
+
 
 class VEScheduler(Scheduler):
     def __init__(self,
@@ -437,3 +441,7 @@ class VEScheduler(Scheduler):
         s = torch.arange(n).to(self.sigma_min)/(n-1)
         steps = self.sigma_max**2 * (self.sigma_min**2/self.sigma_max**2)**s
         return steps
+
+    def step_from_time(self, t: Float[Tensor, "batch"], n: int):
+        step = (n-1) * (torch.log(t) - torch.log(self.sigma_max**2)) / (torch.log(self.sigma_min**2) - torch.log(self.sigma_max**2))
+        return torch.round(step).int()
