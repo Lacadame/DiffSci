@@ -5,18 +5,36 @@ import diffsci.models
 
 
 class AutoencoderKLWrapper(torch.nn.Module):
-    def __init__(self, vae):
+    def __init__(self, vae, channels=1):
         super().__init__()
         self.vae = vae
         self.inference = False
+        self.channels = channels
 
     def expand_channels(self, x):
         shape = list(x.shape)
         shape[-3] = 3
-        return x.expand(*shape)
+        print(x.shape[-3], self.channels)
+        if self.channels == 1:
+            return x.expand(*shape)
+        elif self.channels == 2:
+            y = torch.zeros(shape)
+            y[..., :2, :, :] = x
+            return y
+        elif self.channels == 3:
+            return x
+        else:
+            raise ValueError(f"Invalid number of channels: {self.channels}")
 
     def squeeze_channels(self, x):
-        return x.mean(dim=-3, keepdim=True)
+        if self.channels == 1:
+            return x.mean(dim=-3, keepdim=True)
+        elif self.channels == 2:
+            return x[..., :2, :, :]
+        elif self.channels == 3:
+            return x
+        else:
+            raise ValueError(f"Invalid number of channels: {self.channels}")
 
     def forward(self, x, has_batch_dim=True):
         res = self.decode(self.encode(x, has_batch_dim), has_batch_dim)
@@ -116,18 +134,36 @@ class LDMAutoencoderKLWrapper(torch.nn.Module):
 
 
 class AutoencoderTinyWrapper(torch.nn.Module):
-    def __init__(self, vae):
+    def __init__(self, vae, channels=1):
         super().__init__()
         self.vae = vae
         self.inference = False
+        self.channels = channels
 
     def expand_channels(self, x):
         shape = list(x.shape)
         shape[-3] = 3
-        return x.expand(*shape)
+        print(x.shape[-3], self.channels)
+        if self.channels == 1:
+            return x.expand(*shape)
+        elif self.channels == 2:
+            y = torch.zeros(shape)
+            y[..., :2, :, :] = x
+            return y
+        elif self.channels == 3:
+            return x
+        else:
+            raise ValueError(f"Invalid number of channels: {self.channels}")
 
     def squeeze_channels(self, x):
-        return x.mean(dim=-3, keepdim=True)
+        if self.channels == 1:
+            return x.mean(dim=-3, keepdim=True)
+        elif self.channels == 2:
+            return x[..., :2, :, :]
+        elif self.channels == 3:
+            return x
+        else:
+            raise ValueError(f"Invalid number of channels: {self.channels}")
 
     def forward(self, x, has_batch_dim=True):
         res = self.decode(self.encode(x, has_batch_dim), has_batch_dim)

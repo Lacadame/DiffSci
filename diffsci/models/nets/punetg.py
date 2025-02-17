@@ -336,8 +336,9 @@ class PUNetGCond(PUNetG):
 
     def forward(self, x, t, y=None):
         y_channels = []
-        for item in self.channel_conditional_items:
-            y_channels.append(y[item])
+        if self.channel_conditional_items is not None:
+            for item in self.channel_conditional_items:
+                y_channels.append(y[item])
         # Filter the y dict to exclude the channel conditional items
         y = {k: v for k, v in y.items()
              if k not in self.channel_conditional_items}
