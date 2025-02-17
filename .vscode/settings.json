@@ -16,5 +16,6 @@
     "python.analysis.diagnosticSeverityOverrides": {
         "reportGeneralTypeIssues": "none",
         "reportOptionalMemberAccess": "none"
-    }
+    },
+    "python.analysis.typeCheckingMode": "basic"
 }
