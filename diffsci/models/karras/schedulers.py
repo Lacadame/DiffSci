@@ -42,6 +42,8 @@ class Scheduler(torch.nn.Module):
             assert stochastic_integrator.stochastic is True
         self.stochastic_integrator = stochastic_integrator
         self._temporary_integrator = None
+        self.langevin_const = 1.0
+        self.langevin_interval = None
 
     def propagate(self,
                   x: Float[Tensor, "batch *shape"],  # noqa: F821
@@ -189,9 +191,9 @@ class Scheduler(torch.nn.Module):
             raise NotImplementedError
         dt = torch.diff(t)
         if record_history:
-            history_shape = [nsteps+1] + list(x.shape)
+            history_shape = [final_step - initial_step + 1] + list(x.shape)
             history = torch.zeros(history_shape).to(x)
-            history[initial_step] = x
+            history[0] = x
         rhs = functools.partial(self.rhs,
                                 score_fn=score_fn,
                                 backward=backward,
@@ -205,7 +207,7 @@ class Scheduler(torch.nn.Module):
         for i in range(initial_step, final_step):
             x = step(x, t[i], dt[i], rhs, noise_strength=self.noise_injection)
             if record_history:
-                history[i+1] = x
+                history[i-initial_step+1] = x
         if record_history:
             return history
         else:
@@ -213,11 +215,26 @@ class Scheduler(torch.nn.Module):
 
     def langevin_factor(self,
                         t: Float[Tensor, "batch"],  # noqa: F821
+                        type: str = 'const',
                         ) -> Float[Tensor, "batch"]:  # noqa: F821
-        # TODO: Only the Song's Langevin factor is implemented
-        return (self.scheduler_fns.scaling_fn(t)**2 *
-                self.scheduler_fns.noise_fn_deriv(t) /
-                self.scheduler_fns.noise_fn(t))
+        # Only multiples of the Song's Langevin factor are implemented
+        standard_factor = (self.scheduler_fns.scaling_fn(t)**2 *
+                           self.scheduler_fns.noise_fn_deriv(t) /
+                           self.scheduler_fns.noise_fn(t))
+        if type == 'const':
+            if self.langevin_interval is not None:
+                if len(t.shape) > 0:            # TODO: improve this hack
+                    t_ = t[0]
+                else:
+                    t_ = t
+                if t_ > self.langevin_interval[0] and t_ < self.langevin_interval[1]:
+                    return self.langevin_const * standard_factor + 0*t
+                else:
+                    return 0*t
+            else:
+                return self.langevin_const * standard_factor + 0*t
+        else:
+            raise NotImplementedError
 
     def noise_injection(self,
                         t: Float[Tensor, "batch"],  # noqa: F821
@@ -366,6 +383,11 @@ class EDMScheduler(Scheduler):
             steps = self.scheduler_fns.inverse_noise_fn(steps)
         return steps
 
+    def step_from_time(self, t: Float[Tensor, "batch"], n: int):  # noqa: F821
+        exp = 1/self.expoent_steps
+        step = (n-1) * (t**(exp) - self.sigma_max**(exp)) / (self.sigma_min**(exp) - self.sigma_max**(exp))
+        return torch.round(step).int()
+
 
 class VPScheduler(Scheduler):
     def __init__(self,
@@ -391,6 +413,10 @@ class VPScheduler(Scheduler):
         steps = 1 + s*(self.epsilon_min - 1)
         return steps
 
+    def step_from_time(self, t: Float[Tensor, "batch"], n: int):  # noqa: F821
+        step = (n-1) * (t - 1) / (self.epsilon_min - 1)
+        return torch.round(step).int()
+
 
 class VEScheduler(Scheduler):
     def __init__(self,
@@ -415,3 +441,7 @@ class VEScheduler(Scheduler):
         s = torch.arange(n).to(self.sigma_min)/(n-1)
         steps = self.sigma_max**2 * (self.sigma_min**2/self.sigma_max**2)**s
         return steps
+
+    def step_from_time(self, t: Float[Tensor, "batch"], n: int):
+        step = (n-1) * (torch.log(t) - torch.log(self.sigma_max**2)) / (torch.log(self.sigma_min**2) - torch.log(self.sigma_max**2))
+        return torch.round(step).int()

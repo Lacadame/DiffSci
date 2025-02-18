@@ -666,6 +666,7 @@ class AutoencoderKL(pl.LightningModule):
         inputs = batch
         reconstructions, posterior = self(inputs)
 
+        # TODO: Remove this, it is just to monitor CPU usage
         aeloss, log_dict_ae = self.loss(inputs,
                                         reconstructions,
                                         posterior,
@@ -680,6 +681,7 @@ class AutoencoderKL(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         # inputs = self.get_input(batch, self.image_key)
+
         inputs = batch
         reconstructions, posterior = self(inputs)
 
@@ -694,22 +696,64 @@ class AutoencoderKL(pl.LightningModule):
         # discloss, log_dict_disc = self.loss(inputs, reconstructions, posterior, 1, self.global_step,
         #                                     last_layer=self.get_last_layer(), split="val")
 
-        self.log("val/rec_loss", log_dict_ae["val/rec_loss"])
+        self.log("val_loss", log_dict_ae["val/rec_loss"])
         self.log_dict(log_dict_ae)
         # self.log_dict(log_dict_disc)
         return self.log_dict
 
+    # def configure_optimizers(self):
+    #     lr = self.learning_rate
+    #     opt_ae = torch.optim.Adam(list(self.encoder.parameters()) +
+    #                               list(self.decoder.parameters()) +
+    #                               list(self.quant_conv.parameters()) +
+    #                               list(self.post_quant_conv.parameters()),
+    #                               lr=lr, betas=(0.5, 0.9))
+    #     # opt_disc = torch.optim.Adam(self.loss.discriminator.parameters(),
+    #     #                             lr=lr, betas=(0.5, 0.9))
+    #     # return [opt_ae, opt_disc], []
+    #     return [opt_ae]       # second entry to keep format
+
     def configure_optimizers(self):
-        lr = self.learning_rate
-        opt_ae = torch.optim.Adam(list(self.encoder.parameters()) +
-                                  list(self.decoder.parameters()) +
-                                  list(self.quant_conv.parameters()) +
-                                  list(self.post_quant_conv.parameters()),
-                                  lr=lr, betas=(0.5, 0.9))
-        # opt_disc = torch.optim.Adam(self.loss.discriminator.parameters(),
-        #                             lr=lr, betas=(0.5, 0.9))
-        # return [opt_ae, opt_disc], []
-        return [opt_ae]       # second entry to keep format
+        if self.lr_scheduler is not None:
+            lr_scheduler_config = {"scheduler": self.lr_scheduler,
+                                   "interval": self.lr_scheduler_interval}
+            return [self.optimizer], [lr_scheduler_config]
+        else:  # Just fo backward compatibility for some examples
+            return self.optimizer
+
+    def set_optimizer_and_scheduler(self,
+                                    optimizer=None,
+                                    scheduler=None,
+                                    scheduler_interval="step"):
+        """
+        Parameters
+        ----------
+        optimizer : None | torch.optim.Optimizer
+            if None, use the default optimizer AdamW,
+            with learning rate 1e-3, betas=(0.9, 0.999),
+            and weight decay 1e-4
+        scheduler : None | torch.optim.lr_scheduler._LRScheduler
+            if None, use the default scheduler CosineAnnealingWarmRestarts,
+            with T_0=10.
+        scheduler_interval : str
+            "epoch" or "step", whether the scheduler should be called at the
+            end of each epoch or each step.
+        """
+        if optimizer is not None:
+            self.optimizer = optimizer
+        else:
+            self.optimizer = torch.optim.AdamW(self.parameters(),
+                                               lr=1e-3,
+                                               betas=(0.9, 0.999),
+                                               weight_decay=1e-4)
+        if scheduler is not None:
+            self.lr_scheduler = scheduler
+        else:
+            self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
+                                    self.optimizer,
+                                    lr_lambda=lambda step: 1.0 + 0*step
+                                )  # Neutral scheduler
+        self.lr_scheduler_interval = scheduler_interval
 
     def get_last_layer(self):
         return self.decoder.conv_out.weight

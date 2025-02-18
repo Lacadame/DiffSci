@@ -3,11 +3,12 @@ from typing import Callable, Any
 import torch
 import lightning
 from torch import Tensor
-from jaxtyping import Float
+from jaxtyping import Float, Bool
 
 from diffsci.torchutils import (broadcast_from_below,
                                 linear_interpolation,
-                                dict_unsqueeze)
+                                dict_unsqueeze,
+                                dict_to)
 from diffsci.utils import get_minibatch_sizes
 from . import preconditioners
 from . import noisesamplers
@@ -301,7 +302,7 @@ class KarrasModule(lightning.LightningModule):
             weight = weight/torch.exp(modifier)
             bias = bias + modifier
         # Compute the loss
-        loss = self.loss_metric(denoiser, x)
+        loss = self.loss_metric(denoiser, x)  # [nbatch]
 
         if mask is not None:
             # Apply the mask if it is provided
@@ -378,6 +379,72 @@ class KarrasModule(lightning.LightningModule):
         sigma_broadcasted = broadcast_from_below(sigma, x)  # [nbatch, *shapex]
         return (denoiser - x)/(sigma_broadcasted**2)
 
+    def sample_and_filter(
+            self,
+            nsamples: int,
+            shape: list[int],
+            filter_fn: Callable[[Float[Tensor, "nsamples *shape"]],  # noqa: F821
+                                Bool[Tensor, "*shape"]],  # noqa: F821
+            y: None | Float[Tensor, "*yshape"] = None,  # noqa: F821
+            guidance: float = 1.0,
+            nsteps: int = 100,
+            record_history: bool = False,
+            maximum_batch_size: None | int = None,
+            integrator: None | str | integrators.Integrator = None,
+            move_to_cpu: bool = False,
+            return_only_positives: bool = False
+            ) -> dict[str, Any]:  # TODO: Put the actual type
+        if record_history:
+            raise ValueError("record_history is not supported for filtering at the moment")
+        if maximum_batch_size is not None:
+            batch_sizes = get_minibatch_sizes(nsamples, maximum_batch_size)
+            samples = []
+            filters = []
+            num_positive = 0
+            for batch_size in batch_sizes:
+                result = self.sample_and_filter(
+                    batch_size,
+                    shape,
+                    filter_fn,
+                    y,
+                    guidance,
+                    nsteps,
+                    record_history,
+                    maximum_batch_size=None,
+                    integrator=integrator,
+                    return_only_positives=return_only_positives,
+                    move_to_cpu=move_to_cpu
+                )
+                samples.append(result["samples"])
+                filters.append(result["filter"])
+                num_positive += result['filter'].sum().item()
+            hit_rate = num_positive/nsamples
+            catdim = 1 if record_history else 0
+            samples = torch.cat(samples, dim=catdim)
+            filters = torch.cat(filters, dim=catdim)
+            return dict(samples=samples, filter=filters, hit_rate=hit_rate)
+        else:
+            samples = self.sample(
+                nsamples,
+                shape,
+                y=y,
+                guidance=guidance,
+                nsteps=nsteps,
+                record_history=record_history,
+                maximum_batch_size=maximum_batch_size,
+                integrator=integrator,
+                move_to_cpu=False  # Moving to CPU will be done after encoding
+            )
+            with torch.inference_mode():
+                filter = filter_fn(self.encode(samples, y, record_history))
+            if return_only_positives:
+                samples = samples[filter]
+                filter = filter[filter]
+            if move_to_cpu:
+                samples = samples.detach().cpu()
+            hit_rate = filter.sum()/nsamples
+            return dict(samples=samples, filter=filter, hit_rate=hit_rate)
+
     def sample(
             self,
             nsamples: int,
@@ -387,7 +454,8 @@ class KarrasModule(lightning.LightningModule):
             nsteps: int = 100,
             record_history: bool = False,
             maximum_batch_size: None | int = None,
-            integrator: None | str | integrators.Integrator = None
+            integrator: None | str | integrators.Integrator = None,
+            move_to_cpu: bool = False,
             ) -> Float[Tensor, "..."]:  # TODO: Put the actual shape
         if maximum_batch_size is not None:
             batch_sizes = get_minibatch_sizes(nsamples, maximum_batch_size)
@@ -400,13 +468,16 @@ class KarrasModule(lightning.LightningModule):
                                           nsteps,
                                           record_history,
                                           maximum_batch_size=None,
-                                          integrator=integrator))
+                                          integrator=integrator,
+                                          move_to_cpu=move_to_cpu))
             catdim = 1 if record_history else 0
             result = torch.cat(result, dim=catdim)
             return result
         else:
             batched_shape = [nsamples] + list(shape)
             white_noise = torch.randn(*batched_shape).to(self.device)
+            if y is not None:
+                y = dict_to(y, self.device)
             if self.latent_model:  # TODO: A stupid hack. Should be improved
                 white_noise = self.encode(white_noise, y)
                 white_noise = torch.randn_like(white_noise)
@@ -417,6 +488,8 @@ class KarrasModule(lightning.LightningModule):
                         nsteps,
                         record_history,
                         integrator=integrator)
+            if move_to_cpu:
+                result = result.detach().cpu()
             return result
 
     def propagate_white_noise(
@@ -435,7 +508,7 @@ class KarrasModule(lightning.LightningModule):
                                               nsteps,
                                               record_history,
                                               integrator=integrator)
-        result = self.decode(result, y)
+        result = self.decode(result, y, record_history)
         return result
 
     def propagate_toward_sample(
@@ -459,6 +532,39 @@ class KarrasModule(lightning.LightningModule):
                                             x,
                                             rhs,
                                             nsteps,
+                                            record_history=record_history)
+        if integrator is not None:
+            self.config.noisescheduler.unset_temporary_integrator()
+        return result
+
+    def propagate_partial_toward_sample(
+            self,
+            x: Float[Tensor, "nsamples *shape"],  # noqa: F821
+            initial_step: int,
+            final_step: int = None,
+            y: None | Float[Tensor, "*yshape"] = None,  # noqa: F821
+            nsteps: int = 100,
+            record_history: bool = False,
+            integrator: None | str | integrators.Integrator = None
+            ) -> Float[Tensor, "nsamples *shape"]:  # noqa: F821
+        # TODO: Add the option of custom integration
+        if y is not None:
+            y = y.unsqueeze(0)  # Broadcasting will take care of the rest
+
+        def rhs(x, sigma):
+            with torch.inference_mode():
+                return self.get_score(x, sigma, y)
+        if final_step is None:
+            final_step = nsteps
+
+        if integrator is not None:
+            self.config.noisescheduler.set_temporary_integrator(integrator)
+        result = self.config.noisescheduler.propagate_partial(
+                                            x,
+                                            rhs,
+                                            nsteps,
+                                            initial_step,
+                                            final_step,
                                             record_history=record_history)
         if integrator is not None:
             self.config.noisescheduler.unset_temporary_integrator()
@@ -670,7 +776,13 @@ class KarrasModule(lightning.LightningModule):
             mask = None
         return x, y, mask
 
-    def encode(self, x, y=None):
+    def encode(self, x, y=None, record_history=False):
+        if record_history:
+            xlist = []
+            for xx in x:
+                out = self.encode(xx, y, record_history=False)
+                xlist.append(out)
+            return torch.stack(xlist, dim=0)
         if self.latent_model:
             if self.autoencoder_conditional:
                 x = self.autoencoder.encode(x, y)
@@ -682,18 +794,25 @@ class KarrasModule(lightning.LightningModule):
             x = self.edm_batch_norm.normalize(x)
         return x / self.norm
 
-    def decode(self, x, y=None):
-        x = x * self.norm
-        if self.config.has_edm_batch_norm:
-            x = self.edm_batch_norm.unnormalize(x)
-        if self.latent_model:
-            if self.autoencoder_conditional:
-                x = self.autoencoder.decode(x, y)
-            else:
-                x = self.autoencoder.decode(x)
+    def decode(self, x, y=None, record_history=False):
+        if record_history:
+            xlist = []
+            for xx in x:
+                out = self.decode(xx, y, record_history=False)
+                xlist.append(out)
+            return torch.stack(xlist, dim=0)
         else:
-            x = x
-        return x
+            x = x * self.norm
+            if self.config.has_edm_batch_norm:
+                x = self.edm_batch_norm.unnormalize(x)
+            if self.latent_model:
+                if self.autoencoder_conditional:
+                    x = self.autoencoder.decode(x, y)
+                else:
+                    x = self.autoencoder.decode(x)
+            else:
+                x = x
+            return x
 
     def start_edm_batch_norm(self):
         if not self.config.has_edm_batch_norm:

@@ -2,6 +2,7 @@ import math
 
 import torch
 from torch import Tensor
+from torch.distributions import Normal
 from jaxtyping import Shaped, Float
 
 from diffsci.torchutils import broadcast_from_below
@@ -108,15 +109,11 @@ class AnalyticalDataset(torch.utils.data.Dataset):
 
 
 class SinglePointDataset(AnalyticalDataset):
-    def __init__(self,
-                 num_samples: int,
-                 x0: Float[Tensor, "*shape"],  # noqa: F821
-                 ):
-        """
-        A dataset consisting of a generator of a single point. We can define it
-        mathematically as the Dirac delta distribution in x_0.
+    """
+    A dataset consisting of a generator of a single point. We can define it
+    mathematically as the Dirac delta distribution in x_0.
 
-        Parameters:
+    Parameters:
         ----------
         x0 : float | torch.Tensor of shape [*shape].
             The point to generate.
@@ -125,7 +122,11 @@ class SinglePointDataset(AnalyticalDataset):
         num_samples : int.
             The number of points to generate before considering the dataset
             'complete'.
-        """
+    """
+    def __init__(self,
+                 num_samples: int,
+                 x0: Float[Tensor, "*shape"],  # noqa: F821
+                 ):
         self.shape = x0.shape
         self.x0 = x0
         super().__init__(num_samples)
@@ -195,16 +196,11 @@ class SinglePointDataset(AnalyticalDataset):
 
 
 class SingleGaussianDataset(AnalyticalDataset):
-    def __init__(self,
-                 num_samples: int,
-                 x0: Float[Tensor, "*shape"],  # noqa: F821
-                 scale: float = 1.0,
-                 ):
-        """
-        A dataset consisting of a generator of a single multi-variate gaussian
-        with diagonal covariance matrix equal to scale * I.
+    """
+    A dataset consisting of a generator of a single multi-variate gaussian
+    with diagonal covariance matrix equal to scale * I.
 
-        Parameters:
+    Parameters:
         ----------
         x0 : float | torch.Tensor of shape [*shape].
             Mean of the gaussian distribution.
@@ -215,7 +211,12 @@ class SingleGaussianDataset(AnalyticalDataset):
             The dimension of the space.
         num_samples : int.
             The number of points to generate.
-        """
+    """
+    def __init__(self,
+                 num_samples: int,
+                 x0: Float[Tensor, "*shape"],  # noqa: F821
+                 scale: float = 1.0,
+                 ):
         self.shape = x0.shape
         self.x0 = x0
         self.scale = scale
@@ -422,6 +423,37 @@ class MixtureOfGaussiansDataset(AnalyticalDataset):
         noise = self.scale * torch.randn_like(means)
         return means + noise
 
+    def prob(self,
+             x: Float[Tensor, "batch *shape"],  # noqa: F821
+             sigma: Float[Tensor, "batch"]  # noqa: F821
+             ) -> Float[Tensor, "batch"]:  # noqa: F821
+        """
+        Calculate the probability of x.
+        Parameters:
+        ----------
+        x : torch.Tensor of shape (nbatch, *shape).
+        sigma : torch.Tensor of shape (nbatch).
+        Returns:
+        -------
+        prob : torch.Tensor of shape (nbatch,).
+        """
+        sigma_mod = torch.sqrt(sigma**2 + self.scale**2)  # [b]
+        x = x.unsqueeze(1)  # [b, 1, *shape]
+        p = self.means.unsqueeze(0)  # [1, n, *shape]
+        diff = (x - p)  # [b, n, *shape]
+        sumdims = tuple(range(2, diff.dim()))
+        norm2 = torch.sum((diff**2), dim=sumdims)  # [b, n]
+        expfactors = torch.exp(-0.5*norm2/(sigma_mod[:, None]**2))  # [b, n]
+        wfactors = expfactors * self.weights  # [b, n]
+        prob = wfactors.sum(dim=1)  # [b]
+        dims = x.shape[1:]
+        n = 1
+        for dim in dims:
+            n *= dim
+        # print(f'Dimension: {n}')
+        normalizer = 1/(2*math.pi*sigma_mod**2)**(n/2)
+        return prob * normalizer
+
     def gradlogprob(self,
                     x: Float[Tensor, "batch *shape"],  # noqa: F821
                     sigma: Float[Tensor, "batch"]  # noqa: F821
@@ -456,15 +488,11 @@ class MixtureOfGaussiansDataset(AnalyticalDataset):
 
 
 class DiagonalGaussianDataset(AnalyticalDataset):
-    def __init__(self,
-                 num_samples: int,
-                 x0: Float[Tensor, "*shape"],  # noqa: F821
-                 diag_std: Float[Tensor, "*shape"]):    # noqa: F821
-        """
-        A dataset consisting of a generator of a multivariate gaussian with
-        diagonal covariance matrix.
+    """
+    A dataset consisting of a generator of a multivariate gaussian with
+    diagonal covariance matrix.
 
-        Parameters
+    Parameters
         ----------
         x0 : float | torch.Tensor of shape [*shape]
             The mean of the gaussian
@@ -475,7 +503,12 @@ class DiagonalGaussianDataset(AnalyticalDataset):
             'complete'
         diag_std : float | torch.Tensor of shape [*shape]
             The sqrt of the diagonal of the covariance matrix.
-        """
+    """
+    def __init__(self,
+                 num_samples: int,
+                 x0: Float[Tensor, "*shape"],  # noqa: F821
+                 diag_std: Float[Tensor, "*shape"]):    # noqa: F821
+
         self.shape = x0.shape
         self.x0 = x0
         self.std = diag_std
@@ -508,4 +541,183 @@ class DiagonalGaussianDataset(AnalyticalDataset):
         sigma_mod = torch.sqrt(sigma**2 + self.std**2)
         grad_logp = -(x - self.x0) / (sigma_mod ** 2)
 
+        return grad_logp
+
+
+class Single1DUniformDataset(AnalyticalDataset):
+    """
+    A dataset consisting of a generator of a single univariate uniform distribution in the interval [a,b].
+
+    Parameters:
+        ----------
+        num_samples : int.
+            The number of points to generate.
+        interval : list[float].
+            A list of two floats representing the lower (a) and upper (b) bounds of the uniform distribution.
+    """
+    def __init__(self,
+                 num_samples: int,
+                 interval: list[float]):
+        self.a, self.b = interval
+        super().__init__(num_samples)
+
+    def sample(self) -> Tensor:  # noqa: F821
+        samples = torch.rand(self.num_samples, 1)
+        return samples * (self.b - self.a) + self.a
+
+    def prob(self,
+             x: Tensor,  # noqa: F821
+             sigma: Tensor  # noqa: F821
+             ) -> Tensor:  # noqa: F821
+        """
+        Calculate the probability of x.
+
+        Parameters:
+        ----------
+        x : torch.Tensor of shape (nbatch, 1).
+        sigma : torch.Tensor of shape (nbatch).
+
+        Returns:
+        -------
+        p : torch.Tensor of shape (nbatch,).
+        """
+        a = self.a
+        b = self.b
+        normal_dist = Normal(0, 1)
+        phi_a = normal_dist.cdf((x - a) / sigma)
+        phi_b = normal_dist.cdf((x - b) / sigma)
+        p = 1 / (b - a) * (phi_a - phi_b)
+        return p
+
+    def gradlogprob(self,
+                    x: Tensor,  # noqa: F821
+                    sigma: Tensor,  # noqa: F821
+                    epsilon: float = 1e-15
+                    ) -> Tensor:  # noqa: F821
+        """
+        Calculate the grad log-probability of x.
+
+        Parameters:
+        ----------
+        x : torch.Tensor of shape (nbatch, 1).
+        sigma : torch.Tensor of shape (nbatch).
+
+        Returns:
+        -------
+        grad_logp : torch.Tensor of shape (nbatch, 1).
+        """
+        a = self.a
+        b = self.b
+        normal_dist = Normal(0, 1)
+        sigma = broadcast_from_below(sigma, x)
+
+        pdf_a = normal_dist.log_prob((x - a) / sigma).exp()
+        pdf_b = normal_dist.log_prob((x - b) / sigma).exp()
+        phi_a = normal_dist.cdf((x - a) / sigma)
+        phi_b = normal_dist.cdf((x - b) / sigma)
+
+        num = pdf_a - pdf_b
+        den = phi_a - phi_b + epsilon  # Add epsilon to avoid division by zero
+        grad_logp = num / (den * sigma)
+        return grad_logp
+
+
+class MixtureOf1DUniformsDataset(AnalyticalDataset):
+    """
+    A dataset consisting of a generator of a mixture of univariate uniform distributions.
+
+    Parameters:
+        ----------
+        num_samples : int.
+            The number of points to generate.
+        intervals : list[list[float]].
+            A list of intervals, where each interval is a list [a, b].
+        weights : list[float].
+            Mixture weights for each uniform distribution (should sum to 1).
+    """
+    def __init__(self,
+                 num_samples: int,
+                 intervals: list[list[float]],
+                 weights: list[float]):
+        self.intervals = intervals
+        self.weights = torch.tensor(weights) / sum(weights)  # Normalize the weights
+        assert len(intervals) == len(weights), "Number of intervals must match number of weights"
+        super().__init__(num_samples)
+
+    def sample(self) -> Tensor:  # noqa: F821
+        mixture_indices = torch.multinomial(self.weights, self.num_samples, replacement=True)
+        samples = torch.zeros(self.num_samples, 1)
+        for i in range(len(self.intervals)):
+            mask = (mixture_indices == i)
+            num_samples_i = mask.sum()
+            if num_samples_i > 0:
+                a, b = self.intervals[i]
+                samples[mask] = torch.rand(num_samples_i, 1) * (b - a) + a
+        return samples
+
+    def prob(self,
+             x: Tensor,  # noqa: F821
+             sigma: Tensor  # noqa: F821
+             ) -> Tensor:  # noqa: F821
+        """
+        Calculate the probability of x for the mixture distribution.
+
+        Parameters:
+        ----------
+        x : torch.Tensor of shape (nbatch, 1).
+        sigma : torch.Tensor of shape (nbatch).
+
+        Returns:
+        -------
+        p : torch.Tensor of shape (nbatch,).
+        """
+        normal_dist = Normal(0, 1)
+        sigma = broadcast_from_below(sigma, x)
+        total_prob = torch.zeros(x.shape)
+
+        # Sum the probabilities from each uniform component in the mixture
+        for i, (a, b) in enumerate(self.intervals):
+            phi_a = normal_dist.cdf((x - a) / sigma)
+            phi_b = normal_dist.cdf((x - b) / sigma)
+            prob_i = 1 / (b - a) * (phi_a - phi_b)
+            total_prob += self.weights[i] * prob_i
+
+        total_prob = total_prob.squeeze(-1)
+        return total_prob
+
+    def gradlogprob(self,
+                    x: Tensor,  # noqa: F821
+                    sigma: Tensor,  # noqa: F821
+                    epsilon: float = 1e-15
+                    ) -> Tensor:  # noqa: F821
+        """
+        Calculate the grad log-probability of x for the mixture distribution.
+
+        Parameters:
+        ----------
+        x : torch.Tensor of shape (nbatch, 1).
+        sigma : torch.Tensor of shape (nbatch).
+
+        Returns:
+        -------
+        grad_logp : torch.Tensor of shape (nbatch, 1).
+        """
+        normal_dist = Normal(0, 1)
+        sigma = broadcast_from_below(sigma, x)
+        total_p = torch.zeros(x.shape)
+        total_gradp = torch.zeros(x.shape)
+
+        # Sum the gradients from each uniform component in the mixture
+        for i, (a, b) in enumerate(self.intervals):
+            pdf_a = normal_dist.log_prob((x - a) / sigma).exp()
+            pdf_b = normal_dist.log_prob((x - b) / sigma).exp()
+            phi_a = normal_dist.cdf((x - a) / sigma)
+            phi_b = normal_dist.cdf((x - b) / sigma)
+
+            gradp = (pdf_a - pdf_b) / (b-a)
+            p = (phi_a - phi_b) / (b-a)
+            total_gradp += self.weights[i] * gradp
+            total_p += self.weights[i] * p
+
+        grad_logp = total_gradp / (total_p * sigma + epsilon)
         return grad_logp
