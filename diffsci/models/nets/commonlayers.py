@@ -632,7 +632,8 @@ class ResnetBlockC(torch.nn.Module):
                  second_norm="GroupRMS",
                  affine_norm=True,
                  convolution_type="default",
-                 bias=True):
+                 bias=True,
+                 extra_residual: None | torch.nn.Module = None):
         """
         Parameters
         ----------
@@ -659,6 +660,8 @@ class ResnetBlockC(torch.nn.Module):
             to the normalization
         convolution_type : str
             The type of convolution to use. Default: "default"
+        extra_residual:
+
         """
         super().__init__()
         kernel_size = kernel_size
@@ -716,6 +719,8 @@ class ResnetBlockC(torch.nn.Module):
                 magnitude_preserving=magnitude_preserving
             )
 
+        self.extra_residual = extra_residual
+
     def forward(self, x, te=None):
         """
         Parameters
@@ -740,6 +745,8 @@ class ResnetBlockC(torch.nn.Module):
         )  # (B, C_out, D, H, W)
         if self.has_residual_connection:
             y = y + x
+        if self.extra_residual is not None:
+            y = y + self.extra_residual(x)
         return y
 
     def get_convolution_function(self):
