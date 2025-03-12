@@ -198,6 +198,33 @@ class Upsample(nn.Module):
                                         stride=1,
                                         padding=1)
 
+    # def forward(self, x):
+    #     # Original shape
+    #     b, c, h, w, d = x.shape
+    #     # First upsample H,W (treat D as channels)
+    #     x_hw = x.reshape(b, c*d, h, w)
+    #     x_hw = F.interpolate(x_hw, scale_factor=2.0, mode="nearest")
+    #     x_hw = x_hw.reshape(b, c, d, h*2, w*2)
+    #     # Then upsample D using 1D interpolation
+    #     x_d = x_hw.permute(0, 1, 3, 4, 2)  # b, c, h*2, w*2, d
+    #     x_d_flat = x_d.reshape(-1, 1, d)  # Reshape for 1D interpolation
+    #     # Process in batches if size exceeds 2**20
+    #     if x_d_flat.shape[0] > 2**20:
+    #         batch_size = 2**20  # Max size per batch
+    #         x_d_up = []
+    #         for i in range(0, x_d_flat.shape[0], batch_size):
+    #             batch = x_d_flat[i:i+batch_size]
+    #             batch_up = F.interpolate(batch, scale_factor=2, mode="nearest")
+    #             x_d_up.append(batch_up)
+    #         x_d_up = torch.cat(x_d_up, dim=0)
+    #     else:
+    #         x_d_up = F.interpolate(x_d_flat, scale_factor=2, mode="nearest")  # 1D interpolation
+    #     x_d = x_d_up.reshape(b, c, h*2, w*2, d*2)
+    #     # Apply conv3d if needed (exactly as in original)
+    #     if self.with_conv:
+    #         x_d = self.conv(x_d)
+    #     return x_d
+
     def forward(self, x):
         x = torch.nn.functional.interpolate(x, scale_factor=2.0,
                                             mode="nearest")
