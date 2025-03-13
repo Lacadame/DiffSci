@@ -6,9 +6,9 @@ from jaxtyping import Float
 
 
 class NoiseSampler(torch.nn.Module):
-    def loss_weighing(self,
-                      sigma: Float[Tensor, '...']
-                      ) -> Float[Tensor, '...']:
+    def loss_weighting(self,
+                       sigma: Float[Tensor, '...']
+                       ) -> Float[Tensor, '...']:
         raise NotImplementedError
 
     def sample(self,
@@ -84,4 +84,28 @@ class VENoiseSampler(NoiseSampler):
         logsigma_max = torch.log(self.sigma_max)
         logsigma = logsigma_min + unif*(logsigma_max - logsigma_min)
         sigma = torch.exp(logsigma)
+        return sigma
+
+
+class UniformNoiseSampler(NoiseSampler):
+    def __init__(self,
+                 t: float = 0.0,
+                 T: float = 1.0,
+                 sigma_data: float = 0.5):
+        super().__init__()
+        self.register_buffer("t", torch.tensor(t))
+        self.register_buffer("T", torch.tensor(T))
+        self.register_buffer("sigma_data", torch.tensor(sigma_data))
+
+    def loss_weighting(self,
+                       sigma: Float[Tensor, '...']
+                       ) -> Float[Tensor, '...']:
+        # same as in EDM
+        return (sigma**2 + self.sigma_data**2)/((sigma*self.sigma_data)**2)
+
+    def sample(self,
+               shape: list[int]
+               ) -> Float[Tensor, '*shape']:  # noqa: F821
+        sigma = torch.rand(shape).to(self.t.device)
+        sigma = self.t + sigma*(self.T - self.t)
         return sigma
