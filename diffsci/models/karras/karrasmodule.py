@@ -188,7 +188,8 @@ class KarrasModule(lightning.LightningModule):
                  conditional: bool = False,
                  masked: bool = False,
                  autoencoder: None | torch.nn.Module = None,
-                 autoencoder_conditional: bool = False):
+                 autoencoder_conditional: bool = False,
+                 encode_y: bool = False):
         super().__init__()
         self.model = model
         self.config = config
@@ -198,6 +199,7 @@ class KarrasModule(lightning.LightningModule):
         if self.autoencoder:
             self.freeze_autoencoder()
         self.autoencoder_conditional = autoencoder_conditional
+        self.encode_y = encode_y
         self.set_optimizer_and_scheduler()
         self.set_loss_metric()
         self.start_edm_batch_norm()
@@ -210,11 +212,13 @@ class KarrasModule(lightning.LightningModule):
         masked = self.masked
         autoencoder = True if self.autoencoder else False
         autoencoder_conditional = self.autoencoder_conditional
+        encode_y = self.encode_y
         return dict(config_description=config_description,
                     conditional=conditional,
                     masked=masked,
                     autoencoder=autoencoder,
-                    autoencoder_conditional=autoencoder_conditional)
+                    autoencoder_conditional=autoencoder_conditional,
+                    encode_y=encode_y)
 
     def freeze_autoencoder(self):
         """
@@ -287,7 +291,10 @@ class KarrasModule(lightning.LightningModule):
         depending on whether we are dealing with a conditional or unconditional
         model
         """
-        x = self.encode(x, y)
+        if self.encode_y:
+            x, y = self.encode(x, y)
+        else:
+            x = self.encode(x, y)
         broadcasted_sigma = broadcast_from_below(sigma, x)  # [nbatch, *1]
         noise = broadcasted_sigma*torch.randn_like(x)  # [nbatch, *shapex]
         x_noised = x + noise  # [nbatch, *shapex]
@@ -333,7 +340,6 @@ class KarrasModule(lightning.LightningModule):
         depending on whether we are dealing with a conditional or unconditional
         model
         """
-
         input_scale_factor = self.config.preconditioner.input_scaling(
             sigma)  # [nbatch]
         input_scale_factor = broadcast_from_below(input_scale_factor,
@@ -456,6 +462,7 @@ class KarrasModule(lightning.LightningModule):
             maximum_batch_size: None | int = None,
             integrator: None | str | integrators.Integrator = None,
             move_to_cpu: bool = False,
+            is_latent_shape: bool = False
             ) -> Float[Tensor, "..."]:  # TODO: Put the actual shape
         if maximum_batch_size is not None:
             batch_sizes = get_minibatch_sizes(nsamples, maximum_batch_size)
@@ -478,16 +485,27 @@ class KarrasModule(lightning.LightningModule):
             white_noise = torch.randn(*batched_shape).to(self.device)
             if y is not None:
                 y = dict_to(y, self.device)
+            # if self.latent_model and not is_latent_shape:  # TODO: A stupid hack. Should be improved
             if self.latent_model:  # TODO: A stupid hack. Should be improved
-                white_noise = self.encode(white_noise, y)
+                if self.encode_y:
+                    original_y = y.copy()
+                    white_noise, y = self.encode(white_noise, y)
+                    y['y'] = y['y'].squeeze(0)
+                else:
+                    # if y['y'].dim() == 3:
+                    #     y['y'] = y['y'].unsqueeze(0)
+                    white_noise = self.encode(white_noise, y)
                 white_noise = torch.randn_like(white_noise)
+                # print(white_noise.shape)
+                # raise ValueError("Stop here")
             result = self.propagate_white_noise(
                         white_noise,
                         y,
                         guidance,
                         nsteps,
                         record_history,
-                        integrator=integrator)
+                        integrator=integrator,
+                        original_y=original_y if self.encode_y else None)
             if move_to_cpu:
                 result = result.detach().cpu()
             return result
@@ -499,7 +517,8 @@ class KarrasModule(lightning.LightningModule):
             guidance: float = 1.0,
             nsteps: int = 100,
             record_history: bool = False,
-            integrator: None | str | integrators.Integrator = None
+            integrator: None | str | integrators.Integrator = None,
+            original_y: None | dict[str, Float[Tensor, "*yshape"]] = None
             ) -> Float[Tensor, "..."]:  # TODO: Put the actual shape
         x = x*self.config.noisescheduler.maximum_scale
         result = self.propagate_toward_sample(x,
@@ -508,6 +527,10 @@ class KarrasModule(lightning.LightningModule):
                                               nsteps,
                                               record_history,
                                               integrator=integrator)
+        # if original_y is not None:
+        #     result = self.decode(result, original_y, record_history)
+        # else:
+        #     result = self.decode(result, y, record_history)
         result = self.decode(result, y, record_history)
         return result
 
@@ -785,14 +808,20 @@ class KarrasModule(lightning.LightningModule):
             return torch.stack(xlist, dim=0)
         if self.latent_model:
             if self.autoencoder_conditional:
-                x = self.autoencoder.encode(x, y)
+                if self.encode_y:
+                    x, y = self.autoencoder.encode(x, y)
+                else:
+                    x = self.autoencoder.encode(x, y)
             else:
                 x = self.autoencoder.encode(x)
         else:
             x = x
         if self.config.has_edm_batch_norm:
             x = self.edm_batch_norm.normalize(x)
-        return x / self.norm
+        if self.encode_y:
+            return x/self.norm, y
+        else:
+            return x / self.norm
 
     def decode(self, x, y=None, record_history=False):
         if record_history:

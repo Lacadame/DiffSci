@@ -50,7 +50,8 @@ def test_mnist_lightning_uncond(batch_size=16,
                                                  batch_size=batch_size,
                                                  shuffle=False,
                                                  num_workers=4)
-    model = diffsci.models.PUNetUncond(net_channels)
+    modelconfig = diffsci.models.PUNetGConfig(model_channels=net_channels)
+    model = diffsci.models.PUNetG(modelconfig)
     moduleconfig = diffsci.models.KarrasModuleConfig.from_edm()
     module = diffsci.models.KarrasModule(model, moduleconfig)
     trainer = lightning.Trainer(max_epochs=max_epochs,

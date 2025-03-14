@@ -5,16 +5,17 @@ import diffsci.models
 
 
 class AutoencoderKLWrapper(torch.nn.Module):
-    def __init__(self, vae, channels=1):
+    def __init__(self, vae, channels=1, independent_channels=False, data_channels=1):
         super().__init__()
         self.vae = vae
         self.inference = False
         self.channels = channels
+        self.independent_channels = independent_channels
+        self.data_channels = data_channels
 
     def expand_channels(self, x):
         shape = list(x.shape)
         shape[-3] = 3
-        print(x.shape[-3], self.channels)
         if self.channels == 1:
             return x.expand(*shape)
         elif self.channels == 2:
@@ -43,7 +44,13 @@ class AutoencoderKLWrapper(torch.nn.Module):
     def encode(self, x, has_batch_dim=True):
         if not has_batch_dim:
             x = x.unsqueeze(0)
-        res = self.vae.encode(self.expand_channels(x))['latent_dist'].sample()
+        if self.independent_channels:
+            res = []
+            for ch in range(self.data_channels):
+                res.append(self.vae.encode(self.expand_channels(x[:, ch].unsqueeze(1)))['latent_dist'].sample())
+            res = torch.cat(res, dim=1)
+        else:
+            res = self.vae.encode(self.expand_channels(x))['latent_dist'].sample()
         if not has_batch_dim:
             res = res[0]
         return res
@@ -51,7 +58,13 @@ class AutoencoderKLWrapper(torch.nn.Module):
     def decode(self, z, has_batch_dim=True):
         if not has_batch_dim:
             z = z.unsqueeze(0)
-        res = self.squeeze_channels(self.vae.decode(z)['sample'])
+        if self.independent_channels:
+            res = []
+            for ch in range(self.data_channels):
+                res.append(self.squeeze_channels(self.vae.decode(z[:, 4*ch:4*(ch+1)])['sample']))
+            res = torch.cat(res, dim=1)
+        else:
+            res = self.squeeze_channels(self.vae.decode(z)['sample'])
         if not has_batch_dim:
             res = res[0]
         return res
@@ -143,7 +156,6 @@ class AutoencoderTinyWrapper(torch.nn.Module):
     def expand_channels(self, x):
         shape = list(x.shape)
         shape[-3] = 3
-        print(x.shape[-3], self.channels)
         if self.channels == 1:
             return x.expand(*shape)
         elif self.channels == 2:
@@ -187,7 +199,10 @@ class AutoencoderTinyWrapper(torch.nn.Module):
 
 
 def load_autoencoder(type: str,
-                     path: str = None):
+                     path: str = None,
+                     channels: int = 1,
+                     independent_channels: bool = False,
+                     data_channels: int = 3):
     if type == 'kl1':
         url = ("https://huggingface.co/stabilityai/"
                "sd-vae-ft-mse-original/blob/main/"
@@ -195,7 +210,10 @@ def load_autoencoder(type: str,
         vae_base_model = (diffusers.
                           AutoencoderKL.
                           from_single_file(url))
-        vae_wrapper = AutoencoderKLWrapper(vae_base_model)
+        vae_wrapper = AutoencoderKLWrapper(vae_base_model,
+                                           channels=channels,
+                                           independent_channels=independent_channels,
+                                           data_channels=data_channels)
     elif type == 'tiny1':
         vae_base_model = (diffusers.
                           AutoencoderTiny.
