@@ -420,12 +420,17 @@ class MixtureOfGaussiansDataset(AnalyticalDataset):
                                     self.num_samples,
                                     replacement=True)
         means = self.means[indexes, ...]
-        noise = self.scale * torch.randn_like(means)
+        if isinstance(self.scale, float):
+            scale = self.scale
+        else:
+            scale = self.scale[indexes].unsqueeze(-1)
+        noise = scale * torch.randn_like(means)
         return means + noise
 
     def prob(self,
              x: Float[Tensor, "batch *shape"],  # noqa: F821
-             sigma: Float[Tensor, "batch"]  # noqa: F821
+             sigma: Float[Tensor, "batch"],  # noqa: F821
+             scaling: Float[Tensor, "batch"] = 1.0 # noqa: F821
              ) -> Float[Tensor, "batch"]:  # noqa: F821
         """
         Calculate the probability of x.
@@ -437,22 +442,27 @@ class MixtureOfGaussiansDataset(AnalyticalDataset):
         -------
         prob : torch.Tensor of shape (nbatch,).
         """
-        sigma_mod = torch.sqrt(sigma**2 + self.scale**2)  # [b]
+        if isinstance(self.scale, float):
+            scale = self.scale
+        else:
+            scale = self.scale.unsqueeze(0)
+        sigma_mod = scaling * torch.sqrt(sigma.unsqueeze(-1)**2 + scale**2)  # [b, n]
         x = x.unsqueeze(1)  # [b, 1, *shape]
-        p = self.means.unsqueeze(0)  # [1, n, *shape]
+        p = scaling * self.means.unsqueeze(0)  # [1, n, *shape]
         diff = (x - p)  # [b, n, *shape]
         sumdims = tuple(range(2, diff.dim()))
         norm2 = torch.sum((diff**2), dim=sumdims)  # [b, n]
-        expfactors = torch.exp(-0.5*norm2/(sigma_mod[:, None]**2))  # [b, n]
+        expfactors = torch.exp(-0.5*norm2/(sigma_mod**2))  # [b, n]
         wfactors = expfactors * self.weights  # [b, n]
-        prob = wfactors.sum(dim=1)  # [b]
         dims = x.shape[1:]
         n = 1
         for dim in dims:
             n *= dim
         # print(f'Dimension: {n}')
-        normalizer = 1/(2*math.pi*sigma_mod**2)**(n/2)
-        return prob * normalizer
+        normalizer = 1/(2*math.pi*sigma_mod**2)**(n/2)  # [b, n]
+        wfactors = wfactors * normalizer  # [b, n]
+        prob = wfactors.sum(dim=1)  # [b]
+        return prob
 
     def gradlogprob(self,
                     x: Float[Tensor, "batch *shape"],  # noqa: F821
@@ -470,13 +480,17 @@ class MixtureOfGaussiansDataset(AnalyticalDataset):
         -------
         grad_logp : torch.Tensor of shape (nbatch, *shape).
         """
-        sigma_mod = torch.sqrt(sigma**2 + self.scale**2)  # [b]
+        if isinstance(self.scale, float):
+            scale = self.scale
+        else:
+            scale = self.scale.unsqueeze(0)
+        sigma_mod = torch.sqrt(sigma.unsqueeze(-1)**2 + scale**2)  # [b, n]
         x = x.unsqueeze(1)  # [b, 1, *shape]
         p = self.means.unsqueeze(0)  # [1, n, *shape]
         diff = (x - p)  # [b, n, *shape]
         sumdims = tuple(range(2, diff.dim()))
         norm2 = torch.sum((diff**2), dim=sumdims)  # [b, n]
-        expfactors = torch.exp(-0.5*norm2/(sigma_mod[:, None]**2))  # [b, n]
+        expfactors = torch.exp(-0.5*norm2/(sigma_mod**2))  # [b, n]
         wfactors = expfactors * self.weights  # [b, n]
         sigma_mod_ = broadcast_from_below(sigma_mod, diff)  # [b, n, *shape]
         terms = -diff/(sigma_mod_**2)  # [b, n, *shape]
