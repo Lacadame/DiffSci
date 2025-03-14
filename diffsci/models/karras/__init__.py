@@ -9,7 +9,8 @@ from .schedulers import (Scheduler,
 from .noisesamplers import (NoiseSampler,
                             EDMNoiseSampler,
                             VPNoiseSampler,
-                            VENoiseSampler)
+                            VENoiseSampler,
+                            UniformNoiseSampler)
 from .schedulingfunctions import (SchedulingFunctions,
                                   EDMSchedulingFunctions,
                                   VPSchedulingFunctions,

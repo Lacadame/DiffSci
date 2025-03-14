@@ -568,7 +568,9 @@ class KarrasModule(lightning.LightningModule):
             y: None | Float[Tensor, "*yshape"] = None,  # noqa: F821
             nsteps: int = 100,
             record_history: bool = False,
-            integrator: None | str | integrators.Integrator = None
+            integrator: None | str | integrators.Integrator = None,
+            analytical_score = None,
+            interp_fn = None
             ) -> Float[Tensor, "nsamples *shape"]:  # noqa: F821
         # TODO: Add the option of custom integration
         if y is not None:
@@ -576,7 +578,18 @@ class KarrasModule(lightning.LightningModule):
 
         def rhs(x, sigma):
             with torch.inference_mode():
-                return self.get_score(x, sigma, y)
+                trained_score = self.get_score(x, sigma, y)
+            if interp_fn is not None:        # for interpolating between trained and analytical scores
+                assert analytical_score is not None
+                print(sigma[0])
+                alpha = interp_fn(sigma).unsqueeze(-1).to(trained_score.device)
+                x_ = x.cpu().detach()
+                sigma_ = sigma.cpu().detach()
+                analytic_score = analytical_score(x_, sigma_).to(trained_score.device)
+                score = alpha * trained_score + (1 - alpha) * analytic_score
+                return score
+            else:
+                return trained_score
         if final_step is None:
             final_step = nsteps
 
