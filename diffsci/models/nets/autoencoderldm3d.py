@@ -587,10 +587,19 @@ class lossconfig(object):
         self.disc_weight = disc_weight
 
 
+class distillconfig(object):
+    def __init__(self,
+                 teacher_model: torch.nn.Module,
+                 distill_weight: float = 1e-3):
+        self.teacher_model = teacher_model
+        self.distill_weight = distill_weight
+
+
 class AutoencoderKL(pl.LightningModule):
     def __init__(self,
                  ddconfig,
                  lossconfig,
+                 distillconfig=None,
                  embed_dim=4,
                  ckpt_path=None,
                  ignore_keys=[],
