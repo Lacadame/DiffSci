@@ -7,6 +7,18 @@ from jaxtyping import Float
 
 
 class VAEModuleConfig(object):
+    """Configuration class for VAE module.
+
+    This class holds parameters that control the VAE training behavior,
+    including loss weights, variance initialization, and reduction methods.
+
+    Attributes:
+        kl_weight: Weight for the KL divergence term in the VAE loss.
+        nll_weight: Weight for the negative log-likelihood term in the VAE loss.
+        logvar_init: Initial value for the log variance parameter.
+        trainable_logvar: Whether the log variance is a trainable parameter.
+        reduce_mean: If True, reduce losses by mean; otherwise, sum and divide by batch size.
+    """
     def __init__(self,
                  kl_weight: float = 1e-3,
                  nll_weight: float = 1.0,
