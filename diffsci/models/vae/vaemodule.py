@@ -95,7 +95,7 @@ class VAELoss(torch.nn.Module):
                 latent_space_matching_loss = torch.sum(latent_space_matching_loss) / nsamples  # []
             elif self.config.latent_matching_type == "modhell":
                 latent_space_matching_loss = zdistrib.modified_hellinger(teacher_zdistrib, reduce_mean=reduce_mean)
-                latent_space_matching_lmean_and_logvaross = torch.sum(latent_space_matching_loss) / nsamples  # []
+                latent_space_matching_loss = torch.sum(latent_space_matching_loss) / nsamples  # []
             elif self.config.latent_matching_type == "mse":
                 latent_space_matching_loss = torch.nn.functional.mse_loss(
                     zdistrib.mean, teacher_zdistrib.mean, reduction='none')
