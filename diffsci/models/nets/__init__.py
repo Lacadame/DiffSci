@@ -19,4 +19,5 @@ from .embedder import (TwoPointCorrelationEmbedder,
                        PoreSizeDistTransformer,
                        PorosityEmbedder,
                        CompositeEmbedder)
+from .vaenet import VAENet, VAENetConfig
 from . import commonlayers
