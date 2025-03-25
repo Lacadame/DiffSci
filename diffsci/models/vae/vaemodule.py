@@ -95,7 +95,7 @@ class VAELoss(torch.nn.Module):
                 latent_space_matching_loss = torch.sum(latent_space_matching_loss) / nsamples  # []
             elif self.config.latent_matching_type == "modhell":
                 latent_space_matching_loss = zdistrib.modified_hellinger(teacher_zdistrib, reduce_mean=reduce_mean)
-                latent_space_matching_loss = torch.sum(latent_space_matching_loss) / nsamples  # []
+                latent_space_matching_lmean_and_logvaross = torch.sum(latent_space_matching_loss) / nsamples  # []
             elif self.config.latent_matching_type == "mse":
                 latent_space_matching_loss = torch.nn.functional.mse_loss(
                     zdistrib.mean, teacher_zdistrib.mean, reduction='none')
@@ -160,9 +160,9 @@ class VAEModule(lightning.LightningModule):
             zsample = zdistrib.mode()
         return {'zdistrib': zdistrib, 'zsample': zsample}
 
-    def decode(self, z: Float[Tensor, "batch zdim *shape"],  # noqa: F821, F722
+    def decode(self, zsample: Float[Tensor, "batch zdim *shape"],  # noqa: F821, F722
                y: Float[Tensor, "batch *yshape"] | None = None):  # noqa: F821, F722
-        x_recon = self.decoder(z, y) if self.conditional else self.decoder(z)
+        x_recon = self.decoder(zsample, y) if self.conditional else self.decoder(zsample)
         return x_recon
 
     def loss_fn(self, batch):
