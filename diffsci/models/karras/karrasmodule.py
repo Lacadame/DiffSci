@@ -518,7 +518,7 @@ class KarrasModule(lightning.LightningModule):
             nsteps: int = 100,
             record_history: bool = False,
             integrator: None | str | integrators.Integrator = None,
-            original_y: None | dict[str, Float[Tensor, "*yshape"]] = None
+            original_y: None | dict[str, Float[Tensor, "*yshape"]] = None  # noqa: F821
             ) -> Float[Tensor, "..."]:  # TODO: Put the actual shape
         x = x*self.config.noisescheduler.maximum_scale
         result = self.propagate_toward_sample(x,
@@ -569,8 +569,8 @@ class KarrasModule(lightning.LightningModule):
             nsteps: int = 100,
             record_history: bool = False,
             integrator: None | str | integrators.Integrator = None,
-            analytical_score = None,
-            interp_fn = None
+            analytical_score=None,
+            interp_fn=None
             ) -> Float[Tensor, "nsamples *shape"]:  # noqa: F821
         # TODO: Add the option of custom integration
         if y is not None:

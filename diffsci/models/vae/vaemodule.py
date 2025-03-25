@@ -6,7 +6,7 @@ from torch import Tensor
 from jaxtyping import Float
 
 
-class VAEModuleConfig(object):
+class VAEModuleConfig(torch.nn.Module):
     """Configuration class for VAE module.
 
     This class holds parameters that control the VAE training behavior,
@@ -24,12 +24,34 @@ class VAEModuleConfig(object):
                  nll_weight: float = 1.0,
                  logvar_init: float = 0.0,
                  trainable_logvar: bool = True,
-                 reduce_mean: bool = False):
+                 reduce_mean: bool = False,
+                 teacher_encdec: torch.nn.Module | None = None,
+                 distillation_alpha: float = 0.5,
+                 latent_matching_type: str = "kl"):
+        super().__init__()
         self.kl_weight = kl_weight
         self.nll_weight = nll_weight
         self.logvar_init = logvar_init
         self.trainable_logvar = trainable_logvar
         self.reduce_mean = reduce_mean
+        self.teacher_encdec = teacher_encdec
+        self.distillation_alpha = distillation_alpha
+        self.latent_matching_type = latent_matching_type
+        self.freeze_teacher = self.freeze_teacher()
+
+        assert self.latent_matching_type in ["kl", "mse", "modhell"], \
+            "latent_matching_type must be either 'kl', 'mse', or 'modhell'"
+        assert hasattr(self.teacher_encdec, "encoder") and hasattr(self.teacher_encdec, "decoder"), \
+            "teacher_encdec must have encoder and decoder attributes"
+
+    def freeze_teacher(self):
+        if self.teacher_encdec is not None:
+            for param in self.teacher_encdec.parameters():
+                param.requires_grad = False
+
+    @property
+    def has_distillation(self):
+        return self.teacher_encdec is not None
 
 
 class VAELoss(torch.nn.Module):
@@ -46,38 +68,86 @@ class VAELoss(torch.nn.Module):
                 x_recon: Float[Tensor, "batch channels *shape"],  # noqa: F821, F722
                 zdistrib: "DiagonalGaussianDistribution"):
         reduce_mean = self.config.reduce_mean
-        nll_loss = ((x.contiguous() - x_recon.contiguous())**2)/torch.exp(self.logvar) + self.logvar
-        kl_loss = zdistrib.kl(reduce_mean=reduce_mean)
         nsamples = x.shape[0]
-        if reduce_mean:
-            nll_loss = torch.mean(nll_loss)
+        if self.config.has_distillation and self.config.distillation_alpha == 1.0:
+            # No need to compute this loss, everything will be distillation
+            nll_loss = torch.tensor(0.0).to(x)
+            kl_loss = torch.tensor(0.0).to(x)
+            main_loss = torch.tensor(0.0).to(x)
+            loss = torch.tensor(0.0).to(x)
         else:
-            nll_loss = torch.sum(nll_loss) / nsamples  # Only the batch dimension is mean-reduced
-        kl_loss = torch.sum(kl_loss) / nsamples
-        loss = nll_loss + self.config.kl_weight * kl_loss
+            nll_loss = ((x.contiguous() - x_recon.contiguous())**2)/torch.exp(self.logvar) + self.logvar  # [b, c, ...]
+            kl_loss = zdistrib.kl(reduce_mean=reduce_mean)  # [b, ...]
+            if reduce_mean:
+                nll_loss = torch.mean(nll_loss)  # []
+            else:
+                nll_loss = torch.sum(nll_loss) / nsamples  # Only the batch dimension is mean-reduced,  []
+            kl_loss = torch.sum(kl_loss) / nsamples  # []
+            main_loss = nll_loss + self.config.kl_weight * kl_loss  # []
+            loss = main_loss.clone()
+        if self.config.has_distillation:
+            teacher_z = self.config.teacher_encdec.encoder(x)  # [b, 2*zdim, ...]
+            teacher_zdistrib = DiagonalGaussianDistribution(teacher_z)
+            teacher_zsample = teacher_zdistrib.sample()
+            teacher_x_recon = self.config.teacher_encdec.decoder(teacher_zsample)  # [b, c, ...]
+            if self.config.latent_matching_type == "kl":
+                latent_space_matching_loss = zdistrib.kl(teacher_zdistrib, reduce_mean=reduce_mean)
+                latent_space_matching_loss = torch.sum(latent_space_matching_loss) / nsamples  # []
+            elif self.config.latent_matching_type == "modhell":
+                latent_space_matching_loss = zdistrib.modified_hellinger(teacher_zdistrib, reduce_mean=reduce_mean)
+                latent_space_matching_loss = torch.sum(latent_space_matching_loss) / nsamples  # []
+            elif self.config.latent_matching_type == "mse":
+                latent_space_matching_loss = torch.nn.functional.mse_loss(
+                    zdistrib.mean, teacher_zdistrib.mean, reduction='none')
+                if reduce_mean:
+                    latent_space_matching_loss = torch.mean(latent_space_matching_loss)  # []
+                else:
+                    latent_space_matching_loss = torch.sum(latent_space_matching_loss) / nsamples  # []
+            else:
+                raise ValueError(f"Latent matching type {self.config.latent_matching_type} not supported")
+            output_matching_loss = torch.nn.functional.mse_loss(x_recon, teacher_x_recon, reduction='none')
+            if reduce_mean:
+                output_matching_loss = torch.mean(output_matching_loss)  # []
+            else:
+                output_matching_loss = torch.sum(output_matching_loss) / nsamples  # []
+            loss = ((1 - self.config.distillation_alpha) * loss +
+                    self.config.distillation_alpha * (latent_space_matching_loss + output_matching_loss))
         logs = {
             "nll_loss": nll_loss.item(),
             "kl_loss": kl_loss.item(),
+            "main_loss": main_loss.item(),
             "logvar": self.logvar.item(),
         }
+        if self.config.has_distillation:
+            logs["latent_space_matching_loss"] = latent_space_matching_loss.item()
+            logs["output_matching_loss"] = output_matching_loss.item()
         return loss, logs
 
 
 class VAEModule(lightning.LightningModule):
     def __init__(self,
-                 encoder: torch.nn.Module,
-                 decoder: torch.nn.Module,
+                 encdec: torch.nn.Module,
                  config: VAEModuleConfig,
                  conditional: bool = False,
                  verbose: bool = False):
         super().__init__()
-        self.encoder = encoder
-        self.decoder = decoder
+        self.encdec = encdec
+        # Assert whether encdec has "encoder" and "decoder" attributes
+        assert hasattr(self.encdec, "encoder") and hasattr(self.encdec, "decoder"), \
+            "encdec must have encoder and decoder attributes"
         self.config = config
         self.conditional = conditional
         self.loss_module = VAELoss(config)
         self.set_optimizer_and_scheduler()
         self.verbose = verbose
+
+    @property
+    def encoder(self):
+        return self.encdec.encoder
+
+    @property
+    def decoder(self):
+        return self.encdec.decoder
 
     def encode(self, x: Float[Tensor, "batch channels *shape"],  # noqa: F821, F722
                y: Float[Tensor, "batch *yshape"] | None = None,  # noqa: F821, F722
@@ -174,6 +244,10 @@ class DiagonalGaussianDistribution(torch.nn.Module):
         self.mean = mean
         self.logvar = torch.clamp(logvar, low_clamp, high_clamp)
 
+    @property
+    def mean_and_logvar(self):
+        return torch.cat((self.mean, self.logvar), dim=1)
+
     def sample(self):
         x = self.mean + self.std * (
             torch.randn(self.mean.shape).to(self.mean)
@@ -202,6 +276,28 @@ class DiagonalGaussianDistribution(torch.nn.Module):
         result = 0.5 * reduce_operator(
             logtwopi + self.logvar + torch.pow(sample-self.mean, 2) / self.var,
             dim=dims)
+        return result
+
+    def modified_hellinger(self, other: "DiagonalGaussianDistribution | None" = None, reduce_mean: bool = False):
+        # It is another distance operator, but the formula here is (in latex):
+        # 1/4 \sum_{i=1}^d (2 \log \frac{\sigma_{i, 1}^2 + \sigma_{i, 2}^2}{2 \sigma_{i, 1} \sigma_{i, 2}} \\
+        #                   + \frac{(\mu_{i, 1} - \mu_{i, 2})^2}{\sigma_{i, 1}^2 + \sigma_{i, 2}^2})
+        dims = list(range(1, len(self.mean.shape)))
+        reduce_operator = torch.mean if reduce_mean else torch.sum
+
+        if other is None:
+            # Use mu_{i, 2}=0 and \sigma_{i, 2}=1
+            other_mean = torch.zeros_like(self.mean)
+            other_var = torch.ones_like(self.var)
+        else:
+            other_mean = other.mean
+            other_var = other.var
+
+        sum_var = self.var + other_var
+        log_term = 2 * torch.log(sum_var / (2 * self.std * torch.sqrt(other_var)))
+        mean_term = torch.pow(self.mean - other_mean, 2) / sum_var
+
+        result = 0.25 * reduce_operator(log_term + mean_term, dim=dims)
         return result
 
     def mode(self):
