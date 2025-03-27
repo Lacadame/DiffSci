@@ -21,3 +21,10 @@ from .embedder import (TwoPointCorrelationEmbedder,
                        CompositeEmbedder)
 from .vaenet import VAENet, VAENetConfig
 from . import commonlayers
+
+from .patched_conv import (
+    patch_conv_1d,
+    patch_conv_2d,
+    patch_conv_3d,
+    get_patch_conv,
+)

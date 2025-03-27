@@ -1,7 +1,13 @@
+from typing import List
+
+import functools
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List
+
+
+from .patched_conv import get_patch_conv
 
 
 class VAENetConfig:
@@ -29,6 +35,7 @@ class VAENetConfig:
         with_time_emb: bool = False,       # Use time embeddings
         double_z: bool = True,             # Double the output in encoder for mean and logvar
         num_groups: int = 32,              # Number of groups for GroupNorm
+        patch_size: int = None,            # Patch size for patch-based convolutions
     ):
         assert dimension in [1, 2, 3], f"Dimension must be 1, 2, or 3, got {dimension}"
 
@@ -53,6 +60,7 @@ class VAENetConfig:
         self.double_z = double_z
         self.num_resolutions = len(self.ch_mult)
         self.num_groups = num_groups
+        self.patch_size = patch_size
 
     def export_description(self) -> dict:
         """Export configuration as a dictionary."""
@@ -76,7 +84,8 @@ class VAENetConfig:
             "output_bias": self.output_bias,
             "with_time_emb": self.with_time_emb,
             "double_z": self.double_z,
-            "num_groups": self.num_groups
+            "num_groups": self.num_groups,
+            "patch_size": self.patch_size,
         }
 
 
@@ -93,6 +102,10 @@ class DimensionHelper:
             return nn.Conv3d
         else:
             raise ValueError(f"Unsupported dimension: {dimension}")
+
+    @staticmethod
+    def get_patch_conv_cls(dimension):
+        return PatchedConv.initialize_with_dimension(dimension)
 
     @staticmethod
     def get_convtranspose_cls(dimension):
@@ -152,6 +165,59 @@ class DimensionHelper:
             raise ValueError(f"Unsupported dimension: {dimension}")
 
 
+class PatchedConv(torch.nn.Module):
+    def __init__(self,
+                 in_channels: int,
+                 out_channels: int,
+                 patch_size: int | None = None,
+                 kernel_size: int = 3,
+                 stride: int = 1,
+                 padding: int | None = None,
+                 bias: bool = True,
+                 dimension: int = 3):
+        # TODO: Generalize for non-square patches
+        super().__init__()
+        assert kernel_size % 2 == 1, f"Kernel size must be odd, got {kernel_size}"
+        assert stride == 1, f"Only implemented for stride == 1, got {stride}"
+        assert padding is None or padding == kernel_size//2, \
+            f"Padding must be kernel_size//2, got {padding}"
+        self.padding = padding if padding is not None else kernel_size//2
+        self.dimension = dimension
+        self.kernel_size = kernel_size
+        self.conv = DimensionHelper.get_conv_cls(dimension)(in_channels,
+                                                            out_channels,
+                                                            kernel_size,
+                                                            padding=0,
+                                                            bias=bias)
+        self.patch_conv = get_patch_conv(dimension)
+        self.patch_size = patch_size
+
+    @classmethod
+    def initialize_with_dimension(cls, dimension: int):
+        return functools.partial(cls, dimension=dimension)
+
+    def forward(self,
+                x: torch.Tensor,
+                custom_patch_size: int = None) -> torch.Tensor:
+        # x is assumed to be of shape [..., *spatial_shape]
+        dimensions = x.shape[-self.dimension:]
+        patch_size = custom_patch_size if custom_patch_size is not None else self.patch_size
+        if patch_size is None:
+            need_patch = False
+        else:
+            need_patch = any(d > patch_size for d in dimensions)
+        if need_patch:
+            return self.patch_conv(x,
+                                   self.patch_size,
+                                   conv_cls=self.conv,
+                                   padding=self.padding)
+        else:
+            # We manually pad the input to match the output shape
+            pd = [self.padding]*2*self.dimension
+            x = torch.nn.functional.pad(x, pd)
+            return self.conv(x)
+
+
 # Utility functions and blocks
 def get_norm(in_channels, num_groups=32):
     """Normalized layer with dimension flexibility."""
@@ -170,33 +236,37 @@ class ResnetBlock(nn.Module):
     """Residual block with dimension flexibility."""
 
     def __init__(self, *, dimension, in_channels, out_channels=None,
-                 conv_shortcut=False, dropout, temb_channels=0, num_groups=32):
+                 conv_shortcut=False, dropout, temb_channels=0, num_groups=32,
+                 patch_size=None):
         super().__init__()
         self.dimension = dimension
         self.in_channels = in_channels
         out_channels = in_channels if out_channels is None else out_channels
         self.out_channels = out_channels
         self.use_conv_shortcut = conv_shortcut
+        self.patch_size = patch_size
 
-        Conv = DimensionHelper.get_conv_cls(dimension)
+        Conv = DimensionHelper.get_patch_conv_cls(dimension)
 
         self.norm1 = get_norm(in_channels, num_groups=num_groups)
-        self.conv1 = Conv(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
+        self.conv1 = Conv(in_channels, out_channels, kernel_size=3, stride=1, padding=1,
+                          patch_size=patch_size)
 
         if temb_channels > 0:
             self.temb_proj = nn.Linear(temb_channels, out_channels)
 
         self.norm2 = get_norm(out_channels, num_groups=num_groups)
         self.dropout = nn.Dropout(dropout)
-        self.conv2 = Conv(out_channels, out_channels, kernel_size=3, stride=1, padding=1)
+        self.conv2 = Conv(out_channels, out_channels, kernel_size=3, stride=1, padding=1,
+                          patch_size=patch_size)
 
         if self.in_channels != self.out_channels:
             if self.use_conv_shortcut:
                 self.conv_shortcut = Conv(in_channels, out_channels, kernel_size=3,
-                                          stride=1, padding=1)
+                                          stride=1, padding=1, patch_size=patch_size)
             else:
                 self.nin_shortcut = Conv(in_channels, out_channels, kernel_size=1,
-                                         stride=1, padding=0)
+                                         stride=1, padding=0, patch_size=patch_size)
 
     def forward(self, x, temb=None):
         h = x
@@ -227,18 +297,19 @@ class ResnetBlock(nn.Module):
 class AttnBlock(nn.Module):
     """Self-attention block with dimension flexibility."""
 
-    def __init__(self, dimension, in_channels, num_groups=32):
+    def __init__(self, dimension, in_channels, num_groups=32, patch_size=None):
         super().__init__()
         self.dimension = dimension
         self.in_channels = in_channels
+        self.patch_size = patch_size
 
         self.norm = get_norm(in_channels, num_groups=num_groups)
 
-        Conv = DimensionHelper.get_conv_cls(dimension)
-        self.q = Conv(in_channels, in_channels, kernel_size=1, stride=1, padding=0)
-        self.k = Conv(in_channels, in_channels, kernel_size=1, stride=1, padding=0)
-        self.v = Conv(in_channels, in_channels, kernel_size=1, stride=1, padding=0)
-        self.proj_out = Conv(in_channels, in_channels, kernel_size=1, stride=1, padding=0)
+        Conv = DimensionHelper.get_patch_conv_cls(dimension)
+        self.q = Conv(in_channels, in_channels, kernel_size=1, stride=1, padding=0, patch_size=patch_size)
+        self.k = Conv(in_channels, in_channels, kernel_size=1, stride=1, padding=0, patch_size=patch_size)
+        self.v = Conv(in_channels, in_channels, kernel_size=1, stride=1, padding=0, patch_size=patch_size)
+        self.proj_out = Conv(in_channels, in_channels, kernel_size=1, stride=1, padding=0, patch_size=patch_size)
 
     def forward(self, x):
         h_ = x
@@ -272,16 +343,17 @@ class AttnBlock(nn.Module):
 class LinearAttention(nn.Module):
     """Linear attention mechanism with dimension flexibility."""
 
-    def __init__(self, dimension, dim, heads=4, dim_head=32):
+    def __init__(self, dimension, dim, heads=4, dim_head=32, patch_size=None):
         super().__init__()
         self.dimension = dimension
         self.heads = heads
         self.dim_head = dim_head
         hidden_dim = dim_head * heads
+        self.patch_size = patch_size
 
-        Conv = DimensionHelper.get_conv_cls(dimension)
-        self.to_qkv = Conv(dim, hidden_dim * 3, 1, bias=False)
-        self.to_out = Conv(hidden_dim, dim, 1)
+        Conv = DimensionHelper.get_patch_conv_cls(dimension)
+        self.to_qkv = Conv(dim, hidden_dim * 3, 1, bias=False, patch_size=patch_size)
+        self.to_out = Conv(hidden_dim, dim, 1, patch_size=patch_size)
 
     def forward(self, x):
         b, _ = x.shape[0], x.shape[1]
@@ -313,38 +385,41 @@ class LinearAttention(nn.Module):
 class LinAttnBlock(nn.Module):
     """Linear attention block wrapper for compatibility."""
 
-    def __init__(self, dimension, in_channels):
+    def __init__(self, dimension, in_channels, patch_size=None):
         super().__init__()
-        self.attn = LinearAttention(dimension, dim=in_channels, heads=1, dim_head=in_channels)
+        self.patch_size = patch_size
+        self.attn = LinearAttention(dimension, dim=in_channels, heads=1, dim_head=in_channels,
+                                    patch_size=patch_size)
 
     def forward(self, x):
         return self.attn(x)
 
 
-def make_attn(dimension, in_channels, attn_type="vanilla", num_groups=32):
+def make_attn(dimension, in_channels, attn_type="vanilla", num_groups=32, patch_size=None):
     """Factory function to create an attention block of specified type."""
     assert attn_type in ["vanilla", "linear", "none"], f'attn_type {attn_type} unknown'
     print(f"making attention of type '{attn_type}' with {in_channels} in_channels")
 
     if attn_type == "vanilla":
-        return AttnBlock(dimension, in_channels, num_groups=num_groups)
+        return AttnBlock(dimension, in_channels, num_groups=num_groups, patch_size=patch_size)
     elif attn_type == "none":
         return nn.Identity()
     else:
-        return LinAttnBlock(dimension, in_channels)
+        return LinAttnBlock(dimension, in_channels, patch_size=patch_size)
 
 
 class Upsample(nn.Module):
     """Upsampling module with dimension flexibility."""
 
-    def __init__(self, dimension, in_channels, with_conv):
+    def __init__(self, dimension, in_channels, with_conv, patch_size=None):
         super().__init__()
         self.dimension = dimension
         self.with_conv = with_conv
+        self.patch_size = patch_size
 
         if self.with_conv:
-            Conv = DimensionHelper.get_conv_cls(dimension)
-            self.conv = Conv(in_channels, in_channels, kernel_size=3, stride=1, padding=1)
+            Conv = DimensionHelper.get_patch_conv_cls(dimension)
+            self.conv = Conv(in_channels, in_channels, kernel_size=3, stride=1, padding=1, patch_size=patch_size)
 
     def forward(self, x):
         if self.dimension == 1:
@@ -363,10 +438,11 @@ class Upsample(nn.Module):
 class Downsample(nn.Module):
     """Downsampling module with dimension flexibility."""
 
-    def __init__(self, dimension, in_channels, with_conv):
+    def __init__(self, dimension, in_channels, with_conv, patch_size=None):
         super().__init__()
         self.dimension = dimension
         self.with_conv = with_conv
+        self.patch_size = patch_size
 
         if self.with_conv:
             Conv = DimensionHelper.get_conv_cls(dimension)
@@ -402,9 +478,10 @@ class VAEEncoder(nn.Module):
         super().__init__()
         self.config = config
         self.dimension = config.dimension
+        self.patch_size = config.patch_size
 
         # Choose correct convolution class for the given dimension
-        self.Conv = DimensionHelper.get_conv_cls(config.dimension)
+        Conv = DimensionHelper.get_patch_conv_cls(config.dimension)
 
         # Define the embedding dimension for time if needed
         self.temb_ch = 0
@@ -417,13 +494,14 @@ class VAEEncoder(nn.Module):
             )
 
         # Input projection
-        self.conv_in = self.Conv(
+        self.conv_in = Conv(
             config.in_channels,
             config.ch,
             kernel_size=3,
             stride=1,
             padding=1,
-            bias=config.input_bias
+            bias=config.input_bias,
+            patch_size=config.patch_size
         )
 
         # Calculate the minimum resolution (bottleneck size)
@@ -446,7 +524,8 @@ class VAEEncoder(nn.Module):
                     out_channels=block_out,
                     temb_channels=self.temb_ch,
                     dropout=config.dropout,
-                    num_groups=config.num_groups
+                    num_groups=config.num_groups,
+                    patch_size=config.patch_size
                 ))
                 block_in = block_out
 
@@ -455,7 +534,8 @@ class VAEEncoder(nn.Module):
                         config.dimension,
                         block_in,
                         attn_type=config.attn_type,
-                        num_groups=config.num_groups
+                        num_groups=config.num_groups,
+                        patch_size=config.patch_size
                     ))
 
             down = nn.Module()
@@ -463,7 +543,8 @@ class VAEEncoder(nn.Module):
             down.attn = attn
 
             if i_level != config.num_resolutions - 1:
-                down.downsample = Downsample(config.dimension, block_in, config.resamp_with_conv)
+                down.downsample = Downsample(config.dimension, block_in, config.resamp_with_conv,
+                                             patch_size=config.patch_size)
                 curr_res = curr_res // 2
 
             self.down.append(down)
@@ -476,7 +557,8 @@ class VAEEncoder(nn.Module):
             out_channels=block_in,
             temb_channels=self.temb_ch,
             dropout=config.dropout,
-            num_groups=config.num_groups
+            num_groups=config.num_groups,
+            patch_size=config.patch_size
         )
 
         if config.has_mid_attn:
@@ -484,7 +566,8 @@ class VAEEncoder(nn.Module):
                 config.dimension,
                 block_in,
                 attn_type=config.attn_type,
-                num_groups=config.num_groups
+                num_groups=config.num_groups,
+                patch_size=config.patch_size
             )
 
         self.mid.block_2 = ResnetBlock(
@@ -493,7 +576,8 @@ class VAEEncoder(nn.Module):
             out_channels=block_in,
             temb_channels=self.temb_ch,
             dropout=config.dropout,
-            num_groups=config.num_groups
+            num_groups=config.num_groups,
+            patch_size=config.patch_size
         )
 
         # Output projection
@@ -502,17 +586,18 @@ class VAEEncoder(nn.Module):
             z_channels = 2 * z_channels
 
         self.norm_out = get_norm(block_in, num_groups=config.num_groups)
-        self.conv_out = self.Conv(
+        self.conv_out = Conv(
             block_in,
             z_channels,
             kernel_size=3,
             stride=1,
             padding=1,
-            bias=True
+            bias=True,
+            patch_size=config.patch_size
         )
 
         # Additional projection to z_dim if needed
-        self.quant_conv = self.Conv(z_channels, 2 * config.z_dim, kernel_size=1)
+        self.quant_conv = Conv(z_channels, 2 * config.z_dim, kernel_size=1, patch_size=config.patch_size)
 
     def forward(self, x, time=None):
         # Time embedding
@@ -560,9 +645,10 @@ class VAEDecoder(nn.Module):
         super().__init__()
         self.config = config
         self.dimension = config.dimension
+        self.patch_size = config.patch_size
 
         # Choose correct convolution class for the given dimension
-        self.Conv = DimensionHelper.get_conv_cls(config.dimension)
+        Conv = DimensionHelper.get_patch_conv_cls(config.dimension)
 
         # Define the embedding dimension for time if needed
         self.temb_ch = 0
@@ -575,7 +661,7 @@ class VAEDecoder(nn.Module):
             )
 
         # Initial projection from z_dim to z_channels
-        self.post_quant_conv = self.Conv(config.z_dim, config.z_channels, kernel_size=1)
+        self.post_quant_conv = Conv(config.z_dim, config.z_channels, kernel_size=1, patch_size=config.patch_size)
 
         # Calculate the minimum resolution (bottleneck size)
         self.num_resolutions = len(config.ch_mult)
@@ -584,13 +670,14 @@ class VAEDecoder(nn.Module):
 
         # Input projection
         block_in = config.ch * config.ch_mult[-1]
-        self.conv_in = self.Conv(
+        self.conv_in = Conv(
             config.z_channels,
             block_in,
             kernel_size=3,
             stride=1,
             padding=1,
-            bias=config.input_bias
+            bias=config.input_bias,
+            patch_size=config.patch_size
         )
 
         # Middle block
@@ -601,7 +688,8 @@ class VAEDecoder(nn.Module):
             out_channels=block_in,
             temb_channels=self.temb_ch,
             dropout=config.dropout,
-            num_groups=config.num_groups
+            num_groups=config.num_groups,
+            patch_size=config.patch_size
         )
 
         if config.has_mid_attn:
@@ -609,7 +697,8 @@ class VAEDecoder(nn.Module):
                 config.dimension,
                 block_in,
                 attn_type=config.attn_type,
-                num_groups=config.num_groups
+                num_groups=config.num_groups,
+                patch_size=config.patch_size
             )
 
         self.mid.block_2 = ResnetBlock(
@@ -618,7 +707,8 @@ class VAEDecoder(nn.Module):
             out_channels=block_in,
             temb_channels=self.temb_ch,
             dropout=config.dropout,
-            num_groups=config.num_groups
+            num_groups=config.num_groups,
+            patch_size=config.patch_size
         )
 
         # Upsampling blocks
@@ -635,7 +725,8 @@ class VAEDecoder(nn.Module):
                     out_channels=block_out,
                     temb_channels=self.temb_ch,
                     dropout=config.dropout,
-                    num_groups=config.num_groups
+                    num_groups=config.num_groups,
+                    patch_size=config.patch_size
                 ))
                 block_in = block_out
 
@@ -644,7 +735,8 @@ class VAEDecoder(nn.Module):
                         config.dimension,
                         block_in,
                         attn_type=config.attn_type,
-                        num_groups=config.num_groups
+                        num_groups=config.num_groups,
+                        patch_size=config.patch_size
                     ))
 
             up = nn.Module()
@@ -652,20 +744,22 @@ class VAEDecoder(nn.Module):
             up.attn = attn
 
             if i_level != 0:
-                up.upsample = Upsample(config.dimension, block_in, config.resamp_with_conv)
+                up.upsample = Upsample(config.dimension, block_in, config.resamp_with_conv,
+                                       patch_size=config.patch_size)
                 curr_res = curr_res * 2
 
             self.up.insert(0, up)  # Insert at the beginning for correct order
 
         # Output normalization and convolution
         self.norm_out = get_norm(block_in, num_groups=config.num_groups)
-        self.conv_out = self.Conv(
+        self.conv_out = Conv(
             block_in,
             config.out_channels,
             kernel_size=3,
             stride=1,
             padding=1,
-            bias=config.output_bias
+            bias=config.output_bias,
+            patch_size=config.patch_size
         )
 
     def forward(self, z, time=None):
