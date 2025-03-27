@@ -219,6 +219,14 @@ class PatchedConv(torch.nn.Module):
             pd = [self.padding]*2*self.dimension
             x = torch.nn.functional.pad(x, pd)
             return self.conv(x)
+        
+    @property
+    def weight(self):
+        return self.conv.weight
+
+    @property
+    def bias(self):
+        return self.conv.bias
 
 
 # Utility functions and blocks
@@ -425,11 +433,11 @@ class Upsample(nn.Module):
 
     def forward(self, x):
         if self.dimension == 1:
-            x = F.interpolate(x, scale_factor=2.0, mode="linear", align_corners=False)
+            x = F.interpolate(x, scale_factor=2.0, mode="nearest")
         elif self.dimension == 2:
-            x = F.interpolate(x, scale_factor=2.0, mode="bilinear", align_corners=False)
+            x = F.interpolate(x, scale_factor=2.0, mode="nearest")
         elif self.dimension == 3:
-            x = F.interpolate(x, scale_factor=2.0, mode="trilinear", align_corners=False)
+            x = F.interpolate(x, scale_factor=2.0, mode="nearest")
 
         if self.with_conv:
             x = self.conv(x)
@@ -454,13 +462,15 @@ class Downsample(nn.Module):
 
     def forward(self, x):
         if self.with_conv:
-            pad_size = 1
             if self.dimension == 1:
-                x = F.pad(x, (pad_size, pad_size))
+                pad = (0, 1)
+                x = torch.nn.functional.pad(x, pad, mode="constant", value=0)
             elif self.dimension == 2:
-                x = F.pad(x, (pad_size, pad_size, pad_size, pad_size))
+                pad = (0, 1, 0, 1)
+                x = torch.nn.functional.pad(x, pad, mode="constant", value=0)
             else:  # dimension == 3
-                x = F.pad(x, (pad_size, pad_size, pad_size, pad_size, pad_size, pad_size))
+                pad = (0, 1, 0, 1, 0, 1)
+                x = torch.nn.functional.pad(x, pad, mode="constant", value=0)
             x = self.conv(x)
         else:
             if self.dimension == 1:
@@ -602,40 +612,62 @@ class VAEEncoder(nn.Module):
         self.quant_conv = Conv(z_channels, 2 * config.z_dim, kernel_size=1, patch_size=config.patch_size)
 
     def forward(self, x, time=None):
+        # print(f"Input x shape: {x.shape}, 10th item: {x.flatten()[9] if x.numel() > 9 else None}")
+        
         # Time embedding
         temb = None
         if self.config.with_time_emb and time is not None:
             temb = self.time_embed(time)
+            # print(f"Time embedding shape: {temb.shape}, 10th item: {temb.flatten()[9] if temb.numel() > 9 else None}")
 
         # Initial convolution
         h = self.conv_in(x)
+        # print(f"After conv_in shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
 
         # Downsampling
         hs = [h]
         for i_level in range(self.config.num_resolutions):
+            # print(f"Downsampling level: {i_level}")
             for i_block in range(self.config.num_res_blocks):
                 h = self.down[i_level].block[i_block](hs[-1], temb)
+                # print(f"  After down[{i_level}].block[{i_block}] shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
+                
                 if len(self.down[i_level].attn) > i_block:
                     h = self.down[i_level].attn[i_block](h)
+                    # print(f"  After down[{i_level}].attn[{i_block}] shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
                 hs.append(h)
 
             if i_level != self.config.num_resolutions - 1:
                 hs.append(self.down[i_level].downsample(hs[-1]))
+                # print(f"  After down[{i_level}].downsample shape: {hs[-1].shape}, 10th item: {hs[-1].flatten()[9] if hs[-1].numel() > 9 else None}")
 
         # Middle
         h = hs[-1]
+        # print(f"Middle input shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
+        
         h = self.mid.block_1(h, temb)
+        # print(f"After mid.block_1 shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
+        
         if hasattr(self.mid, 'attn_1'):
             h = self.mid.attn_1(h)
+            # print(f"After mid.attn_1 shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
+        
         h = self.mid.block_2(h, temb)
+        # print(f"After mid.block_2 shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
 
         # Normalize and project
         h = self.norm_out(h)
+        # print(f"After norm_out shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
+        
         h = nonlinearity(h)
+        # print(f"After nonlinearity shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
+        
         h = self.conv_out(h)
+        # print(f"After conv_out shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
 
         # Final projection to z_dim (for mean and variance)
         h = self.quant_conv(h)
+        # print(f"After quant_conv shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
 
         return h
 
@@ -771,43 +803,61 @@ class VAEDecoder(nn.Module):
         )
 
     def forward(self, z, time=None):
+        # print(f"Input z shape: {z.shape}, 10th item: {z.flatten()[9] if z.numel() > 9 else None}")
+        
         # Time embedding
         temb = None
         if self.config.with_time_emb and time is not None:
             temb = self.time_embed(time)
+            # print(f"Time embedding shape: {temb.shape}, 10th item: {temb.flatten()[9] if temb.numel() > 9 else None}")
 
         # Project from z_dim to z_channels
         z = self.post_quant_conv(z)
+        # print(f"After post_quant_conv shape: {z.shape}, 10th item: {z.flatten()[9] if z.numel() > 9 else None}")
 
         # Initial convolution
         h = self.conv_in(z)
+        # print(f"After conv_in shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
 
         # Middle block
         h = self.mid.block_1(h, temb)
+        # print(f"After mid.block_1 shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
         
         if hasattr(self.mid, 'attn_1'):
             h = self.mid.attn_1(h)
+            # print(f"After mid.attn_1 shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
 
         h = self.mid.block_2(h, temb)
+        # print(f"After mid.block_2 shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
 
         # Upsampling
         for i_level in reversed(range(len(self.up))):
+            # print(f"Upsampling level: {i_level}")
             for i_block in range(len(self.up[i_level].block)):
                 h = self.up[i_level].block[i_block](h, temb)
+                # print(f"  After up[{i_level}].block[{i_block}] shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
                 
                 if len(self.up[i_level].attn) > i_block:
                     h = self.up[i_level].attn[i_block](h)
+                    # print(f"  After up[{i_level}].attn[{i_block}] shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
             
             if i_level != 0:
                 h = self.up[i_level].upsample(h)
+                # print(f"  After up[{i_level}].upsample shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
         
         # Output normalization and convolution
         h = self.norm_out(h)
+        # print(f"After norm_out shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
+        
         h = nonlinearity(h)
+        # print(f"After nonlinearity shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
+        
         h = self.conv_out(h)
+        # print(f"After conv_out shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
 
         if self.config.tanh_out:
             h = torch.tanh(h)
+            # print(f"After tanh shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
         
         return h
 
