@@ -36,6 +36,7 @@ class VAENetConfig:
         double_z: bool = True,             # Double the output in encoder for mean and logvar
         num_groups: int = 32,              # Number of groups for GroupNorm
         patch_size: int = None,            # Patch size for patch-based convolutions
+        memory_efficient_variant: bool = False  # Use memory efficient decoding
     ):
         assert dimension in [1, 2, 3], f"Dimension must be 1, 2, or 3, got {dimension}"
 
@@ -61,6 +62,7 @@ class VAENetConfig:
         self.num_resolutions = len(self.ch_mult)
         self.num_groups = num_groups
         self.patch_size = patch_size
+        self.memory_efficient_variant = memory_efficient_variant
 
     def export_description(self) -> dict:
         """Export configuration as a dictionary."""
@@ -86,6 +88,7 @@ class VAENetConfig:
             "double_z": self.double_z,
             "num_groups": self.num_groups,
             "patch_size": self.patch_size,
+            "memory_efficient_decoding": self.memory_efficient_decoding
         }
 
 
@@ -398,7 +401,6 @@ class LinAttnBlock(nn.Module):
 def make_attn(dimension, in_channels, attn_type="vanilla", num_groups=32, patch_size=None):
     """Factory function to create an attention block of specified type."""
     assert attn_type in ["vanilla", "linear", "none"], f'attn_type {attn_type} unknown'
-    print(f"making attention of type '{attn_type}' with {in_channels} in_channels")
 
     if attn_type == "vanilla":
         return AttnBlock(dimension, in_channels, num_groups=num_groups, patch_size=patch_size)
@@ -717,7 +719,13 @@ class VAEDecoder(nn.Module):
             block = nn.ModuleList()
             attn = nn.ModuleList()
 
-            block_out = config.ch * config.ch_mult[i_level]
+            if self.config.memory_efficient_variant:
+                if i_level == 0:
+                    block_out = config.ch * config.ch_mult[i_level]
+                else:
+                    block_out = config.ch * config.ch_mult[i_level-1]
+            else:
+                block_out = config.ch * config.ch_mult[i_level]
             for i_block in range(config.num_res_blocks + 1):
                 block.append(ResnetBlock(
                     dimension=config.dimension,
@@ -776,6 +784,7 @@ class VAEDecoder(nn.Module):
 
         # Middle block
         h = self.mid.block_1(h, temb)
+        
         if hasattr(self.mid, 'attn_1'):
             h = self.mid.attn_1(h)
 
@@ -785,10 +794,13 @@ class VAEDecoder(nn.Module):
         for i_level in reversed(range(len(self.up))):
             for i_block in range(len(self.up[i_level].block)):
                 h = self.up[i_level].block[i_block](h, temb)
+                
                 if len(self.up[i_level].attn) > i_block:
                     h = self.up[i_level].attn[i_block](h)
+            
             if i_level != 0:
                 h = self.up[i_level].upsample(h)
+        
         # Output normalization and convolution
         h = self.norm_out(h)
         h = nonlinearity(h)
@@ -796,6 +808,7 @@ class VAEDecoder(nn.Module):
 
         if self.config.tanh_out:
             h = torch.tanh(h)
+        
         return h
 
 

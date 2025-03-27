@@ -1,3 +1,7 @@
+###############################################################################
+# Code ensembled from https://github.com/CompVis/latent-diffusion/tree/main
+###############################################################################
+
 import torch
 import torch.nn as nn
 

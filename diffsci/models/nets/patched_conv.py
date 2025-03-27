@@ -1,5 +1,5 @@
 import torch
-
+import gc
 
 def divide_dims(ub, window_size, lb=0):
     """
@@ -98,6 +98,9 @@ def patch_conv_3d(input_tensor: torch.Tensor,
                 lbze, ubze = lbz, ubz + 2*padding
                 output_tensor[..., lbx:ubx, lby:uby, lbz:ubz] = conv_cls(
                     input_tensor[..., lbxe:ubxe, lbye:ubye, lbze:ubze])
+    del input_tensor
+    torch.cuda.empty_cache()
+    gc.collect()
     return output_tensor
 
 
