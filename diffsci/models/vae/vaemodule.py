@@ -38,8 +38,8 @@ class VAEModuleConfig(torch.nn.Module):
         self.distillation_alpha = distillation_alpha
         self.latent_matching_type = latent_matching_type
 
-        assert self.latent_matching_type in ["kl", "mse", "modhell"], \
-            "latent_matching_type must be either 'kl', 'mse', or 'modhell'"
+        assert self.latent_matching_type in ["kl", "mse", "modhell", "wasserstein"], \
+            "latent_matching_type must be either 'kl', 'mse', 'modhell', or 'wasserstein'"
         if self.has_distillation:
             assert hasattr(self.teacher_encdec, "encoder") and hasattr(self.teacher_encdec, "decoder"), \
                 "teacher_encdec must have encoder and decoder attributes"
@@ -91,23 +91,9 @@ class VAELoss(torch.nn.Module):
             teacher_zdistrib = DiagonalGaussianDistribution(teacher_z)
             teacher_zsample = teacher_zdistrib.sample()
             teacher_x_recon = self.config.teacher_encdec.decoder(teacher_zsample)  # [b, c, ...]
-            if self.config.latent_matching_type == "kl":
-                latent_space_matching_loss = zdistrib.kl(teacher_zdistrib, reduce_mean=reduce_mean)
-                latent_space_matching_loss = torch.sum(latent_space_matching_loss) / nsamples  # []
-            elif self.config.latent_matching_type == "modhell":
-                latent_space_matching_loss = zdistrib.modified_hellinger(teacher_zdistrib, reduce_mean=reduce_mean)
-                latent_space_matching_loss = torch.sum(latent_space_matching_loss) / nsamples  # []
-            elif self.config.latent_matching_type == "mse":
-                latent_space_matching_loss = torch.nn.functional.mse_loss(
-                    zdistrib.mean, teacher_zdistrib.mean, reduction='none')
-                if reduce_mean:
-                    latent_space_matching_loss = torch.mean(latent_space_matching_loss)  # []
-                else:
-                    latent_space_matching_loss = torch.sum(latent_space_matching_loss) / nsamples  # []
-            else:
-                raise ValueError(f"Latent matching type {self.config.latent_matching_type} not supported")
+            latent_space_matching_loss = self.calculate_latent_space_matching_loss(zdistrib, teacher_zdistrib, reduce_mean)
             output_matching_loss = torch.nn.functional.mse_loss(x_recon, teacher_x_recon, reduction='none')
-            if reduce_mean:
+            if reduce_mean: 
                 output_matching_loss = torch.mean(output_matching_loss)  # []
             else:
                 output_matching_loss = torch.sum(output_matching_loss) / nsamples  # []
@@ -123,6 +109,20 @@ class VAELoss(torch.nn.Module):
             logs["latent_space_matching_loss"] = latent_space_matching_loss.item()
             logs["output_matching_loss"] = output_matching_loss.item()
         return loss, logs
+
+    def calculate_latent_space_matching_loss(self, zdistrib, teacher_zdistrib, reduce_mean):
+        if self.config.latent_matching_type == "kl":
+            latent_space_matching_loss = zdistrib.kl(teacher_zdistrib, reduce_mean=reduce_mean)
+            latent_space_matching_loss = torch.sum(latent_space_matching_loss) / nsamples  # []
+        elif self.config.latent_matching_type == "modhell":
+            latent_space_matching_loss = zdistrib.modified_hellinger(teacher_zdistrib, reduce_mean=reduce_mean)
+            latent_space_matching_loss = torch.sum(latent_space_matching_loss) / nsamples  # []
+        elif self.config.latent_matching_type in ["mse", "wasserstein"]:
+            latent_space_matching_loss = zdistrib.wasserstein(teacher_zdistrib, reduce_mean=reduce_mean)
+            latent_space_matching_loss = torch.sum(latent_space_matching_loss) / nsamples  # []
+        else:
+            raise ValueError(f"Latent matching type {self.config.latent_matching_type} not supported")
+        return latent_space_matching_loss
 
 
 class VAEModule(lightning.LightningModule):
@@ -310,6 +310,21 @@ class DiagonalGaussianDistribution(torch.nn.Module):
         mean_term = torch.pow(self.mean - other_mean, 2) / sum_var
 
         result = 0.25 * reduce_operator(log_term + mean_term, dim=dims)
+        return result
+
+    def wasserstein(self, other: "DiagonalGaussianDistribution | None" = None, reduce_mean: bool = False):
+        dims = list(range(1, len(self.mean.shape)))
+        reduce_operator = torch.mean if reduce_mean else torch.sum
+        if other is None:
+            other_mean = torch.zeros_like(self.mean)
+            other_var = torch.ones_like(self.var)
+        else:
+            other_mean = other.mean
+            other_std = other.std
+
+        mean_term = torch.pow(self.mean - other_mean, 2)
+        std_term = torch.pow(self.std - other_std, 2)
+        result = reduce_operator(mean_term + std_term, dim=dims)
         return result
 
     def mode(self):
