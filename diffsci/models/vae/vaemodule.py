@@ -42,8 +42,8 @@ class VAEModuleConfig(torch.nn.Module):
         assert self.latent_matching_type in ["kl", "mse", "modhell"], \
             "latent_matching_type must be either 'kl', 'mse', or 'modhell'"
         if self.has_distillation:
-        assert hasattr(self.teacher_encdec, "encoder") and hasattr(self.teacher_encdec, "decoder"), \
-            "teacher_encdec must have encoder and decoder attributes"
+            assert hasattr(self.teacher_encdec, "encoder") and hasattr(self.teacher_encdec, "decoder"), \
+                "teacher_encdec must have encoder and decoder attributes"
 
     def freeze_teacher(self):
         if self.teacher_encdec is not None:
