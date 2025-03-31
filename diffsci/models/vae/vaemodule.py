@@ -37,18 +37,12 @@ class VAEModuleConfig(torch.nn.Module):
         self.teacher_encdec = teacher_encdec
         self.distillation_alpha = distillation_alpha
         self.latent_matching_type = latent_matching_type
-        self.freeze_teacher = self.freeze_teacher()
 
         assert self.latent_matching_type in ["kl", "mse", "modhell"], \
             "latent_matching_type must be either 'kl', 'mse', or 'modhell'"
         if self.has_distillation:
             assert hasattr(self.teacher_encdec, "encoder") and hasattr(self.teacher_encdec, "decoder"), \
                 "teacher_encdec must have encoder and decoder attributes"
-
-    def freeze_teacher(self):
-        if self.teacher_encdec is not None:
-            for param in self.teacher_encdec.parameters():
-                param.requires_grad = False
 
     @property
     def has_distillation(self):
@@ -63,6 +57,12 @@ class VAELoss(torch.nn.Module):
             self.logvar = torch.nn.Parameter(torch.ones(size=(1,)) * config.logvar_init)
         else:
             self.register_buffer("logvar", torch.ones(size=(1,)) * config.logvar_init)
+        self.freeze_teacher()
+
+    def freeze_teacher(self):
+        if self.config.teacher_encdec is not None:
+            for param in self.config.teacher_encdec.parameters():
+                param.requires_grad = False
 
     def forward(self,
                 x: Float[Tensor, "batch channels *shape"],  # noqa: F821, F722
@@ -167,8 +167,7 @@ class VAEModule(lightning.LightningModule):
         return x_recon
 
     def loss_fn(self, batch):
-        x = batch['x']
-        y = batch.get('y', None)
+        x, y = self.select_batch(batch)
         encoder_outputs = self.encode(x, y)
         x_recon = self.decode(encoder_outputs['zsample'], y)
         loss, logs = self.loss_module(x, x_recon, encoder_outputs['zdistrib'])
@@ -233,6 +232,18 @@ class VAEModule(lightning.LightningModule):
             return [self.optimizer], [lr_scheduler_config]
         else:  # Just fo backward compatibility for some examples
             return self.optimizer
+
+    def select_batch(self, batch):
+        if isinstance(batch, dict):
+            x = batch['x']
+            y = batch.get('y', None)
+        else:
+            if self.conditional:
+                x, y = batch
+            else:
+                x = batch
+                y = None
+            return x, y
 
 
 class DiagonalGaussianDistribution(torch.nn.Module):

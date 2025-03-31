@@ -1,6 +1,8 @@
 from typing import List
 
 import functools
+import pathlib
+import yaml
 
 import torch
 import torch.nn as nn
@@ -88,8 +90,18 @@ class VAENetConfig:
             "double_z": self.double_z,
             "num_groups": self.num_groups,
             "patch_size": self.patch_size,
-            "memory_efficient_decoding": self.memory_efficient_decoding
+            "memory_efficient_variant": self.memory_efficient_variant
         }
+    
+    @classmethod
+    def from_description(cls, description: dict):
+        return cls(**description)
+    
+    @classmethod
+    def from_config_file(cls, config_file: pathlib.Path | str):
+        with open(config_file, "r") as f:
+            description = yaml.safe_load(f)
+        return cls.from_description(description)
 
 
 class DimensionHelper:
