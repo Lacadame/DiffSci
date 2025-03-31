@@ -30,7 +30,7 @@ class VAEModuleConfig(torch.nn.Module):
                  latent_matching_type: str = "kl"):
         super().__init__()
         self.kl_weight = kl_weight
-        self.nll_weight = nll_weight
+        self.nll_weight = nll_weight  # Unused for now
         self.logvar_init = logvar_init
         self.trainable_logvar = trainable_logvar
         self.reduce_mean = reduce_mean
@@ -91,7 +91,8 @@ class VAELoss(torch.nn.Module):
             teacher_zdistrib = DiagonalGaussianDistribution(teacher_z)
             teacher_zsample = teacher_zdistrib.sample()
             teacher_x_recon = self.config.teacher_encdec.decoder(teacher_zsample)  # [b, c, ...]
-            latent_space_matching_loss = self.calculate_latent_space_matching_loss(zdistrib, teacher_zdistrib, reduce_mean)
+            latent_space_matching_loss = self.calculate_latent_space_matching_loss(
+                zdistrib, teacher_zdistrib, reduce_mean, nsamples)
             output_matching_loss = torch.nn.functional.mse_loss(x_recon, teacher_x_recon, reduction='none')
             if reduce_mean: 
                 output_matching_loss = torch.mean(output_matching_loss)  # []
@@ -110,7 +111,8 @@ class VAELoss(torch.nn.Module):
             logs["output_matching_loss"] = output_matching_loss.item()
         return loss, logs
 
-    def calculate_latent_space_matching_loss(self, zdistrib, teacher_zdistrib, reduce_mean):
+    def calculate_latent_space_matching_loss(self, zdistrib, teacher_zdistrib,
+                                             reduce_mean, nsamples):
         if self.config.latent_matching_type == "kl":
             latent_space_matching_loss = zdistrib.kl(teacher_zdistrib, reduce_mean=reduce_mean)
             latent_space_matching_loss = torch.sum(latent_space_matching_loss) / nsamples  # []
