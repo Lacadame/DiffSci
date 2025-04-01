@@ -319,7 +319,7 @@ class DiagonalGaussianDistribution(torch.nn.Module):
         reduce_operator = torch.mean if reduce_mean else torch.sum
         if other is None:
             other_mean = torch.zeros_like(self.mean)
-            other_var = torch.ones_like(self.var)
+            other_std = torch.ones_like(self.std)
         else:
             other_mean = other.mean
             other_std = other.std

@@ -883,9 +883,15 @@ class VAENet(nn.Module):
         self.encoder = VAEEncoder(config)
         self.decoder = VAEDecoder(config)
 
-    def encode(self, x, time=None):
+    def encode(self, x, time=None, sample=True):
         """Encode input to latent parameters (mean and logvar)."""
-        return self.encoder(x, time)
+        z = self.encoder(x, time)
+        if sample:
+            mean, logvar = torch.chunk(z, 2, dim=1)
+            normsample = torch.randn_like(mean)
+            std = torch.exp(0.5 * logvar)
+            z = mean + std * normsample
+        return z
 
     def decode(self, z, time=None):
         """Decode latent representation to reconstructed input."""
