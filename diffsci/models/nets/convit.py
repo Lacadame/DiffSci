@@ -1,9 +1,82 @@
 # TODO: Put DimensionHelper in a unified separate file
+from typing import Any, Optional
 
+import pathlib
+import yaml
 import math
 
 import torch
 import einops
+
+from .commonlayers import GaussianFourierProjection
+
+
+class ConVitConfig(object):
+    def __init__(self,
+                 in_channels: int = 1,
+                 embed_dim: int = 64,
+                 num_pos_dims: int = 2,
+                 out_channels: Optional[int] = None,
+                 num_layers: int = 6,
+                 num_heads: int = 8,
+                 ffn_expansion_factor: int = 4,
+                 attn_compression_factor: int = 2,
+                 rope_freq: float = 1.0,
+                 with_conv: bool = False,
+                 kernel_size_conv: int = 3,
+                 kernel_size_in_out: int = 3,
+                 has_time_embedding: bool = False,
+                 has_conditional_embedding: bool = False,
+                 fourier_projection_scale: float = 30.0):
+        self.in_channels = in_channels
+        self.embed_dim = embed_dim
+        self.num_pos_dims = num_pos_dims
+        self.out_channels = out_channels
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.ffn_expansion_factor = ffn_expansion_factor
+        self.attn_compression_factor = attn_compression_factor
+        self.rope_freq = rope_freq
+        self.with_conv = with_conv
+        self.kernel_size_conv = kernel_size_conv
+        self.kernel_size_in_out = kernel_size_in_out
+        self.has_time_embedding = has_time_embedding
+        self.has_conditional_embedding = has_conditional_embedding
+        self.fourier_projection_scale = fourier_projection_scale
+
+    def export_description(self) -> dict[str, Any]:
+        args = dict(
+            in_channels=self.in_channels,
+            embed_dim=self.embed_dim,
+            num_pos_dims=self.num_pos_dims,
+            out_channels=self.out_channels,
+            num_layers=self.num_layers,
+            num_heads=self.num_heads,
+            ffn_expansion_factor=self.ffn_expansion_factor,
+            attn_compression_factor=self.attn_compression_factor,
+            rope_freq=self.rope_freq,
+            with_conv=self.with_conv,
+            kernel_size_conv=self.kernel_size_conv,
+            kernel_size_in_out=self.kernel_size_in_out,
+            has_time_embedding=self.has_time_embedding,
+            has_conditional_embedding=self.has_conditional_embedding,
+            fourier_projection_scale=self.fourier_projection_scale
+        )
+        return args
+
+    @property
+    def has_embedding(self):
+        return self.has_time_embedding or self.has_conditional_embedding
+
+    @classmethod
+    def from_description(cls, description: dict):
+        return cls(**description)
+
+    @classmethod
+    def from_config_file(cls, config_file: pathlib.Path | str):
+        with open(config_file, "r") as f:
+            description = yaml.safe_load(f)
+        return cls.from_description(description)
 
 
 class DimensionHelper:
@@ -98,6 +171,26 @@ class DimensionHelper:
             return torch.nn.functional.avg_pool3d(x, kernel_size, stride, padding)
 
 
+class ChannelRMSNorm(torch.nn.Module):
+    def __init__(self, channel_dim: int, element_wise_affine: bool = True):
+        super().__init__()
+        self.element_wise_affine = element_wise_affine
+        self.channel_dim = channel_dim
+        if self.element_wise_affine:
+            self.weight = torch.nn.Parameter(torch.ones(channel_dim))
+        else:
+            self.register_parameter("weight", None)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        eps = torch.finfo(x.dtype).eps
+        norm = torch.sqrt(torch.mean(x**2, dim=1, keepdim=True) + eps)
+        x = x / norm
+        if self.element_wise_affine:
+            num_pos_dims = len(x.shape[2:])
+            x = x * self.weight.view(1, -1, *([1] * num_pos_dims))
+        return x
+
+
 class Upsample(torch.nn.Module):
     def __init__(self, num_pos_dims, channels_in, channels_out=None, expansion_factor=2, with_conv=False):
         super().__init__()
@@ -162,7 +255,8 @@ class ConvSwiGLU(torch.nn.Module):
                  embed_dim: int,
                  num_pos_dims: int,
                  expansion_factor: int = 4,
-                 kernel_size: int = 1):
+                 kernel_size: int = 1,
+                 final_rms: bool = False):
         super().__init__()
         self.embed_dim = embed_dim
         self.linear_in = DimensionHelper.get_conv_cls(num_pos_dims)(
@@ -172,9 +266,34 @@ class ConvSwiGLU(torch.nn.Module):
         self.swish = torch.nn.SiLU()
         self.linear_out = DimensionHelper.get_conv_cls(num_pos_dims)(
             embed_dim * expansion_factor, embed_dim, kernel_size, padding='same')
+        if final_rms:
+            self.rms = ChannelRMSNorm(channel_dim=embed_dim)
+        else:
+            self.rms = lambda x: x
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.linear_out(self.swish(self.linear_in(x)) * self.linear_gate(x))
+        x = self.linear_out(self.swish(self.linear_in(x)) * self.linear_gate(x))
+        x = self.rms(x)
+        return x
+
+
+class SwiGLU(torch.nn.Module):
+    def __init__(self, embed_dim: int, final_rms: bool = False):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.linear_in = torch.nn.Linear(embed_dim, embed_dim * 4)
+        self.linear_gate = torch.nn.Linear(embed_dim, embed_dim * 4)
+        self.swish = torch.nn.SiLU()
+        self.linear_out = torch.nn.Linear(embed_dim * 4, embed_dim)
+        if final_rms:
+            self.rms = torch.nn.RMSNorm(embed_dim)
+        else:
+            self.rms = lambda x: x
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.linear_out(self.swish(self.linear_in(x)) * self.linear_gate(x))
+        x = self.rms(x)
+        return x
 
 
 class LearnedRoPE(torch.nn.Module):
@@ -324,7 +443,8 @@ class ConVitBlock(torch.nn.Module):
                  num_heads: int = 8,
                  rope_freq: float = 1.0,
                  with_conv: bool = False,
-                 kernel_size_conv: int = 3):
+                 kernel_size_conv: int = 3,
+                 has_embedding: bool = False):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_pos_dims = num_pos_dims
@@ -334,8 +454,8 @@ class ConVitBlock(torch.nn.Module):
         self.rope_freq = rope_freq
         self.kernel_size_conv = kernel_size_conv
 
-        self.norm_1 = torch.nn.RMSNorm(embed_dim)
-        self.norm_2 = torch.nn.RMSNorm(embed_dim)
+        self.norm_1 = ChannelRMSNorm(channel_dim=embed_dim)
+        self.norm_2 = ChannelRMSNorm(channel_dim=embed_dim)
         self.attention = MultiheadAttention(
             embed_dim=embed_dim,
             num_heads=num_heads,
@@ -359,26 +479,32 @@ class ConVitBlock(torch.nn.Module):
             num_pos_dims=num_pos_dims,
             expansion_factor=ffn_expansion_factor,
             kernel_size=kernel_size_conv)
+        self.has_embedding = has_embedding
+        if has_embedding:
+            self.embedding_projection = SwiGLU(embed_dim=embed_dim, final_rms=True)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, y: torch.Tensor | None = None) -> torch.Tensor:
         channel_m_symbols = ' '.join(
             [f'm{i}' for i in range(self.num_pos_dims)]
         )
+        if y is not None:
+            if not self.has_embedding:
+                raise ValueError("Conditional embedding is not supported when self.has_embedding=False")
+            y = self.embedding_projection(y)
+            y = y.reshape(y.shape[0], -1, *([1] * self.num_pos_dims))
+        else:
+            y = 0.0
 
         x0 = x.clone()
-        x = einops.rearrange(x, f'b d {channel_m_symbols} -> b {channel_m_symbols} d')
-        x = self.norm_1(x)
-        x = einops.rearrange(x, f'b {channel_m_symbols} d -> b d {channel_m_symbols}')
-        x = self.upsample(x)
+        x = self.norm_1(x) + y
+        x = self.downsample(x)
         x = einops.rearrange(x, f'b d {channel_m_symbols} -> b {channel_m_symbols} d')
         x = self.attention(x)
         x = einops.rearrange(x, f'b {channel_m_symbols} d -> b d {channel_m_symbols}')
-        x = self.downsample(x)
+        x = self.upsample(x)
         x = x + x0
         x0 = x.clone()
-        x = einops.rearrange(x, f'b d {channel_m_symbols} -> b {channel_m_symbols} d')
-        x = self.norm_2(x)
-        x = einops.rearrange(x, f'b {channel_m_symbols} d -> b d {channel_m_symbols}')
+        x = self.norm_2(x) + y
         x = self.ffn(x)
         x = x + x0
         return x
@@ -386,67 +512,71 @@ class ConVitBlock(torch.nn.Module):
 
 class ConVit(torch.nn.Module):
     def __init__(self,
-                 in_channels: int,
-                 embed_dim: int,
-                 num_pos_dims: int,
-                 out_channels: int | None = None,
-                 num_layers: int = 6,
-                 num_heads: int = 8,
-                 ffn_expansion_factor: int = 4,
-                 attn_compression_factor: int = 2,
-                 rope_freq: float = 1.0,
-                 with_conv: bool = False,
-                 kernel_size_conv: int = 3,
-                 kernel_size_in_out: int = 3):
+                 config: ConVitConfig,
+                 conditional_embedding: None | torch.nn.Module = None):
         super().__init__()
-        self.in_channels = in_channels
-        self.embed_dim = embed_dim
-        out_channels = out_channels if out_channels is not None else embed_dim
+        self.config = config
+        self.in_channels = config.in_channels
+        self.embed_dim = config.embed_dim
+        out_channels = config.out_channels if config.out_channels is not None else config.embed_dim
         self.out_channels = out_channels
-        self.num_pos_dims = num_pos_dims
-        self.num_layers = num_layers
-        self.num_heads = num_heads
-        self.ffn_expansion_factor = ffn_expansion_factor
-        self.attn_compression_factor = attn_compression_factor
-        self.rope_freq = rope_freq
-        self.with_conv = with_conv
+        self.num_pos_dims = config.num_pos_dims
+        self.num_layers = config.num_layers
+        self.num_heads = config.num_heads
+        self.ffn_expansion_factor = config.ffn_expansion_factor
+        self.attn_compression_factor = config.attn_compression_factor
+        self.rope_freq = config.rope_freq
+        self.with_conv = config.with_conv
+        self.kernel_size_conv = config.kernel_size_conv
+        self.kernel_size_in_out = config.kernel_size_in_out
+        self.has_embedding = config.has_embedding
+        self.has_conditional_embedding = config.has_conditional_embedding
+        self.fourier_projection_scale = config.fourier_projection_scale
 
-        self.convin = DimensionHelper.get_conv_cls(num_pos_dims)(
-            in_channels,
-            embed_dim,
-            kernel_size_in_out,
+        self.convin = DimensionHelper.get_conv_cls(self.num_pos_dims)(
+            self.in_channels,
+            self.embed_dim,
+            self.kernel_size_in_out,
             padding='same'
         )
-        self.convout = DimensionHelper.get_conv_cls(num_pos_dims)(
-            embed_dim,
-            out_channels,
-            kernel_size_in_out,
+        self.convout = DimensionHelper.get_conv_cls(self.num_pos_dims)(
+            self.embed_dim,
+            self.out_channels,
+            self.kernel_size_in_out,
             padding='same'
         )
-        self.normout = torch.nn.RMSNorm(embed_dim)
+        self.normout = ChannelRMSNorm(channel_dim=self.embed_dim)
 
         self.blocks = torch.nn.ModuleList([
             ConVitBlock(
-                embed_dim=embed_dim,
-                num_pos_dims=num_pos_dims,
-                ffn_expansion_factor=ffn_expansion_factor,
-                attn_compression_factor=attn_compression_factor,
-                num_heads=num_heads,
-                rope_freq=rope_freq,
-                with_conv=with_conv,
-                kernel_size_conv=kernel_size_conv)
-            for _ in range(num_layers)
+                embed_dim=self.embed_dim,
+                num_pos_dims=self.num_pos_dims,
+                ffn_expansion_factor=self.ffn_expansion_factor,
+                attn_compression_factor=self.attn_compression_factor,
+                num_heads=self.num_heads,
+                rope_freq=self.rope_freq,
+                with_conv=self.with_conv,
+                kernel_size_conv=self.kernel_size_conv,
+                has_embedding=self.has_embedding)
+            for _ in range(self.num_layers)
         ])
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        channel_m_symbols = ' '.join(
-            [f'm{i}' for i in range(self.num_pos_dims)]
-        )
+        if config.has_time_embedding:
+            self.time_embedding = GaussianFourierProjection(
+                embed_dim=self.embed_dim, scale=self.fourier_projection_scale)
+        if config.has_conditional_embedding:
+            assert isinstance(conditional_embedding, torch.nn.Module)
+            self.conditional_embedding = conditional_embedding
+
+    def forward(self, x: torch.Tensor, t: torch.Tensor | None = None, y: torch.Tensor | None = None) -> torch.Tensor:
+        te = self.time_embedding(t) if t is not None else 0.0
+        ye = self.conditional_embedding(y) if y is not None else 0.0
+        y = te + ye
+        if not isinstance(y, torch.Tensor):
+            y = None
         x = self.convin(x)
         for block in self.blocks:
-            x = block(x)
-        x = einops.rearrange(x, f'b d {channel_m_symbols} -> b {channel_m_symbols} d')
+            x = block(x, y)
         x = self.normout(x)
-        x = einops.rearrange(x, f'b {channel_m_symbols} d -> b d {channel_m_symbols}')
         x = self.convout(x)
         return x

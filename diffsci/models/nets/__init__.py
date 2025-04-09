@@ -29,4 +29,4 @@ from .patched_conv import (
     get_patch_conv,
 )
 
-from .convit import ConVit, ConVitBlock
+from .convit import ConVit, ConVitBlock, ConVitConfig
