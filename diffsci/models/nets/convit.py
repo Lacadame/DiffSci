@@ -1,0 +1,452 @@
+# TODO: Put DimensionHelper in a unified separate file
+
+import math
+
+import torch
+import einops
+
+
+class DimensionHelper:
+    """Helper class for dimension-specific operations."""
+
+    @staticmethod
+    def get_conv_cls(dimension):
+        if dimension == 1:
+            return torch.nn.Conv1d
+        elif dimension == 2:
+            return torch.nn.Conv2d
+        elif dimension == 3:
+            return torch.nn.Conv3d
+        else:
+            raise ValueError(f"Unsupported dimension: {dimension}")
+
+    @staticmethod
+    def get_convtranspose_cls(dimension):
+        if dimension == 1:
+            return torch.nn.ConvTranspose1d
+        elif dimension == 2:
+            return torch.nn.ConvTranspose2d
+        elif dimension == 3:
+            return torch.nn.ConvTranspose3d
+        else:
+            raise ValueError(f"Unsupported dimension: {dimension}")
+
+    @staticmethod
+    def get_shape_for_broadcast(dimension, batch_size, channels, *spatial_dims):
+        """Return shape for broadcasting time embedding to spatial dimensions."""
+        if dimension == 1:
+            return [batch_size, channels, 1]
+        elif dimension == 2:
+            return [batch_size, channels, 1, 1]
+        elif dimension == 3:
+            return [batch_size, channels, 1, 1, 1]
+        else:
+            raise ValueError(f"Unsupported dimension: {dimension}")
+
+    @staticmethod
+    def flatten_spatial_dims(x, dimension):
+        """Flatten spatial dimensions for attention."""
+        b, c = x.shape[0], x.shape[1]
+        if dimension == 1:
+            # [b, c, d] -> [b, c, d]
+            return x.reshape(b, c, -1), x.shape[2]
+        elif dimension == 2:
+            # [b, c, h, w] -> [b, c, h*w]
+            return x.reshape(b, c, -1), (x.shape[2], x.shape[3])
+        elif dimension == 3:
+            # [b, c, h, w, d] -> [b, c, h*w*d]
+            return x.reshape(b, c, -1), (x.shape[2], x.shape[3], x.shape[4])
+        else:
+            raise ValueError(f"Unsupported dimension: {dimension}")
+
+    @staticmethod
+    def unflatten_spatial_dims(x, dimension, spatial_size):
+        """Unflatten spatial dimensions after attention."""
+        b, c = x.shape[0], x.shape[1]
+        if dimension == 1:
+            # [b, c, d] -> [b, c, d]
+            return x.reshape(b, c, spatial_size)
+        elif dimension == 2:
+            # [b, c, h*w] -> [b, c, h, w]
+            h, w = spatial_size
+            return x.reshape(b, c, h, w)
+        elif dimension == 3:
+            # [b, c, h*w*d] -> [b, c, h, w, d]
+            h, w, d = spatial_size
+            return x.reshape(b, c, h, w, d)
+        else:
+            raise ValueError(f"Unsupported dimension: {dimension}")
+
+    @staticmethod
+    def interpolate_fn(x, dimension, scale_factor):
+        if dimension == 1:
+            return torch.nn.functional.interpolate(x, scale_factor=scale_factor, mode='linear', align_corners=False)
+        elif dimension == 2:
+            return torch.nn.functional.interpolate(x, scale_factor=scale_factor, mode='bilinear', align_corners=False)
+        elif dimension == 3:
+            return torch.nn.functional.interpolate(x, scale_factor=scale_factor, mode='trilinear', align_corners=False)
+        else:
+            raise ValueError(f"Unsupported dimension: {dimension}")
+
+    @staticmethod
+    def avgpool_fn(x, dimension, kernel_size, stride, padding):
+        if dimension == 1:
+            return torch.nn.functional.avg_pool1d(x, kernel_size, stride, padding)
+        elif dimension == 2:
+            return torch.nn.functional.avg_pool2d(x, kernel_size, stride, padding)
+        elif dimension == 3:
+            return torch.nn.functional.avg_pool3d(x, kernel_size, stride, padding)
+
+
+class Upsample(torch.nn.Module):
+    def __init__(self, num_pos_dims, channels_in, channels_out=None, expansion_factor=2, with_conv=False):
+        super().__init__()
+        self.num_pos_dims = num_pos_dims
+        self.channels_in = channels_in
+        if channels_out is None:
+            channels_out = channels_in
+        self.channels_out = channels_out
+        self.expansion_factor = expansion_factor
+        stride = expansion_factor
+        assert stride % 2 == 0
+        kernel_size = 2 * expansion_factor
+        padding = stride // 2
+        if with_conv:
+            self.conv = DimensionHelper.get_convtranspose_cls(self.num_pos_dims)(
+                channels_in, channels_out, kernel_size, stride, padding)
+        else:
+            self.conv = lambda x: DimensionHelper.interpolate_fn(
+                x, self.num_pos_dims, expansion_factor)
+
+    def forward(self, x):
+        assert x.shape[1] == self.channels_in
+        assert len(x.shape) == self.num_pos_dims + 2
+
+        x = self.conv(x)
+        return x
+
+
+class Downsample(torch.nn.Module):
+    def __init__(self, num_pos_dims,
+                 channels_in,
+                 channels_out=None,
+                 compression_factor=2,
+                 with_conv=False):
+        super().__init__()
+        self.num_pos_dims = num_pos_dims
+        self.channels_in = channels_in
+        if channels_out is None:
+            channels_out = channels_in
+        self.compression_factor = compression_factor
+        stride = compression_factor
+        assert stride % 2 == 0
+        kernel_size = 2 * compression_factor
+        padding = stride // 2
+        if with_conv:
+            self.conv = DimensionHelper.get_conv_cls(self.num_pos_dims)(
+                channels_in, channels_out, kernel_size, stride, padding)
+        else:
+            self.conv = lambda x: DimensionHelper.avgpool_fn(
+                x, self.num_pos_dims, compression_factor, compression_factor, 0)
+
+    def forward(self, x):
+        assert x.shape[1] == self.channels_in
+        assert len(x.shape) == self.num_pos_dims + 2
+
+        x = self.conv(x)
+        return x
+
+
+class ConvSwiGLU(torch.nn.Module):
+    def __init__(self,
+                 embed_dim: int,
+                 num_pos_dims: int,
+                 expansion_factor: int = 4,
+                 kernel_size: int = 1):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.linear_in = DimensionHelper.get_conv_cls(num_pos_dims)(
+            embed_dim, embed_dim * expansion_factor, kernel_size, padding='same')
+        self.linear_gate = DimensionHelper.get_conv_cls(num_pos_dims)(
+            embed_dim, embed_dim * expansion_factor, kernel_size, padding='same')
+        self.swish = torch.nn.SiLU()
+        self.linear_out = DimensionHelper.get_conv_cls(num_pos_dims)(
+            embed_dim * expansion_factor, embed_dim, kernel_size, padding='same')
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.linear_out(self.swish(self.linear_in(x)) * self.linear_gate(x))
+
+
+class LearnedRoPE(torch.nn.Module):
+    def __init__(self, embed_dim: int, num_pos_dims: int = 1, base_freq: float = 1.0):
+        super().__init__()
+        self.embed_dim = embed_dim
+        assert embed_dim % 2 == 0
+        self.half_dim = embed_dim // 2
+        self.base_freq = base_freq
+        self.num_pos_dims = num_pos_dims
+
+        self.angles = torch.nn.Parameter(
+            torch.randn(self.num_pos_dims, self.half_dim) * self.base_freq
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        position_dimensions = x.shape[1:-1]
+        positions = torch.stack(
+            torch.meshgrid(
+                [torch.arange(d).to(x.device) for d in position_dimensions]), dim=-1)
+        angles = (positions.unsqueeze(-1) * self.angles).sum(dim=-2)  # [*pos_dims, d//2]
+        x = einops.rearrange(x, '... (d c) -> ... d c', c=2)  # [b, l, d//2, 2]
+        x = torch.stack([
+            x[..., 0] * torch.cos(angles) - x[..., 1] * torch.sin(angles),
+            x[..., 0] * torch.sin(angles) + x[..., 1] * torch.cos(angles),
+        ], dim=-1)
+        x = einops.rearrange(x, '... d c -> ... (d c)', c=2)
+        return x
+
+    @classmethod
+    def outer_product(cls, *vectors):
+        """
+        Compute the outer product of a list of vectors of shape [..., d_i],
+        returning a tensor of shape [..., d_1, d_2, ..., d_n].
+        """
+        raise NotImplementedError("Not implemented")
+        if not vectors:
+            raise ValueError("At least one vector is required")
+
+        result = vectors[0].clone()
+        for i, vec in enumerate(vectors[1:], 1):
+            result = result.unsqueeze(-1) * vec.unsqueeze(-2)
+        return result
+
+
+class MultiheadAttention(torch.nn.Module):
+    def __init__(self,
+                 embed_dim: int,
+                 num_heads: int,
+                 dim_per_head: int | None = None,
+                 num_pos_dims: int = 1,
+                 rope_freq: float = 1.0):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        if dim_per_head is None:
+            dim_per_head = embed_dim // num_heads
+        self.dim_per_head = dim_per_head
+        assert self.embed_dim % self.num_heads == 0
+        assert self.dim_per_head % 2 == 0
+
+        self.q_proj_tensor = torch.nn.Parameter(
+            torch.empty((embed_dim, dim_per_head, num_heads))
+        )
+        self.k_proj_tensor = torch.nn.Parameter(
+            torch.empty((embed_dim, dim_per_head, num_heads))
+        )
+        self.v_proj_tensor = torch.nn.Parameter(
+            torch.empty((embed_dim, dim_per_head, num_heads))
+        )
+        self.out_proj_tensor = torch.nn.Parameter(
+            torch.empty((embed_dim, dim_per_head, num_heads))
+        )
+        self.reset_parameters()
+        self.rope_layer = LearnedRoPE(embed_dim=dim_per_head, num_pos_dims=num_pos_dims, base_freq=rope_freq)
+        self.register_buffer("scale", torch.sqrt(torch.tensor(dim_per_head, dtype=torch.float32)))
+
+    def reset_parameters(self):
+        qk_fan_in, qk_fan_out = self.embed_dim, self.dim_per_head
+        vo_fan_in, vo_fan_out = self.embed_dim, self.dim_per_head
+        qk_bound = 6 / math.sqrt(qk_fan_in + qk_fan_out)
+        vo_bound = 6 / math.sqrt(vo_fan_in + vo_fan_out)
+
+        torch.nn.init.uniform_(self.q_proj_tensor, -qk_bound, qk_bound)
+        torch.nn.init.uniform_(self.k_proj_tensor, -qk_bound, qk_bound)
+        torch.nn.init.uniform_(self.v_proj_tensor, -vo_bound, vo_bound)
+        torch.nn.init.uniform_(self.out_proj_tensor, -vo_bound, vo_bound)
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor | None = None):
+        if y is None:
+            y = x
+
+        num_channel_indexes = len(x.shape[1: -1])
+        channel_m_symbols = ' '.join(
+            [f'm{i}' for i in range(num_channel_indexes)]
+        )
+        channel_n_symbols = ' '.join(
+            [f'n{i}' for i in range(num_channel_indexes)]
+        )
+
+        h = self.num_heads
+
+        query_signature = f'b {channel_m_symbols} d, d dv h -> b {channel_m_symbols} dv h'
+        query = einops.einsum(x, self.q_proj_tensor, query_signature)
+        key_signature = f'b {channel_m_symbols} d, d dv h -> b {channel_m_symbols} dv h'
+        key = einops.einsum(y, self.k_proj_tensor, key_signature)
+        value_signature = f'b {channel_m_symbols} d, d dv h -> b {channel_m_symbols} dv h'
+        value = einops.einsum(y, self.v_proj_tensor, value_signature)
+
+        query_signature = f'b {channel_m_symbols} dv h -> (b h) {channel_m_symbols} dv'
+        query = einops.rearrange(query, query_signature)
+        key_signature = f'b {channel_m_symbols} dv h -> (b h) {channel_m_symbols} dv'
+        key = einops.rearrange(key, key_signature)
+
+        query = self.rope_layer(query)
+        key = self.rope_layer(key)
+
+        query_signature = f'(b h) {channel_m_symbols} dv -> b {channel_m_symbols} dv h'
+        query = einops.rearrange(query, query_signature, h=h)
+        key_signature = f'(b h) {channel_m_symbols} dv -> b {channel_m_symbols} dv h'
+        key = einops.rearrange(key, key_signature, h=h)
+
+        scores_signature = \
+            f'b {channel_m_symbols} dv h, b {channel_n_symbols} dv h -> b {channel_m_symbols} {channel_n_symbols} h'
+        scores = einops.einsum(query, key, scores_signature)
+
+        scores = scores / self.scale
+
+        attention = torch.softmax(scores, dim=-2)
+
+        value_signature = f'b {channel_m_symbols} {channel_n_symbols} h, ' \
+                          f'b {channel_n_symbols} dv h -> b {channel_m_symbols} dv h'
+        value = einops.einsum(attention, value, value_signature)
+
+        value_signature = f'b {channel_m_symbols} dv h, d dv h -> b {channel_m_symbols} d'
+        value = einops.einsum(value, self.out_proj_tensor, value_signature)
+
+        return value
+
+
+class ConVitBlock(torch.nn.Module):
+    def __init__(self,
+                 embed_dim: int,
+                 num_pos_dims: int,
+                 ffn_expansion_factor: int = 4,
+                 attn_compression_factor: int = 2,
+                 num_heads: int = 8,
+                 rope_freq: float = 1.0,
+                 with_conv: bool = False,
+                 kernel_size_conv: int = 3):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_pos_dims = num_pos_dims
+        self.ffn_expansion_factor = ffn_expansion_factor
+        self.attn_compression_factor = attn_compression_factor
+        self.num_heads = num_heads
+        self.rope_freq = rope_freq
+        self.kernel_size_conv = kernel_size_conv
+
+        self.norm_1 = torch.nn.RMSNorm(embed_dim)
+        self.norm_2 = torch.nn.RMSNorm(embed_dim)
+        self.attention = MultiheadAttention(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            num_pos_dims=num_pos_dims,
+            rope_freq=rope_freq
+        )
+        self.upsample = Upsample(
+            num_pos_dims=num_pos_dims,
+            channels_in=embed_dim,
+            channels_out=embed_dim,
+            expansion_factor=attn_compression_factor,
+            with_conv=with_conv)
+        self.downsample = Downsample(
+            num_pos_dims=num_pos_dims,
+            channels_in=embed_dim,
+            channels_out=embed_dim,
+            compression_factor=attn_compression_factor,
+            with_conv=with_conv)
+        self.ffn = ConvSwiGLU(
+            embed_dim=embed_dim,
+            num_pos_dims=num_pos_dims,
+            expansion_factor=ffn_expansion_factor,
+            kernel_size=kernel_size_conv)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        channel_m_symbols = ' '.join(
+            [f'm{i}' for i in range(self.num_pos_dims)]
+        )
+
+        x0 = x.clone()
+        x = einops.rearrange(x, f'b d {channel_m_symbols} -> b {channel_m_symbols} d')
+        x = self.norm_1(x)
+        x = einops.rearrange(x, f'b {channel_m_symbols} d -> b d {channel_m_symbols}')
+        x = self.upsample(x)
+        x = einops.rearrange(x, f'b d {channel_m_symbols} -> b {channel_m_symbols} d')
+        x = self.attention(x)
+        x = einops.rearrange(x, f'b {channel_m_symbols} d -> b d {channel_m_symbols}')
+        x = self.downsample(x)
+        x = x + x0
+        x0 = x.clone()
+        x = einops.rearrange(x, f'b d {channel_m_symbols} -> b {channel_m_symbols} d')
+        x = self.norm_2(x)
+        x = einops.rearrange(x, f'b {channel_m_symbols} d -> b d {channel_m_symbols}')
+        x = self.ffn(x)
+        x = x + x0
+        return x
+
+
+class ConVit(torch.nn.Module):
+    def __init__(self,
+                 in_channels: int,
+                 embed_dim: int,
+                 num_pos_dims: int,
+                 out_channels: int | None = None,
+                 num_layers: int = 6,
+                 num_heads: int = 8,
+                 ffn_expansion_factor: int = 4,
+                 attn_compression_factor: int = 2,
+                 rope_freq: float = 1.0,
+                 with_conv: bool = False,
+                 kernel_size_conv: int = 3,
+                 kernel_size_in_out: int = 3):
+        super().__init__()
+        self.in_channels = in_channels
+        self.embed_dim = embed_dim
+        out_channels = out_channels if out_channels is not None else embed_dim
+        self.out_channels = out_channels
+        self.num_pos_dims = num_pos_dims
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.ffn_expansion_factor = ffn_expansion_factor
+        self.attn_compression_factor = attn_compression_factor
+        self.rope_freq = rope_freq
+        self.with_conv = with_conv
+
+        self.convin = DimensionHelper.get_conv_cls(num_pos_dims)(
+            in_channels,
+            embed_dim,
+            kernel_size_in_out,
+            padding='same'
+        )
+        self.convout = DimensionHelper.get_conv_cls(num_pos_dims)(
+            embed_dim,
+            out_channels,
+            kernel_size_in_out,
+            padding='same'
+        )
+        self.normout = torch.nn.RMSNorm(embed_dim)
+
+        self.blocks = torch.nn.ModuleList([
+            ConVitBlock(
+                embed_dim=embed_dim,
+                num_pos_dims=num_pos_dims,
+                ffn_expansion_factor=ffn_expansion_factor,
+                attn_compression_factor=attn_compression_factor,
+                num_heads=num_heads,
+                rope_freq=rope_freq,
+                with_conv=with_conv,
+                kernel_size_conv=kernel_size_conv)
+            for _ in range(num_layers)
+        ])
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        channel_m_symbols = ' '.join(
+            [f'm{i}' for i in range(self.num_pos_dims)]
+        )
+        x = self.convin(x)
+        for block in self.blocks:
+            x = block(x)
+        x = einops.rearrange(x, f'b d {channel_m_symbols} -> b {channel_m_symbols} d')
+        x = self.normout(x)
+        x = einops.rearrange(x, f'b {channel_m_symbols} d -> b d {channel_m_symbols}')
+        x = self.convout(x)
+        return x

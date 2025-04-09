@@ -9,6 +9,7 @@
 
     "flake8.args": [
         "--max-line-length=120",
+        "--ignore=E201"
     ],
 
     "python.linting.pylanceEnabled": false,

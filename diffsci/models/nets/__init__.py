@@ -28,3 +28,5 @@ from .patched_conv import (
     patch_conv_3d,
     get_patch_conv,
 )
+
+from .convit import ConVit, ConVitBlock
