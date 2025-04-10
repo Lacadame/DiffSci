@@ -22,12 +22,14 @@ class ConVitConfig(object):
                  ffn_expansion_factor: int = 4,
                  attn_compression_factor: int = 2,
                  rope_freq: float = 1.0,
-                 with_conv: bool = False,
+                 with_conv_on_upsample: bool = False,
+                 with_conv_on_downsample: bool = False,
                  kernel_size_conv: int = 3,
                  kernel_size_in_out: int = 3,
                  has_time_embedding: bool = False,
                  has_conditional_embedding: bool = False,
-                 fourier_projection_scale: float = 30.0):
+                 fourier_projection_scale: float = 30.0,
+                 relative_positioning: bool = False):
         self.in_channels = in_channels
         self.embed_dim = embed_dim
         self.num_pos_dims = num_pos_dims
@@ -37,12 +39,14 @@ class ConVitConfig(object):
         self.ffn_expansion_factor = ffn_expansion_factor
         self.attn_compression_factor = attn_compression_factor
         self.rope_freq = rope_freq
-        self.with_conv = with_conv
+        self.with_conv_on_upsample = with_conv_on_upsample
+        self.with_conv_on_downsample = with_conv_on_downsample
         self.kernel_size_conv = kernel_size_conv
         self.kernel_size_in_out = kernel_size_in_out
         self.has_time_embedding = has_time_embedding
         self.has_conditional_embedding = has_conditional_embedding
         self.fourier_projection_scale = fourier_projection_scale
+        self.relative_positioning = relative_positioning
 
     def export_description(self) -> dict[str, Any]:
         args = dict(
@@ -55,12 +59,14 @@ class ConVitConfig(object):
             ffn_expansion_factor=self.ffn_expansion_factor,
             attn_compression_factor=self.attn_compression_factor,
             rope_freq=self.rope_freq,
-            with_conv=self.with_conv,
+            with_conv_on_upsample=self.with_conv_on_upsample,
+            with_conv_on_downsample=self.with_conv_on_downsample,
             kernel_size_conv=self.kernel_size_conv,
             kernel_size_in_out=self.kernel_size_in_out,
             has_time_embedding=self.has_time_embedding,
             has_conditional_embedding=self.has_conditional_embedding,
-            fourier_projection_scale=self.fourier_projection_scale
+            fourier_projection_scale=self.fourier_projection_scale,
+            relative_positioning=self.relative_positioning
         )
         return args
 
@@ -297,13 +303,18 @@ class SwiGLU(torch.nn.Module):
 
 
 class LearnedRoPE(torch.nn.Module):
-    def __init__(self, embed_dim: int, num_pos_dims: int = 1, base_freq: float = 1.0):
+    def __init__(self,
+                 embed_dim: int,
+                 num_pos_dims: int = 1,
+                 base_freq: float = 1.0,
+                 relative_positioning: bool = False):
         super().__init__()
         self.embed_dim = embed_dim
         assert embed_dim % 2 == 0
         self.half_dim = embed_dim // 2
         self.base_freq = base_freq
         self.num_pos_dims = num_pos_dims
+        self.relative_positioning = relative_positioning
 
         self.angles = torch.nn.Parameter(
             torch.randn(self.num_pos_dims, self.half_dim) * self.base_freq
@@ -311,9 +322,16 @@ class LearnedRoPE(torch.nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         position_dimensions = x.shape[1:-1]
+        normalizers = (
+            torch.ones(len(position_dimensions)) if not self.relative_positioning else
+            torch.tensor(position_dimensions)
+        ).to(x)
         positions = torch.stack(
             torch.meshgrid(
-                [torch.arange(d).to(x.device) for d in position_dimensions]), dim=-1)
+                [torch.arange(d).to(x) / n
+                 for d, n in zip(position_dimensions, normalizers)]),
+            dim=-1
+        )
         angles = (positions.unsqueeze(-1) * self.angles).sum(dim=-2)  # [*pos_dims, d//2]
         x = einops.rearrange(x, '... (d c) -> ... d c', c=2)  # [b, l, d//2, 2]
         x = torch.stack([
@@ -345,7 +363,8 @@ class MultiheadAttention(torch.nn.Module):
                  num_heads: int,
                  dim_per_head: int | None = None,
                  num_pos_dims: int = 1,
-                 rope_freq: float = 1.0):
+                 rope_freq: float = 1.0,
+                 relative_positioning: bool = False):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
@@ -368,7 +387,12 @@ class MultiheadAttention(torch.nn.Module):
             torch.empty((embed_dim, dim_per_head, num_heads))
         )
         self.reset_parameters()
-        self.rope_layer = LearnedRoPE(embed_dim=dim_per_head, num_pos_dims=num_pos_dims, base_freq=rope_freq)
+        self.rope_layer = LearnedRoPE(
+            embed_dim=dim_per_head,
+            num_pos_dims=num_pos_dims,
+            base_freq=rope_freq,
+            relative_positioning=relative_positioning
+        )
         self.register_buffer("scale", torch.sqrt(torch.tensor(dim_per_head, dtype=torch.float32)))
 
     def reset_parameters(self):
@@ -442,9 +466,11 @@ class ConVitBlock(torch.nn.Module):
                  attn_compression_factor: int = 2,
                  num_heads: int = 8,
                  rope_freq: float = 1.0,
-                 with_conv: bool = False,
+                 with_conv_on_upsample: bool = False,
+                 with_conv_on_downsample: bool = False,
                  kernel_size_conv: int = 3,
-                 has_embedding: bool = False):
+                 has_embedding: bool = False,
+                 relative_positioning: bool = False):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_pos_dims = num_pos_dims
@@ -460,20 +486,21 @@ class ConVitBlock(torch.nn.Module):
             embed_dim=embed_dim,
             num_heads=num_heads,
             num_pos_dims=num_pos_dims,
-            rope_freq=rope_freq
+            rope_freq=rope_freq,
+            relative_positioning=relative_positioning
         )
         self.upsample = Upsample(
             num_pos_dims=num_pos_dims,
             channels_in=embed_dim,
             channels_out=embed_dim,
             expansion_factor=attn_compression_factor,
-            with_conv=with_conv)
+            with_conv=with_conv_on_upsample)
         self.downsample = Downsample(
             num_pos_dims=num_pos_dims,
             channels_in=embed_dim,
             channels_out=embed_dim,
             compression_factor=attn_compression_factor,
-            with_conv=with_conv)
+            with_conv=with_conv_on_downsample)
         self.ffn = ConvSwiGLU(
             embed_dim=embed_dim,
             num_pos_dims=num_pos_dims,
@@ -518,7 +545,7 @@ class ConVit(torch.nn.Module):
         self.config = config
         self.in_channels = config.in_channels
         self.embed_dim = config.embed_dim
-        out_channels = config.out_channels if config.out_channels is not None else config.embed_dim
+        out_channels = config.out_channels if config.out_channels is not None else config.in_channels
         self.out_channels = out_channels
         self.num_pos_dims = config.num_pos_dims
         self.num_layers = config.num_layers
@@ -526,12 +553,14 @@ class ConVit(torch.nn.Module):
         self.ffn_expansion_factor = config.ffn_expansion_factor
         self.attn_compression_factor = config.attn_compression_factor
         self.rope_freq = config.rope_freq
-        self.with_conv = config.with_conv
+        self.with_conv_on_upsample = config.with_conv_on_upsample
+        self.with_conv_on_downsample = config.with_conv_on_downsample
         self.kernel_size_conv = config.kernel_size_conv
         self.kernel_size_in_out = config.kernel_size_in_out
         self.has_embedding = config.has_embedding
         self.has_conditional_embedding = config.has_conditional_embedding
         self.fourier_projection_scale = config.fourier_projection_scale
+        self.relative_positioning = config.relative_positioning
 
         self.convin = DimensionHelper.get_conv_cls(self.num_pos_dims)(
             self.in_channels,
@@ -555,9 +584,11 @@ class ConVit(torch.nn.Module):
                 attn_compression_factor=self.attn_compression_factor,
                 num_heads=self.num_heads,
                 rope_freq=self.rope_freq,
-                with_conv=self.with_conv,
+                with_conv_on_upsample=self.with_conv_on_upsample,
+                with_conv_on_downsample=self.with_conv_on_downsample,
                 kernel_size_conv=self.kernel_size_conv,
-                has_embedding=self.has_embedding)
+                has_embedding=self.has_embedding,
+                relative_positioning=self.relative_positioning)
             for _ in range(self.num_layers)
         ])
 
