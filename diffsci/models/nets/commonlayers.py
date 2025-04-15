@@ -54,7 +54,7 @@ class DownSampler(torch.nn.Module):
             input_channels,
             output_channels,
             kernel_size=kernel_size,
-            padding='same',
+            padding='same',  # type: ignore
             bias=bias)
 
         if dimension == 2:

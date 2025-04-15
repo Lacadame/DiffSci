@@ -19,4 +19,14 @@ from .embedder import (TwoPointCorrelationEmbedder,
                        PoreSizeDistTransformer,
                        PorosityEmbedder,
                        CompositeEmbedder)
+from .vaenet import VAENet, VAENetConfig
 from . import commonlayers
+
+from .patched_conv import (
+    patch_conv_1d,
+    patch_conv_2d,
+    patch_conv_3d,
+    get_patch_conv,
+)
+
+from .convit import ConVit, ConVitBlock, ConVitConfig

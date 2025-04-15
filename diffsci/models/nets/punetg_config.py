@@ -1,5 +1,8 @@
 from typing import Any
 
+import pathlib
+import yaml
+
 
 class PUNetGConfig(object):
     def __init__(self,
@@ -101,3 +104,13 @@ class PUNetGConfig(object):
     @property
     def magnitude_preserving(self):
         return self.convolution_type == "mp"
+
+    @classmethod
+    def from_description(cls, description: dict):
+        return cls(**description)
+    
+    @classmethod
+    def from_config_file(cls, config_file: pathlib.Path | str):
+        with open(config_file, "r") as f:
+            description = yaml.safe_load(f)
+        return cls.from_description(description)

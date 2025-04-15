@@ -199,7 +199,7 @@ class KarrasModule(lightning.LightningModule):
         if self.autoencoder:
             self.freeze_autoencoder()
         self.autoencoder_conditional = autoencoder_conditional
-        self.encode_y = encode_y
+        self.encode_y = encode_y  # FIXME: What the fuck is this code?
         self.set_optimizer_and_scheduler()
         self.set_loss_metric()
         self.start_edm_batch_norm()
@@ -462,53 +462,59 @@ class KarrasModule(lightning.LightningModule):
             maximum_batch_size: None | int = None,
             integrator: None | str | integrators.Integrator = None,
             move_to_cpu: bool = False,
-            is_latent_shape: bool = False
+            is_latent_shape: bool = False,
+            squeeze_memory_efficiency: bool = False,
+            return_in_latent_space: bool = False
             ) -> Float[Tensor, "..."]:  # TODO: Put the actual shape
-        if maximum_batch_size is not None:
-            batch_sizes = get_minibatch_sizes(nsamples, maximum_batch_size)
-            result = []
-            for batch_size in batch_sizes:
-                result.append(self.sample(batch_size,
-                                          shape,
-                                          y,
-                                          guidance,
-                                          nsteps,
-                                          record_history,
-                                          maximum_batch_size=None,
-                                          integrator=integrator,
-                                          move_to_cpu=move_to_cpu))
-            catdim = 1 if record_history else 0
-            result = torch.cat(result, dim=catdim)
-            return result
-        else:
-            batched_shape = [nsamples] + list(shape)
-            white_noise = torch.randn(*batched_shape).to(self.device)
-            if y is not None:
-                y = dict_to(y, self.device)
-            # if self.latent_model and not is_latent_shape:  # TODO: A stupid hack. Should be improved
-            if self.latent_model:  # TODO: A stupid hack. Should be improved
-                if self.encode_y:
-                    original_y = y.copy()
-                    white_noise, y = self.encode(white_noise, y)
-                    y['y'] = y['y'].squeeze(0)
-                else:
-                    # if y['y'].dim() == 3:
-                    #     y['y'] = y['y'].unsqueeze(0)
-                    white_noise = self.encode(white_noise, y)
-                white_noise = torch.randn_like(white_noise)
-                # print(white_noise.shape)
-                # raise ValueError("Stop here")
-            result = self.propagate_white_noise(
-                        white_noise,
-                        y,
-                        guidance,
-                        nsteps,
-                        record_history,
-                        integrator=integrator,
-                        original_y=original_y if self.encode_y else None)
-            if move_to_cpu:
-                result = result.detach().cpu()
-            return result
+        with torch.inference_mode():
+            if maximum_batch_size is not None:
+                batch_sizes = get_minibatch_sizes(nsamples, maximum_batch_size)
+                result = []
+                for batch_size in batch_sizes:
+                    result.append(self.sample(batch_size,
+                                              shape,
+                                              y,
+                                              guidance,
+                                              nsteps,
+                                              record_history,
+                                              maximum_batch_size=None,
+                                              integrator=integrator,
+                                              move_to_cpu=move_to_cpu,
+                                              is_latent_shape=is_latent_shape,
+                                              squeeze_memory_efficiency=squeeze_memory_efficiency,
+                                              return_in_latent_space=return_in_latent_space))
+                catdim = 1 if record_history else 0
+                result = torch.cat(result, dim=catdim)
+                return result
+            else:
+                batched_shape = [nsamples] + list(shape)
+                white_noise = torch.randn(*batched_shape).to(self.device)
+                if y is not None:
+                    y = dict_to(y, self.device)
+                # Ideally we do not enter here and is_latent_shape is True
+                if self.latent_model and not is_latent_shape:  # TODO: A stupid hack. Should be improved
+                    if self.encode_y:  # FIXME: What the fuck is this code?
+                        original_y = y.copy()
+                        white_noise, y = self.encode(white_noise, y)
+                        y['y'] = y['y'].squeeze(0)
+                    else:
+                        white_noise = self.encode(white_noise, y)
+                    white_noise = torch.randn_like(white_noise)
+                    # print(white_noise.shape)
+                    # raise ValueError("Stop here")
+                result = self.propagate_white_noise(
+                            white_noise,
+                            y,
+                            guidance,
+                            nsteps,
+                            record_history,
+                            integrator=integrator,
+                            original_y=original_y if self.encode_y else None,
+                            move_to_cpu=move_to_cpu,
+                            latent_shape=is_latent_shape,
+                            squeeze_memory_efficiency=squeeze_memory_efficiency,
+                            return_in_latent_space=return_in_latent_space)
+                return result
 
     def propagate_white_noise(
             self,
@@ -518,20 +524,36 @@ class KarrasModule(lightning.LightningModule):
             nsteps: int = 100,
             record_history: bool = False,
             integrator: None | str | integrators.Integrator = None,
-            original_y: None | dict[str, Float[Tensor, "*yshape"]] = None
+            original_y: None | dict[str, Float[Tensor, "*yshape"]] = None,  # noqa: F821
+            move_to_cpu: bool = False,
+            latent_shape: bool = False,
+            squeeze_memory_efficiency: bool = False,
+            return_in_latent_space: bool = False
             ) -> Float[Tensor, "..."]:  # TODO: Put the actual shape
         x = x*self.config.noisescheduler.maximum_scale
-        result = self.propagate_toward_sample(x,
-                                              y,
-                                              guidance,
-                                              nsteps,
-                                              record_history,
-                                              integrator=integrator)
-        # if original_y is not None:
-        #     result = self.decode(result, original_y, record_history)
-        # else:
-        #     result = self.decode(result, y, record_history)
-        result = self.decode(result, y, record_history)
+        with torch.inference_mode():
+            result = self.propagate_toward_sample(x,
+                                                  y,
+                                                  guidance,
+                                                  nsteps,
+                                                  record_history,
+                                                  integrator=integrator)
+        if squeeze_memory_efficiency:
+            torch.cuda.empty_cache()
+            self.model.to("cpu")
+            self.autoencoder.encoder.to("cpu")
+        with torch.inference_mode():
+            if not return_in_latent_space:
+                if original_y is not None:
+                    result = self.decode(result, original_y, record_history)
+                else:
+                    result = self.decode(result, y, record_history)
+        if move_to_cpu:
+            result = result.detach().cpu()
+        if squeeze_memory_efficiency:
+            self.model.to(self.device)
+            self.autoencoder.encoder.to(self.device)
+
         return result
 
     def propagate_toward_sample(
@@ -569,8 +591,8 @@ class KarrasModule(lightning.LightningModule):
             nsteps: int = 100,
             record_history: bool = False,
             integrator: None | str | integrators.Integrator = None,
-            analytical_score = None,
-            interp_fn = None
+            analytical_score=None,
+            interp_fn=None
             ) -> Float[Tensor, "nsamples *shape"]:  # noqa: F821
         # TODO: Add the option of custom integration
         if y is not None:
@@ -581,7 +603,6 @@ class KarrasModule(lightning.LightningModule):
                 trained_score = self.get_score(x, sigma, y)
             if interp_fn is not None:        # for interpolating between trained and analytical scores
                 assert analytical_score is not None
-                print(sigma[0])
                 alpha = interp_fn(sigma).unsqueeze(-1).to(trained_score.device)
                 x_ = x.cpu().detach()
                 sigma_ = sigma.cpu().detach()

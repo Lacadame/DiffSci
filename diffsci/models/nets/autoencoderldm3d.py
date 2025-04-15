@@ -357,35 +357,57 @@ class Encoder(nn.Module):
                                         padding=1)
 
     def forward(self, x):
+        # print(f"Input x shape: {x.shape}, 10th item: {x.flatten()[9] if x.numel() > 9 else None}")
+        
         # timestep embedding
         temb = None
 
         # downsampling
-        hs = [self.conv_in(x)]
+        h = self.conv_in(x)
+        # print(f"After conv_in shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
+        hs = [h]
+        
         for i_level in range(self.num_resolutions):
+            # print(f"Downsampling level: {i_level}")
             for i_block in range(self.num_res_blocks):
                 h = self.down[i_level].block[i_block](hs[-1], temb)
+                # print(f"  After down[{i_level}].block[{i_block}] shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
+                
                 if len(self.down[i_level].attn) > 0:
                     h = self.down[i_level].attn[i_block](h)
+                    # print(f"  After down[{i_level}].attn[{i_block}] shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
+                
                 hs.append(h)
-                # print(h.shape)
+                
             if i_level != self.num_resolutions-1:
-                hs.append(self.down[i_level].downsample(hs[-1]))
-            # print(i_level)
+                h = self.down[i_level].downsample(hs[-1])
+                hs.append(h)
+                # print(f"  After down[{i_level}].downsample shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
 
         # middle
         h = hs[-1]
+        # print(f"Middle input shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
+        
         h = self.mid.block_1(h, temb)
+        # print(f"After mid.block_1 shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
+        
         if self.has_mid_attn:
             h = self.mid.attn_1(h)
+            # print(f"After mid.attn_1 shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
+            
         h = self.mid.block_2(h, temb)
-        # print(h.shape)
+        # print(f"After mid.block_2 shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
 
         # end
         h = self.norm_out(h)
+        # print(f"After norm_out shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
+        
         h = nonlinearity(h)
+        # print(f"After nonlinearity shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
+        
         h = self.conv_out(h)
-        # print(h.shape)
+        # print(f"After conv_out shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
+        
         return h
 
 
@@ -474,37 +496,58 @@ class Decoder(nn.Module):
     def forward(self, z):
         # assert z.shape[1:] == self.z_shape[1:]
         self.last_z_shape = z.shape
+        # print(f"Input z shape: {z.shape}, 10th item: {z.flatten()[9] if z.numel() > 9 else None}")
 
         # timestep embedding
         temb = None
 
         # z to block_in
         h = self.conv_in(z)
+        # print(f"After conv_in shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
 
         # middle
         h = self.mid.block_1(h, temb)
+        # print(f"After mid.block_1 shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
+        
         if self.has_mid_attn:
             h = self.mid.attn_1(h)
+            # print(f"After mid.attn_1 shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
+            
         h = self.mid.block_2(h, temb)
+        # print(f"After mid.block_2 shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
 
         # upsampling
         for i_level in reversed(range(self.num_resolutions)):
+            # print(f"Upsampling level: {i_level}")
             for i_block in range(self.num_res_blocks+1):
                 h = self.up[i_level].block[i_block](h, temb)
+                # print(f"  After up[{i_level}].block[{i_block}] shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
+                
                 if len(self.up[i_level].attn) > 0:
                     h = self.up[i_level].attn[i_block](h)
+                    # print(f"  After up[{i_level}].attn[{i_block}] shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
+                    
             if i_level != 0:
                 h = self.up[i_level].upsample(h)
+                # print(f"  After up[{i_level}].upsample shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
 
         # end
         if self.give_pre_end:
             return h
 
         h = self.norm_out(h)
+        # print(f"After norm_out shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
+        
         h = nonlinearity(h)
+        # print(f"After nonlinearity shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
+        
         h = self.conv_out(h)
+        # print(f"After conv_out shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
+        
         if self.tanh_out:
             h = torch.tanh(h)
+            # print(f"After tanh shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
+            
         return h
 
 # ldm.util
@@ -587,10 +630,19 @@ class lossconfig(object):
         self.disc_weight = disc_weight
 
 
+class distillconfig(object):
+    def __init__(self,
+                 teacher_model: torch.nn.Module,
+                 distill_weight: float = 1e-3):
+        self.teacher_model = teacher_model
+        self.distill_weight = distill_weight
+
+
 class AutoencoderKL(pl.LightningModule):
     def __init__(self,
                  ddconfig,
                  lossconfig,
+                 distillconfig=None,
                  embed_dim=4,
                  ckpt_path=None,
                  ignore_keys=[],
