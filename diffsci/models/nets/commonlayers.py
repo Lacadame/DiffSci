@@ -460,7 +460,7 @@ class ResnetTimeBlock(torch.nn.Module):
         # te : (nbatch, embed_channels)
         # returns : (nbatch, output_channels, 1, 1, 1)
         yt = self.net(te)
-        newdim = yt.shape + (1,)*self.dimension
+        newdim = yt.shape + (1,) * self.dimension
         yt = yt.view(*newdim)
         return yt
 

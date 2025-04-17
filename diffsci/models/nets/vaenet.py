@@ -216,6 +216,7 @@ class PatchedConv(torch.nn.Module):
                 custom_patch_size: int = None) -> torch.Tensor:
         # x is assumed to be of shape [..., *spatial_shape]
         dimensions = x.shape[-self.dimension:]
+
         patch_size = custom_patch_size if custom_patch_size is not None else self.patch_size
         if patch_size is None:
             need_patch = False
@@ -230,7 +231,8 @@ class PatchedConv(torch.nn.Module):
             # We manually pad the input to match the output shape
             pd = [self.padding]*2*self.dimension
             x = torch.nn.functional.pad(x, pd)
-            return self.conv(x)
+
+        return self.conv(x)
         
     @property
     def weight(self):
@@ -885,7 +887,10 @@ class VAENet(nn.Module):
 
     def encode(self, x, time=None, sample=True):
         """Encode input to latent parameters (mean and logvar)."""
+        print(x.shape)
+
         z = self.encoder(x, time)
+
         if sample:
             mean, logvar = torch.chunk(z, 2, dim=1)
             normsample = torch.randn_like(mean)

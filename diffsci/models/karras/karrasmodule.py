@@ -189,7 +189,8 @@ class KarrasModule(lightning.LightningModule):
                  masked: bool = False,
                  autoencoder: None | torch.nn.Module = None,
                  autoencoder_conditional: bool = False,
-                 encode_y: bool = False):
+                 encode_y: bool = False,
+                 decode_original_y: bool = False):
         super().__init__()
         self.model = model
         self.config = config
@@ -200,6 +201,7 @@ class KarrasModule(lightning.LightningModule):
             self.freeze_autoencoder()
         self.autoencoder_conditional = autoencoder_conditional
         self.encode_y = encode_y  # FIXME: What the fuck is this code?
+        self.decode_original_y = decode_original_y  # FIXME: What the fuck is this code?
         self.set_optimizer_and_scheduler()
         self.set_loss_metric()
         self.start_edm_batch_norm()
@@ -494,7 +496,8 @@ class KarrasModule(lightning.LightningModule):
                 # Ideally we do not enter here and is_latent_shape is True
                 if self.latent_model and not is_latent_shape:  # TODO: A stupid hack. Should be improved
                     if self.encode_y:  # FIXME: What the fuck is this code?
-                        original_y = y.copy()
+                        if self.decode_original_y:
+                            original_y = y.copy()
                         white_noise, y = self.encode(white_noise, y)
                         y['y'] = y['y'].squeeze(0)
                     else:
@@ -509,7 +512,7 @@ class KarrasModule(lightning.LightningModule):
                             nsteps,
                             record_history,
                             integrator=integrator,
-                            original_y=original_y if self.encode_y else None,
+                            original_y=original_y if self.decode_original_y else None,
                             move_to_cpu=move_to_cpu,
                             latent_shape=is_latent_shape,
                             squeeze_memory_efficiency=squeeze_memory_efficiency,
