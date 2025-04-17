@@ -483,7 +483,11 @@ class MixtureOfGaussiansDataset(AnalyticalDataset):
         if isinstance(self.scale, float):
             scale = self.scale
         else:
-            scale = self.scale.unsqueeze(0)
+            scale = self.scale.unsqueeze(0)     # [1, n]
+        dims = x.shape[1:]
+        n = 1
+        for dim in dims:
+            n *= dim
         sigma_mod = torch.sqrt(sigma.unsqueeze(-1)**2 + scale**2)  # [b, n]
         x = x.unsqueeze(1)  # [b, 1, *shape]
         p = self.means.unsqueeze(0)  # [1, n, *shape]
@@ -494,6 +498,9 @@ class MixtureOfGaussiansDataset(AnalyticalDataset):
         wfactors = expfactors * self.weights  # [b, n]
         sigma_mod_ = broadcast_from_below(sigma_mod, diff)  # [b, n, *shape]
         terms = -diff/(sigma_mod_**2)  # [b, n, *shape]
+        const = 2*math.pi*sigma_mod**2  # [b, n]
+        const = const**(-n/2)  # [b, n]
+        wfactors = wfactors * const  # [b, n]
         wfactors = broadcast_from_below(wfactors, terms)  # [b, n, *shape]
         wfactors = wfactors + SUM_STABILIZER  # [b, n, *shape]
         wfactors = wfactors/wfactors.sum(dim=1, keepdim=True)  # [b, n, *shape]
