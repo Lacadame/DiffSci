@@ -887,8 +887,6 @@ class VAENet(nn.Module):
 
     def encode(self, x, time=None, sample=True):
         """Encode input to latent parameters (mean and logvar)."""
-        print(x.shape)
-
         z = self.encoder(x, time)
 
         if sample:

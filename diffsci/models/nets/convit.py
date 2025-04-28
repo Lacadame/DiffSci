@@ -422,6 +422,8 @@ class MultiheadAttention(torch.nn.Module):
         channel_n_symbols = ' '.join(
             [f'n{i}' for i in range(num_channel_indexes)]
         )
+        # Store the original spatial dimensions for later reshaping
+        spatial_dims = x.shape[1:-1] if num_channel_indexes > 0 else ()
 
         h = self.num_heads
 
@@ -435,7 +437,7 @@ class MultiheadAttention(torch.nn.Module):
         if self.linear_attention:
             kv_feature_map = lambda x: torch.nn.functional.elu(x) + 1  # noqa: E731
             # kv_feature_map = lambda x: torch.nn.functional.softmax(x / self.scale, dim=-2)  # noqa: E731
-            query = kv_feature_map(query) / self.scale 
+            query = kv_feature_map(query) / self.scale
             key = kv_feature_map(key)
             ksum_signature = f'b {channel_m_symbols} dk h -> b dk h'
             ksum = einops.einsum(key, ksum_signature)
@@ -463,17 +465,36 @@ class MultiheadAttention(torch.nn.Module):
             value = einops.einsum(query, kv, value_signature)
             value = value / value_norm.unsqueeze(-2)
         else:
-            scores_signature = \
-                f'b {channel_m_symbols} dv h, b {channel_n_symbols} dv h -> b {channel_m_symbols} {channel_n_symbols} h'
-            scores = einops.einsum(query, key, scores_signature)
+            # FIXME: The correct should be the second one
+            # scores_signature = \
+            #     f'b {channel_m_symbols} dv h, b {channel_n_symbols} dv h -> b {channel_m_symbols} {channel_n_symbols} h'
+            # scores = einops.einsum(query, key, scores_signature)
 
-            scores = scores / self.scale
+            # scores = scores / self.scale
 
-            attention = torch.softmax(scores, dim=-2)
+            # attention = torch.softmax(scores, dim=-2)
 
-            value_signature = \
-                f'b {channel_m_symbols} {channel_n_symbols} h, b {channel_n_symbols} dv h -> b {channel_m_symbols} dv h'
-            value = einops.einsum(attention, value, value_signature)
+            # value_signature = \
+            #     f'b {channel_m_symbols} {channel_n_symbols} h, b {channel_n_symbols} dv h -> b {channel_m_symbols} dv h'
+            # value = einops.einsum(attention, value, value_signature)
+
+            dim_dict = {f'm{i}': spatial_dims[i] for i in range(num_channel_indexes)}
+            query = einops.rearrange(query, f'b {channel_m_symbols} dv h -> b h ({channel_m_symbols}) dv')
+            key = einops.rearrange(key, f'b {channel_m_symbols} dv h -> b h ({channel_m_symbols}) dv')
+            value = einops.rearrange(value, f'b {channel_m_symbols} dv h -> b h ({channel_m_symbols}) dv')
+
+            # Use scaled_dot_product_attention
+            value = torch.nn.functional.scaled_dot_product_attention(
+                query, key, value,
+                attn_mask=None,
+                is_causal=False,
+                scale=1.0 / self.scale  # The function applies scale internally
+            )
+
+            value = einops.rearrange(
+                value,
+                f'b h ({channel_m_symbols}) dv -> b {channel_m_symbols} dv h',
+                **dim_dict)
 
         value_signature = f'b {channel_m_symbols} dv h, d dv h -> b {channel_m_symbols} d'
         value = einops.einsum(value, self.out_proj_tensor, value_signature)
