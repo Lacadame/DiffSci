@@ -244,13 +244,12 @@ class SingleGaussianDataset(AnalyticalDataset):
         -------
         logp : torch.Tensor of shape (nbatch,).
         """
-        sigma = broadcast_from_below(sigma, x)
         sigma_mod = torch.sqrt(sigma**2 + self.scale**2)
         diff = (x - self.x0)**2
         sqnorm = (torch.sum(diff, dim=tuple(range(1, diff.dim()))))
         expterm = -0.5 * sqnorm / sigma_mod**2
         ndim = sum(self.x0.shape)
-        normalizer = -ndim/2*torch.log(2*math.pi*sigma**2)
+        normalizer = -ndim/2*torch.log(2*math.pi*sigma_mod**2)
         logp = expterm + normalizer
 
         return logp
