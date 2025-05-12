@@ -45,7 +45,7 @@ class HeunIntegrator(Integrator):
         if (t+dt) > 0:
             x_euler = x + dt*rhs_euler
             t_euler = t + dt
-            rhs_euler = rhs(x_euler, t_euler)
+            rhs_heun = rhs(x_euler, t_euler)
         elif (t+dt) == 0:
             rhs_heun = rhs_euler
         else:
