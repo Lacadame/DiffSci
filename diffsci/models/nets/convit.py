@@ -29,7 +29,8 @@ class ConVitConfig(object):
                  has_time_embedding: bool = False,
                  has_conditional_embedding: bool = False,
                  fourier_projection_scale: float = 30.0,
-                 relative_positioning: bool = False):
+                 relative_positioning: bool = False,
+                 linear_attention: bool = False):
         self.in_channels = in_channels
         self.embed_dim = embed_dim
         self.num_pos_dims = num_pos_dims
@@ -47,6 +48,7 @@ class ConVitConfig(object):
         self.has_conditional_embedding = has_conditional_embedding
         self.fourier_projection_scale = fourier_projection_scale
         self.relative_positioning = relative_positioning
+        self.linear_attention = linear_attention
 
     def export_description(self) -> dict[str, Any]:
         args = dict(
@@ -66,7 +68,8 @@ class ConVitConfig(object):
             has_time_embedding=self.has_time_embedding,
             has_conditional_embedding=self.has_conditional_embedding,
             fourier_projection_scale=self.fourier_projection_scale,
-            relative_positioning=self.relative_positioning
+            relative_positioning=self.relative_positioning,
+            linear_attention=self.linear_attention
         )
         return args
 
@@ -364,13 +367,15 @@ class MultiheadAttention(torch.nn.Module):
                  dim_per_head: int | None = None,
                  num_pos_dims: int = 1,
                  rope_freq: float = 1.0,
-                 relative_positioning: bool = False):
+                 relative_positioning: bool = False,
+                 linear_attention: bool = False):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         if dim_per_head is None:
             dim_per_head = embed_dim // num_heads
         self.dim_per_head = dim_per_head
+        self.linear_attention = linear_attention
         assert self.embed_dim % self.num_heads == 0
         assert self.dim_per_head % 2 == 0
 
@@ -417,6 +422,8 @@ class MultiheadAttention(torch.nn.Module):
         channel_n_symbols = ' '.join(
             [f'n{i}' for i in range(num_channel_indexes)]
         )
+        # Store the original spatial dimensions for later reshaping
+        spatial_dims = x.shape[1:-1] if num_channel_indexes > 0 else ()
 
         h = self.num_heads
 
@@ -426,6 +433,16 @@ class MultiheadAttention(torch.nn.Module):
         key = einops.einsum(y, self.k_proj_tensor, key_signature)
         value_signature = f'b {channel_m_symbols} d, d dv h -> b {channel_m_symbols} dv h'
         value = einops.einsum(y, self.v_proj_tensor, value_signature)
+
+        if self.linear_attention:
+            kv_feature_map = lambda x: torch.nn.functional.elu(x) + 1  # noqa: E731
+            # kv_feature_map = lambda x: torch.nn.functional.softmax(x / self.scale, dim=-2)  # noqa: E731
+            query = kv_feature_map(query) / self.scale
+            key = kv_feature_map(key)
+            ksum_signature = f'b {channel_m_symbols} dk h -> b dk h'
+            ksum = einops.einsum(key, ksum_signature)
+            value_norm_signature = f'b {channel_m_symbols} dk h, b dk h -> b {channel_m_symbols} h'
+            value_norm = einops.einsum(query, ksum, value_norm_signature) + torch.finfo(value.dtype).eps
 
         query_signature = f'b {channel_m_symbols} dv h -> (b h) {channel_m_symbols} dv'
         query = einops.rearrange(query, query_signature)
@@ -440,17 +457,44 @@ class MultiheadAttention(torch.nn.Module):
         key_signature = f'(b h) {channel_m_symbols} dv -> b {channel_m_symbols} dv h'
         key = einops.rearrange(key, key_signature, h=h)
 
-        scores_signature = \
-            f'b {channel_m_symbols} dv h, b {channel_n_symbols} dv h -> b {channel_m_symbols} {channel_n_symbols} h'
-        scores = einops.einsum(query, key, scores_signature)
+        if self.linear_attention:
 
-        scores = scores / self.scale
+            kv_signature = f'b {channel_m_symbols} dk h, b {channel_m_symbols} dv h -> b dk dv h'
+            kv = einops.einsum(key, value, kv_signature)
+            value_signature = f'b {channel_m_symbols} dk h, b dk dv h -> b {channel_m_symbols} dv h'
+            value = einops.einsum(query, kv, value_signature)
+            value = value / value_norm.unsqueeze(-2)
+        else:
+            # FIXME: The correct should be the second one
+            # scores_signature = \
+            #     f'b {channel_m_symbols} dv h, b {channel_n_symbols} dv h -> b {channel_m_symbols} {channel_n_symbols} h'
+            # scores = einops.einsum(query, key, scores_signature)
 
-        attention = torch.softmax(scores, dim=-2)
+            # scores = scores / self.scale
 
-        value_signature = f'b {channel_m_symbols} {channel_n_symbols} h, ' \
-                          f'b {channel_n_symbols} dv h -> b {channel_m_symbols} dv h'
-        value = einops.einsum(attention, value, value_signature)
+            # attention = torch.softmax(scores, dim=-2)
+
+            # value_signature = \
+            #     f'b {channel_m_symbols} {channel_n_symbols} h, b {channel_n_symbols} dv h -> b {channel_m_symbols} dv h'
+            # value = einops.einsum(attention, value, value_signature)
+
+            dim_dict = {f'm{i}': spatial_dims[i] for i in range(num_channel_indexes)}
+            query = einops.rearrange(query, f'b {channel_m_symbols} dv h -> b h ({channel_m_symbols}) dv')
+            key = einops.rearrange(key, f'b {channel_m_symbols} dv h -> b h ({channel_m_symbols}) dv')
+            value = einops.rearrange(value, f'b {channel_m_symbols} dv h -> b h ({channel_m_symbols}) dv')
+
+            # Use scaled_dot_product_attention
+            value = torch.nn.functional.scaled_dot_product_attention(
+                query, key, value,
+                attn_mask=None,
+                is_causal=False,
+                scale=1.0 / self.scale  # The function applies scale internally
+            )
+
+            value = einops.rearrange(
+                value,
+                f'b h ({channel_m_symbols}) dv -> b {channel_m_symbols} dv h',
+                **dim_dict)
 
         value_signature = f'b {channel_m_symbols} dv h, d dv h -> b {channel_m_symbols} d'
         value = einops.einsum(value, self.out_proj_tensor, value_signature)
@@ -470,7 +514,8 @@ class ConVitBlock(torch.nn.Module):
                  with_conv_on_downsample: bool = False,
                  kernel_size_conv: int = 3,
                  has_embedding: bool = False,
-                 relative_positioning: bool = False):
+                 relative_positioning: bool = False,
+                 linear_attention: bool = False):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_pos_dims = num_pos_dims
@@ -479,6 +524,7 @@ class ConVitBlock(torch.nn.Module):
         self.num_heads = num_heads
         self.rope_freq = rope_freq
         self.kernel_size_conv = kernel_size_conv
+        self.linear_attention = linear_attention
 
         self.norm_1 = ChannelRMSNorm(channel_dim=embed_dim)
         self.norm_2 = ChannelRMSNorm(channel_dim=embed_dim)
@@ -487,7 +533,8 @@ class ConVitBlock(torch.nn.Module):
             num_heads=num_heads,
             num_pos_dims=num_pos_dims,
             rope_freq=rope_freq,
-            relative_positioning=relative_positioning
+            relative_positioning=relative_positioning,
+            linear_attention=linear_attention
         )
         self.upsample = Upsample(
             num_pos_dims=num_pos_dims,
@@ -561,6 +608,7 @@ class ConVit(torch.nn.Module):
         self.has_conditional_embedding = config.has_conditional_embedding
         self.fourier_projection_scale = config.fourier_projection_scale
         self.relative_positioning = config.relative_positioning
+        self.linear_attention = config.linear_attention
 
         self.convin = DimensionHelper.get_conv_cls(self.num_pos_dims)(
             self.in_channels,
@@ -588,7 +636,8 @@ class ConVit(torch.nn.Module):
                 with_conv_on_downsample=self.with_conv_on_downsample,
                 kernel_size_conv=self.kernel_size_conv,
                 has_embedding=self.has_embedding,
-                relative_positioning=self.relative_positioning)
+                relative_positioning=self.relative_positioning,
+                linear_attention=self.linear_attention)
             for _ in range(self.num_layers)
         ])
 

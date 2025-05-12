@@ -288,7 +288,7 @@ class PUNetG(torch.nn.Module):
                       number_resnet_attn_block: int):
         attn_block = torch.nn.ModuleList(
             [self.attn_fn(input_multiplier)
-             for _ in range(number_resnet_attn_block-1)]
+             for _ in range(number_resnet_attn_block - 1)]
         )
         return attn_block
 
@@ -388,13 +388,13 @@ class PUNetG(torch.nn.Module):
             xe = torch.ones(xe_shape).to(x)
             x = torch.cat([x, xe], dim=1)
         x = self.convin(x)
-        te = self.time_projection(t)
+        te = self.time_projection(t)  # [B, C]
         if y is not None:
             if self.conditional_embedding is None:
                 ye = y
             else:
-                ye = self.conditional_embedding(y)
-            te = te + self.cond_dropout(ye)
+                ye = self.conditional_embedding(y)  # [B, C]
+            te = te + self.cond_dropout(ye)  # [B, C]
         x, intermediate_outputs = self.encode(x, te)
         x = self.bottom_forward(x, te)
         x = self.decode(x, te, intermediate_outputs)
