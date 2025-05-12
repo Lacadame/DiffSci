@@ -42,9 +42,14 @@ class HeunIntegrator(Integrator):
              rhs: ScoreFunction,
              noise_strength: None | Any = None):  # TODO: Complete this type
         rhs_euler = rhs(x, t)
-        x_heun = x + dt*rhs_euler
-        t_heun = t + dt
-        rhs_heun = rhs(x_heun, t_heun)
+        if (t+dt) > 0:
+            x_euler = x + dt*rhs_euler
+            t_euler = t + dt
+            rhs_euler = rhs(x_euler, t_euler)
+        elif (t+dt) == 0:
+            rhs_heun = rhs_euler
+        else:
+            raise ValueError("t+dt < 0 is not supported")
         x = x + 0.5*(rhs_euler + rhs_heun)*dt
         return x
 
