@@ -465,18 +465,6 @@ class MultiheadAttention(torch.nn.Module):
             value = einops.einsum(query, kv, value_signature)
             value = value / value_norm.unsqueeze(-2)
         else:
-            # FIXME: The correct should be the second one
-            # scores_signature = \
-            #     f'b {channel_m_symbols} dv h, b {channel_n_symbols} dv h -> b {channel_m_symbols} {channel_n_symbols} h'
-            # scores = einops.einsum(query, key, scores_signature)
-
-            # scores = scores / self.scale
-
-            # attention = torch.softmax(scores, dim=-2)
-
-            # value_signature = \
-            #     f'b {channel_m_symbols} {channel_n_symbols} h, b {channel_n_symbols} dv h -> b {channel_m_symbols} dv h'
-            # value = einops.einsum(attention, value, value_signature)
 
             dim_dict = {f'm{i}': spatial_dims[i] for i in range(num_channel_indexes)}
             query = einops.rearrange(query, f'b {channel_m_symbols} dv h -> b h ({channel_m_symbols}) dv')
