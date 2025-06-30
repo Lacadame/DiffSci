@@ -194,9 +194,9 @@ class PatchedConv(torch.nn.Module):
         super().__init__()
         assert kernel_size % 2 == 1, f"Kernel size must be odd, got {kernel_size}"
         assert stride == 1, f"Only implemented for stride == 1, got {stride}"
-        assert padding is None or padding == kernel_size//2, \
+        assert padding is None or padding == kernel_size // 2, \
             f"Padding must be kernel_size//2, got {padding}"
-        self.padding = padding if padding is not None else kernel_size//2
+        self.padding = padding if padding is not None else kernel_size // 2
         self.dimension = dimension
         self.kernel_size = kernel_size
         self.conv = DimensionHelper.get_conv_cls(dimension)(in_channels,
@@ -229,7 +229,7 @@ class PatchedConv(torch.nn.Module):
                                    padding=self.padding)
         else:
             # We manually pad the input to match the output shape
-            pd = [self.padding]*2*self.dimension
+            pd = [self.padding] * 2 * self.dimension
             x = torch.nn.functional.pad(x, pd)
 
         return self.conv(x)

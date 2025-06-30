@@ -23,6 +23,7 @@ class VAEModuleConfig:
         logvar_init: Initial value for the log variance parameter.
         trainable_logvar: Whether the log variance is a trainable parameter.
         reduce_mean: If True, reduce losses by mean; otherwise, sum and divide by batch size.
+        adversarial_weight: Weight for the adversarial loss term.
     """
     def __init__(self,
                  kl_weight: float = 1e-3,
@@ -33,7 +34,8 @@ class VAEModuleConfig:
                  teacher_encdec: torch.nn.Module | None = None,
                  teaching_mode: TeachingMode = "both",
                  distillation_alpha: float = 0.5,
-                 latent_matching_type: LatentMatchingType = "kl"):
+                 latent_matching_type: LatentMatchingType = "kl",
+                 adversarial_weight: float = 0.01):
         self.kl_weight = kl_weight
         self.nll_weight = nll_weight  # Unused for now
         self.logvar_init = logvar_init
@@ -43,6 +45,7 @@ class VAEModuleConfig:
         self.teaching_mode = teaching_mode
         self.distillation_alpha = distillation_alpha
         self.latent_matching_type = latent_matching_type
+        self.adversarial_weight = adversarial_weight
 
         assert self.latent_matching_type in ["kl", "mse", "modhell", "wasserstein"], \
             "latent_matching_type must be either 'kl', 'mse', 'modhell', or 'wasserstein'"
@@ -81,13 +84,19 @@ class VAELoss(torch.nn.Module):
     def forward(self,
                 x: Float[Tensor, "batch channels *shape"],  # noqa: F821, F722
                 vae_module: 'VAEModule',
-                y: Float[Tensor, "batch *yshape"] | None = None):  # noqa: F821, F722
-        
+                y: Float[Tensor, "batch *yshape"] | None = None,  # noqa: F821, F722
+                return_intermediates: bool = False):  # New parameter
+
         if self.config.teacher_encdec is not None:
             self.config.teacher_encdec.to(x)  # Hack because teacher_encdec is not seen as a module
 
         if self.config.distillation_training_only:  # We will not compute default encoder/decoder loss
             loss, logs = self.distillation_loss(x, vae_module, y, None, None)
+            if return_intermediates:
+                # For distillation-only, we still need to compute these
+                encoder_outputs = vae_module.encode(x, y)
+                x_recon = vae_module.decode(encoder_outputs['zsample'], y)
+                return loss, logs, encoder_outputs, x_recon
             return loss, logs
 
         encoder_outputs = vae_module.encode(x, y)
@@ -97,7 +106,7 @@ class VAELoss(torch.nn.Module):
         reduce_mean = self.config.reduce_mean
         nsamples = x.shape[0]
 
-        nll_loss = ((x.contiguous() - x_recon.contiguous())**2)/torch.exp(self.logvar) + self.logvar  # [b, c, ...]
+        nll_loss = ((x.contiguous() - x_recon.contiguous()) ** 2) / torch.exp(self.logvar) + self.logvar  # [b, c, ...]
         kl_loss = zdistrib.kl(reduce_mean=reduce_mean)  # [b, ...]
         if reduce_mean:
             nll_loss = torch.mean(nll_loss)  # []
@@ -121,6 +130,9 @@ class VAELoss(torch.nn.Module):
             loss = (1 - self.config.distillation_alpha) * loss + \
                 self.config.distillation_alpha * distillation_loss
             logs.update(distillation_logs)
+
+        if return_intermediates:
+            return loss, logs, encoder_outputs, x_recon
         return loss, logs
 
     def distillation_loss(self, x, vae_module, y, zdistrib, x_recon):
@@ -193,16 +205,27 @@ class VAEModule(lightning.LightningModule):
     def __init__(self,
                  encdec: torch.nn.Module,
                  config: VAEModuleConfig,
+                 discriminator: torch.nn.Module | None = None,
                  conditional: bool = False,
                  verbose: bool = False):
         super().__init__()
         self.encdec = encdec
-        # Assert whether encdec has "encoder" and "decoder" attributes
         assert hasattr(self.encdec, "encoder") and hasattr(self.encdec, "decoder"), \
             "encdec must have encoder and decoder attributes"
+
         self.config = config
         self.conditional = conditional
         self.loss_module = VAELoss(config)
+
+        # Adversarial components (optional)
+        self.discriminator = discriminator
+
+        # Training mode tracking
+        self.is_adversarial = discriminator is not None
+        if self.is_adversarial:
+            self.adversarial_loss = torch.nn.BCEWithLogitsLoss()
+            self.automatic_optimization = False  # Manual optimization for GAN training
+
         self.set_optimizer_and_scheduler()
         self.verbose = verbose
 
@@ -232,31 +255,176 @@ class VAEModule(lightning.LightningModule):
 
     def loss_fn(self, batch):
         x, y = self.select_batch(batch)
-        loss, logs = self.loss_module(x, self, y)
-        return loss, logs
+
+        if self.is_adversarial:
+            # Get VAE loss + intermediates for adversarial training
+            vae_loss, vae_logs, encoder_outputs, x_recon = self.loss_module(
+                x, self, y, return_intermediates=True)
+            return vae_loss, vae_logs, encoder_outputs, x_recon
+        else:
+            # Standard VAE loss
+            loss, logs = self.loss_module(x, self, y)
+            return loss, logs
+
+    def generator_loss_fn(self, batch):
+        """Combined VAE + adversarial loss for generator"""
+        x, y = self.select_batch(batch)
+        vae_loss, vae_logs, encoder_outputs, x_recon = self.loss_module(
+            x, self, y, return_intermediates=True)
+
+        # Adversarial loss for generator
+        if self.conditional and y is not None:
+            fake_pred = self.discriminator(x_recon, y)
+        else:
+            fake_pred = self.discriminator(x_recon)
+
+        gen_adversarial_loss = self.adversarial_loss(
+            fake_pred, torch.ones_like(fake_pred))
+
+        total_loss = vae_loss + self.config.adversarial_weight * gen_adversarial_loss
+
+        logs = vae_logs.copy()
+        logs.update({
+            'gen_adversarial_loss': gen_adversarial_loss.item(),
+            'vae_loss': vae_loss.item(),
+            'total_gen_loss': total_loss.item()
+        })
+
+        return total_loss, logs
+
+    def discriminator_loss_fn(self, batch):
+        """Discriminator loss"""
+        x, y = self.select_batch(batch)
+
+        # Generate fake samples (no gradients to generator)
+        with torch.no_grad():
+            encoder_outputs = self.encode(x, y)
+            x_fake = self.decode(encoder_outputs['zsample'], y)
+
+        # Discriminator predictions
+        if self.conditional and y is not None:
+            real_pred = self.discriminator(x, y)
+            fake_pred = self.discriminator(x_fake, y)
+        else:
+            real_pred = self.discriminator(x)
+            fake_pred = self.discriminator(x_fake)
+
+        # Discriminator loss
+        real_loss = self.adversarial_loss(real_pred, torch.ones_like(real_pred))
+        fake_loss = self.adversarial_loss(fake_pred, torch.zeros_like(fake_pred))
+        discriminator_loss = (real_loss + fake_loss) / 2
+
+        # Accuracy monitoring
+        real_acc = (real_pred > 0).float().mean()
+        fake_acc = (fake_pred < 0).float().mean()
+        d_acc = (real_acc + fake_acc) / 2
+
+        logs = {
+            'discriminator_loss': discriminator_loss.item(),
+            'real_loss': real_loss.item(),
+            'fake_loss': fake_loss.item(),
+            'd_accuracy': d_acc.item(),
+            'real_accuracy': real_acc.item(),
+            'fake_accuracy': fake_acc.item()
+        }
+
+        return discriminator_loss, logs
 
     def training_step(self, batch, batch_idx):
-        loss, logs = self.loss_fn(batch)
-        self.log('train_loss', loss, prog_bar=True, sync_dist=True)
-        if self.verbose:
-            # append train_ to the keys of logs
-            logs = {f'train_{k}': v for k, v in logs.items()}
-            self.log_dict(logs, prog_bar=True, sync_dist=True)
-        return loss
+        if not self.is_adversarial:
+            # Standard VAE training
+            loss, logs = self.loss_fn(batch)
+            self.log('train_loss', loss, prog_bar=True, sync_dist=True)
+            if self.verbose:
+                logs = {f'train_{k}': v for k, v in logs.items()}
+                self.log_dict(logs, prog_bar=True, sync_dist=True)
+            return loss
+        else:
+            # Adversarial training with manual optimization
+            gen_opt, disc_opt = self.optimizers()
+
+            # Train Generator
+            gen_loss, gen_logs = self.generator_loss_fn(batch)
+            gen_opt.zero_grad()
+            self.manual_backward(gen_loss)
+            gen_opt.step()
+
+            # Train Discriminator (with optional balancing)
+            disc_loss, disc_logs = self.discriminator_loss_fn(batch)
+            d_acc = disc_logs['d_accuracy']
+
+            if d_acc < 0.85:  # Only train discriminator if not too strong
+                disc_opt.zero_grad()
+                self.manual_backward(disc_loss)
+                disc_opt.step()
+
+            # Logging
+            self.log('train_gen_loss', gen_loss, prog_bar=True, sync_dist=True)
+            self.log('train_disc_loss', disc_loss, prog_bar=True, sync_dist=True)
+            self.log('d_accuracy', d_acc, prog_bar=True, sync_dist=True)
+
+            if self.verbose:
+                all_logs = {f'train_{k}': v for k, v in {**gen_logs, **disc_logs}.items()}
+                self.log_dict(all_logs, sync_dist=True)
 
     def validation_step(self, batch, batch_idx):
-        loss, logs = self.loss_fn(batch)
-        self.log('val_loss', loss, prog_bar=True, sync_dist=True)
-        if self.verbose:
-            # append val_ to the keys of logs
-            logs = {f'val_{k}': v for k, v in logs.items()}
-            self.log_dict(logs, prog_bar=True, sync_dist=True)
-        return loss
+        if not self.is_adversarial:
+            # Standard VAE validation
+            loss, logs = self.loss_fn(batch)
+            self.log('val_loss', loss, prog_bar=True, sync_dist=True)
+            if self.verbose:
+                logs = {f'val_{k}': v for k, v in logs.items()}
+                self.log_dict(logs, prog_bar=True, sync_dist=True)
+            return loss
+        else:
+            # VAE-GAN validation
+            gen_loss, gen_logs = self.generator_loss_fn(batch)
+            disc_loss, disc_logs = self.discriminator_loss_fn(batch)
+
+            self.log('val_gen_loss', gen_loss, prog_bar=True, sync_dist=True)
+            self.log('val_disc_loss', disc_loss, prog_bar=True, sync_dist=True)
+
+            if self.verbose:
+                all_logs = {f'val_{k}': v for k, v in {**gen_logs, **disc_logs}.items()}
+                self.log_dict(all_logs, sync_dist=True)
+
+    def configure_optimizers(self):
+        if not self.is_adversarial:
+            if hasattr(self, 'optimizer'):
+                if self.lr_scheduler is not None:
+                    return [self.optimizer], [{
+                        "scheduler": self.lr_scheduler,
+                        "interval": self.lr_scheduler_interval
+                    }]
+                return self.optimizer
+            else:
+                return torch.optim.AdamW(
+                    self.parameters(),
+                    lr=1e-3,
+                    betas=(0.9, 0.999),
+                    weight_decay=1e-4
+                )
+        else:
+            optimizers = [self.gen_optimizer, self.disc_optimizer]
+            schedulers = []
+            if self.gen_scheduler is not None:
+                schedulers.append({
+                    "scheduler": self.gen_scheduler,
+                    "interval": "step"
+                })
+            if self.disc_scheduler is not None:
+                schedulers.append({
+                    "scheduler": self.disc_scheduler,
+                    "interval": "step"
+                })
+            return optimizers, schedulers if schedulers else None
 
     def set_optimizer_and_scheduler(self,
                                     optimizer=None,
                                     scheduler=None,
-                                    scheduler_interval="step"):
+                                    scheduler_interval="step",
+                                    adversarial_optimizers=None,
+                                    adversarial_schedulers=None):
         """
         Parameters
         ----------
@@ -270,30 +438,52 @@ class VAEModule(lightning.LightningModule):
         scheduler_interval : str
             "epoch" or "step", whether the scheduler should be called at the
             end of each epoch or each step.
+        adversarial_optimizers : None | tuple[torch.optim.Optimizer, torch.optim.Optimizer]
+            if None and is_adversarial, use default AdamW optimizers for generator and
+            discriminator with lr=1e-4 and 2e-4 respectively
+        adversarial_scheduler : None | tuple[torch.optim.lr_scheduler._LRScheduler,
+            torch.optim.lr_scheduler._LRScheduler]
+            if None, no scheduler is used for adversarial training
         """
-        if optimizer is not None:
-            self.optimizer = optimizer
+        if not self.is_adversarial:
+            if optimizer is not None:
+                self.optimizer = optimizer
+            else:
+                self.optimizer = torch.optim.AdamW(
+                    self.parameters(),
+                    lr=1e-3,
+                    betas=(0.9, 0.999),
+                    weight_decay=1e-4
+                )
+            if scheduler is not None:
+                self.lr_scheduler = scheduler
+            else:
+                self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
+                    self.optimizer,
+                    lr_lambda=lambda step: 1.0 + 0 * step
+                )  # Neutral scheduler
+            self.lr_scheduler_interval = scheduler_interval
         else:
-            self.optimizer = torch.optim.AdamW(self.parameters(),
-                                               lr=1e-3,
-                                               betas=(0.9, 0.999),
-                                               weight_decay=1e-4)
-        if scheduler is not None:
-            self.lr_scheduler = scheduler
-        else:
-            self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
-                                    self.optimizer,
-                                    lr_lambda=lambda step: 1.0 + 0*step
-                                )  # Neutral scheduler
-        self.lr_scheduler_interval = scheduler_interval
+            if adversarial_optimizers is not None:
+                self.gen_optimizer, self.disc_optimizer = adversarial_optimizers
+            else:
+                gen_params = list(self.encdec.parameters()) + list(self.loss_module.parameters())
+                self.gen_optimizer = torch.optim.AdamW(
+                    gen_params,
+                    lr=1e-4,  # Default generator learning rate
+                    betas=(0.5, 0.999)
+                )
+                self.disc_optimizer = torch.optim.AdamW(
+                    self.discriminator.parameters(),
+                    lr=2e-4,  # Default discriminator learning rate
+                    betas=(0.5, 0.999)
+                )
 
-    def configure_optimizers(self):
-        if self.lr_scheduler is not None:
-            lr_scheduler_config = {"scheduler": self.lr_scheduler,
-                                   "interval": self.lr_scheduler_interval}
-            return [self.optimizer], [lr_scheduler_config]
-        else:  # Just fo backward compatibility for some examples
-            return self.optimizer
+            if adversarial_schedulers is not None:
+                self.gen_scheduler, self.disc_scheduler = adversarial_schedulers
+            else:
+                self.gen_scheduler = None
+                self.disc_scheduler = None
 
     def select_batch(self, batch):
         if isinstance(batch, dict):
@@ -349,7 +539,7 @@ class DiagonalGaussianDistribution(torch.nn.Module):
         reduce_operator = torch.mean if reduce_mean else torch.sum
         dims = list(range(1, len(sample.shape)))
         result = 0.5 * reduce_operator(
-            logtwopi + self.logvar + torch.pow(sample-self.mean, 2) / self.var,
+            logtwopi + self.logvar + torch.pow(sample - self.mean, 2) / self.var,
             dim=dims)
         return result
 
