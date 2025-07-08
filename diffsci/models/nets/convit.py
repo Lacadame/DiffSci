@@ -1,6 +1,7 @@
 # TODO: Put DimensionHelper in a unified separate file
 from typing import Any, Optional
 
+import warnings
 import pathlib
 import yaml
 import math
@@ -24,13 +25,16 @@ class ConVitConfig(object):
                  rope_freq: float = 1.0,
                  with_conv_on_upsample: bool = False,
                  with_conv_on_downsample: bool = False,
-                 kernel_size_conv: int = 3,
-                 kernel_size_in_out: int = 3,
+                 kernel_size_conv: int = 1,
+                 kernel_size_in_out: int = 1,
+                 kernel_size_depthwise: int = 3,
                  has_time_embedding: bool = False,
                  has_conditional_embedding: bool = False,
                  fourier_projection_scale: float = 30.0,
                  relative_positioning: bool = False,
-                 linear_attention: bool = False):
+                 linear_attention: bool = False,
+                 input_batch_norm: bool = False,
+                 condition_dropout: float = 0.1):
         self.in_channels = in_channels
         self.embed_dim = embed_dim
         self.num_pos_dims = num_pos_dims
@@ -44,11 +48,14 @@ class ConVitConfig(object):
         self.with_conv_on_downsample = with_conv_on_downsample
         self.kernel_size_conv = kernel_size_conv
         self.kernel_size_in_out = kernel_size_in_out
+        self.kernel_size_depthwise = kernel_size_depthwise
         self.has_time_embedding = has_time_embedding
         self.has_conditional_embedding = has_conditional_embedding
         self.fourier_projection_scale = fourier_projection_scale
         self.relative_positioning = relative_positioning
         self.linear_attention = linear_attention
+        self.input_batch_norm = input_batch_norm
+        self.condition_dropout = condition_dropout
 
     def export_description(self) -> dict[str, Any]:
         args = dict(
@@ -64,12 +71,15 @@ class ConVitConfig(object):
             with_conv_on_upsample=self.with_conv_on_upsample,
             with_conv_on_downsample=self.with_conv_on_downsample,
             kernel_size_conv=self.kernel_size_conv,
+            kernel_size_depthwise=self.kernel_size_depthwise,
             kernel_size_in_out=self.kernel_size_in_out,
             has_time_embedding=self.has_time_embedding,
             has_conditional_embedding=self.has_conditional_embedding,
             fourier_projection_scale=self.fourier_projection_scale,
             relative_positioning=self.relative_positioning,
-            linear_attention=self.linear_attention
+            linear_attention=self.linear_attention,
+            input_batch_norm=self.input_batch_norm,
+            condition_dropout=self.condition_dropout
         )
         return args
 
@@ -88,8 +98,41 @@ class ConVitConfig(object):
         return cls.from_description(description)
 
 
+class ConditionDropout(torch.nn.Module):
+    """A dropout layer that zeroes out entire samples in a batch with probability p.
+
+    Unlike standard dropout which zeroes individual elements, this layer zeroes
+    all elements for randomly selected samples in the batch.
+
+    Args:
+        p (float): probability of zeroing out a sample. Default: 0.5
+    """
+    def __init__(self, p: float = 0.5):
+        super().__init__()
+        self.p = p
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.training or self.p == 0.0:
+            return x
+
+        # Generate mask of shape (N, 1, ..., 1) with same number of dims as input
+        mask_shape = [x.shape[0]] + [1] * (x.dim() - 1)
+        mask = torch.bernoulli(torch.ones(mask_shape, device=x.device) * (1 - self.p))
+
+        return x * mask
+
+
 class DimensionHelper:
     """Helper class for dimension-specific operations."""
+
+    @staticmethod
+    def get_batch_norm_cls(dimension):
+        if dimension == 1:
+            return torch.nn.BatchNorm1d
+        elif dimension == 2:
+            return torch.nn.BatchNorm2d
+        elif dimension == 3:
+            return torch.nn.BatchNorm3d
 
     @staticmethod
     def get_conv_cls(dimension):
@@ -501,6 +544,7 @@ class ConVitBlock(torch.nn.Module):
                  with_conv_on_upsample: bool = False,
                  with_conv_on_downsample: bool = False,
                  kernel_size_conv: int = 3,
+                 kernel_size_depthwise: int = 3,
                  has_embedding: bool = False,
                  relative_positioning: bool = False,
                  linear_attention: bool = False):
@@ -512,6 +556,7 @@ class ConVitBlock(torch.nn.Module):
         self.num_heads = num_heads
         self.rope_freq = rope_freq
         self.kernel_size_conv = kernel_size_conv
+        self.kernel_size_depthwise = kernel_size_depthwise
         self.linear_attention = linear_attention
 
         self.norm_1 = ChannelRMSNorm(channel_dim=embed_dim)
@@ -541,6 +586,18 @@ class ConVitBlock(torch.nn.Module):
             num_pos_dims=num_pos_dims,
             expansion_factor=ffn_expansion_factor,
             kernel_size=kernel_size_conv)
+
+        # New efficient conv path for fine details
+        self.depthwise_conv = DimensionHelper.get_conv_cls(num_pos_dims)(
+            embed_dim, embed_dim, kernel_size=kernel_size_depthwise, groups=embed_dim, padding='same'
+        )
+        self.pointwise_conv = DimensionHelper.get_conv_cls(num_pos_dims)(
+            embed_dim, embed_dim, kernel_size=1
+        )
+        self.conv_activation = torch.nn.SiLU()
+
+        self.fusion_weight = torch.nn.Parameter(torch.tensor(0.0))
+
         self.has_embedding = has_embedding
         if has_embedding:
             self.embedding_projection = SwiGLU(embed_dim=embed_dim, final_rms=True)
@@ -564,6 +621,13 @@ class ConVitBlock(torch.nn.Module):
         x = self.attention(x)
         x = einops.rearrange(x, f'b {channel_m_symbols} d -> b d {channel_m_symbols}')
         x = self.upsample(x)
+
+        # Convolution pathway
+        x_conv = self.pointwise_conv(self.conv_activation(self.depthwise_conv(x)))
+
+        # Fusion
+        x = (1 - torch.sigmoid(self.fusion_weight)) * x + torch.sigmoid(self.fusion_weight) * x_conv
+
         x = x + x0
         x0 = x.clone()
         x = self.norm_2(x) + y
@@ -591,12 +655,20 @@ class ConVit(torch.nn.Module):
         self.with_conv_on_upsample = config.with_conv_on_upsample
         self.with_conv_on_downsample = config.with_conv_on_downsample
         self.kernel_size_conv = config.kernel_size_conv
+        self.kernel_size_depthwise = config.kernel_size_depthwise
         self.kernel_size_in_out = config.kernel_size_in_out
         self.has_embedding = config.has_embedding
         self.has_conditional_embedding = config.has_conditional_embedding
         self.fourier_projection_scale = config.fourier_projection_scale
         self.relative_positioning = config.relative_positioning
         self.linear_attention = config.linear_attention
+        self.input_batch_norm = config.input_batch_norm
+        self.condition_dropout = config.condition_dropout
+
+        if self.input_batch_norm:
+            self.normin = DimensionHelper.get_batch_norm_cls(self.num_pos_dims)(self.in_channels)
+        else:
+            self.normin = torch.nn.Identity()
 
         self.convin = DimensionHelper.get_conv_cls(self.num_pos_dims)(
             self.in_channels,
@@ -623,25 +695,38 @@ class ConVit(torch.nn.Module):
                 with_conv_on_upsample=self.with_conv_on_upsample,
                 with_conv_on_downsample=self.with_conv_on_downsample,
                 kernel_size_conv=self.kernel_size_conv,
+                kernel_size_depthwise=self.kernel_size_depthwise,
                 has_embedding=self.has_embedding,
                 relative_positioning=self.relative_positioning,
                 linear_attention=self.linear_attention)
             for _ in range(self.num_layers)
         ])
-
+        if self.condition_dropout > 0.0:
+            self.condition_dropout_module = ConditionDropout(self.condition_dropout)
+        else:
+            self.condition_dropout_module = torch.nn.Identity()
         if config.has_time_embedding:
             self.time_embedding = GaussianFourierProjection(
                 embed_dim=self.embed_dim, scale=self.fourier_projection_scale)
         if config.has_conditional_embedding:
             assert isinstance(conditional_embedding, torch.nn.Module)
             self.conditional_embedding = conditional_embedding
+        else:
+            if isinstance(conditional_embedding, None):
+                warnings.warn("Conditional embedding is not supported when self.has_conditional_embedding=False")
+                self.conditional_embedding = torch.nn.Identity()
+            else:
+                self.conditional_embedding = conditional_embedding
 
     def forward(self, x: torch.Tensor, t: torch.Tensor | None = None, y: torch.Tensor | None = None) -> torch.Tensor:
         te = self.time_embedding(t) if t is not None else 0.0
         ye = self.conditional_embedding(y) if y is not None else 0.0
+        if self.condition_dropout > 0.0 and y is not None:
+            ye = self.condition_dropout_module(ye)
         y = te + ye
         if not isinstance(y, torch.Tensor):
             y = None
+        x = self.normin(x)
         x = self.convin(x)
         for block in self.blocks:
             x = block(x, y)

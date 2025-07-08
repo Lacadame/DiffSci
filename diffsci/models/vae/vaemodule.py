@@ -1,14 +1,24 @@
 import math
-from typing import Literal
+from typing import Literal, Dict, Callable
 
 import torch
+import torchvision
 import lightning
 from torch import Tensor
 from jaxtyping import Float
 
+from diffsci.models.aux import batchnorm, preprocessors
+
 
 LatentMatchingType = Literal["kl", "mse", "modhell", "wasserstein"]
 TeachingMode = Literal["both", "encoder", "decoder"]
+
+
+def default_scheduler(optimizer):
+    return torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lr_lambda=lambda step: 1.0 + 0*step
+    )
 
 
 class VAEModuleConfig:
@@ -35,7 +45,15 @@ class VAEModuleConfig:
                  teaching_mode: TeachingMode = "both",
                  distillation_alpha: float = 0.5,
                  latent_matching_type: LatentMatchingType = "kl",
-                 adversarial_weight: float = 0.01):
+                 adversarial_weight: float = 0.01,
+                 num_channels: int | None = None,
+                 initial_norm: bool = False,
+                 reconstruction_loss: Literal['mse', 'huber'] = 'huber',
+                 discriminator_frequency: int = 1,
+                 discriminator_threshold: float = 0.85,
+                 label_smoothing: float = 0.1,
+                 loss_preprocessor: Literal['edges', 'none'] | torch.nn.Module = 'none',
+                 total_variation_weight: float = 0.0):
         self.kl_weight = kl_weight
         self.nll_weight = nll_weight  # Unused for now
         self.logvar_init = logvar_init
@@ -46,6 +64,14 @@ class VAEModuleConfig:
         self.distillation_alpha = distillation_alpha
         self.latent_matching_type = latent_matching_type
         self.adversarial_weight = adversarial_weight
+        self.num_channels = num_channels
+        self.initial_norm = initial_norm
+        self.reconstruction_loss = reconstruction_loss
+        self.discriminator_frequency = discriminator_frequency
+        self.discriminator_threshold = discriminator_threshold
+        self.label_smoothing = label_smoothing
+        self.loss_preprocessor = loss_preprocessor
+        self.total_variation_weight = total_variation_weight
 
         assert self.latent_matching_type in ["kl", "mse", "modhell", "wasserstein"], \
             "latent_matching_type must be either 'kl', 'mse', 'modhell', or 'wasserstein'"
@@ -65,6 +91,87 @@ class VAEModuleConfig:
     def distillation_training_only(self):
         return self.has_distillation and self.distillation_alpha == 1.0
 
+    @property
+    def has_initial_norm(self):
+        return self.initial_norm
+
+
+class TotalVariationLoss(torch.nn.Module):
+    """
+    Total Variation Loss that matches TV between real and reconstructed images.
+    Option 2: Match TV between real and reconstruction (preserve edge structure)
+    """
+
+    def __init__(self,
+                 reconstruction_loss: Literal['mse', 'huber'] = 'mse',
+                 tv_weight: float = 1.0):
+        super().__init__()
+        self.tv_weight = tv_weight
+
+        if reconstruction_loss == 'mse':
+            self.loss_fn = torch.nn.functional.mse_loss
+        elif reconstruction_loss == 'huber':
+            self.loss_fn = torch.nn.functional.huber_loss
+        else:
+            raise ValueError(f"Reconstruction loss {reconstruction_loss} not supported")
+
+    def total_variation(self, x):
+        """
+        Compute total variation for arbitrary spatial dimensions.
+        x: [batch, channels, *spatial_dims]
+        Returns: [batch] - TV value for each sample in the batch
+        """
+        tv = 0
+        # Start from dimension 2 (after batch and channel)
+        for dim in range(2, x.dim()):
+            # Create slices for neighboring differences along this dimension
+            slice_1 = [slice(None)] * x.dim()
+            slice_2 = [slice(None)] * x.dim()
+
+            slice_1[dim] = slice(1, None)    # [1:]
+            slice_2[dim] = slice(None, -1)   # [:-1]
+
+            # Compute absolute difference along this dimension
+            diff = torch.abs(x[tuple(slice_1)] - x[tuple(slice_2)])
+            # Sum over channels and spatial dimensions, keep batch dimension
+            tv += torch.sum(diff, dim=tuple(range(1, diff.dim())))
+
+        return tv
+
+    def forward(self, x_real, x_recon):
+        """
+        Compute TV loss between real and reconstructed images.
+
+        Args:
+            x_real: Real images [batch, channels, *spatial_dims]
+            x_recon: Reconstructed images [batch, channels, *spatial_dims]
+
+        Returns:
+            total_loss: Weighted TV loss
+            logs: Dictionary with loss components
+        """
+        # Compute TV for both real and reconstructed
+        # Each returns [batch_size] tensor with TV value per sample
+        tv_real = self.total_variation(x_real)
+        tv_recon = self.total_variation(x_recon)
+
+        # Match TV between real and reconstruction per sample
+        tv_loss = self.loss_fn(tv_recon, tv_real, reduction='mean')
+
+        # Scale by weight
+        total_loss = self.tv_weight * tv_loss
+
+        logs = {
+            'tv_loss': tv_loss.item(),
+            'tv_real_mean': tv_real.mean().item(),
+            'tv_recon_mean': tv_recon.mean().item(),
+            'tv_real_std': tv_real.std().item(),
+            'tv_recon_std': tv_recon.std().item(),
+            'total_tv_loss': total_loss.item()
+        }
+
+        return total_loss, logs
+
 
 class VAELoss(torch.nn.Module):
     def __init__(self, config: VAEModuleConfig):
@@ -74,7 +181,31 @@ class VAELoss(torch.nn.Module):
             self.logvar = torch.nn.Parameter(torch.ones(size=(1,)) * config.logvar_init)
         else:
             self.register_buffer("logvar", torch.ones(size=(1,)) * config.logvar_init)
+        if config.reconstruction_loss == 'mse':
+            self.reconstruction_loss_fn = torch.nn.functional.mse_loss
+        elif config.reconstruction_loss == 'huber':
+            self.reconstruction_loss_fn = torch.nn.functional.huber_loss
+        else:
+            raise ValueError(f"Reconstruction loss {config.reconstruction_loss} not supported")
         self.freeze_teacher()
+
+        if isinstance(config.loss_preprocessor, torch.nn.Module):
+            self.loss_preprocessor = config.loss_preprocessor
+        else:
+            if config.loss_preprocessor == 'edges':
+                self.loss_preprocessor = preprocessors.EdgeDetectionPreprocessor()
+            elif config.loss_preprocessor == 'none':
+                self.loss_preprocessor = torch.nn.Identity()
+            else:
+                raise ValueError(f"Loss preprocessor {config.loss_preprocessor} not supported")
+
+        if config.total_variation_weight > 0.0:
+            self.total_variation_loss = TotalVariationLoss(
+                reconstruction_loss=config.reconstruction_loss,
+                tv_weight=config.total_variation_weight
+            )
+        else:
+            self.total_variation_loss = None
 
     def freeze_teacher(self):
         if self.config.teacher_encdec is not None:
@@ -106,7 +237,13 @@ class VAELoss(torch.nn.Module):
         reduce_mean = self.config.reduce_mean
         nsamples = x.shape[0]
 
-        nll_loss = ((x.contiguous() - x_recon.contiguous()) ** 2) / torch.exp(self.logvar) + self.logvar  # [b, c, ...]
+        # Compute negative log likelihood loss with learned variance
+        reconstruction_error = self.reconstruction_loss_fn(
+            self.loss_preprocessor(x.contiguous()),
+            self.loss_preprocessor(x_recon.contiguous()),
+            reduction='none'
+        )
+        nll_loss = reconstruction_error / torch.exp(self.logvar) + self.logvar  # [b, c, ...]
         kl_loss = zdistrib.kl(reduce_mean=reduce_mean)  # [b, ...]
         if reduce_mean:
             nll_loss = torch.mean(nll_loss)  # []
@@ -115,6 +252,7 @@ class VAELoss(torch.nn.Module):
         kl_loss = torch.sum(kl_loss) / nsamples  # []
 
         main_loss = nll_loss + self.config.kl_weight * kl_loss  # []
+
         loss = main_loss.clone()
 
         logs = {
@@ -123,6 +261,11 @@ class VAELoss(torch.nn.Module):
             "main_loss": main_loss.item(),
             "logvar": self.logvar.item(),
         }
+
+        if self.total_variation_loss is not None:
+            tv_loss, tv_logs = self.total_variation_loss(x, x_recon)
+            loss = loss + tv_loss * self.config.total_variation_weight
+            logs.update(tv_logs)
 
         if self.config.has_distillation:
             distillation_loss, distillation_logs = self.distillation_loss(
@@ -168,7 +311,11 @@ class VAELoss(torch.nn.Module):
             output_matching_loss = torch.tensor(0.0).to(x)
         else:
             teacher_x_recon = self.config.teacher_encdec.decoder(teacher_zsample)  # [b, c, ...]
-            output_matching_loss = torch.nn.functional.mse_loss(x_recon, teacher_x_recon, reduction='none')
+            output_matching_loss = self.reconstruction_loss_fn(
+                self.loss_preprocessor(x_recon),
+                self.loss_preprocessor(teacher_x_recon),
+                reduction='none'
+            )
             if reduce_mean:
                 output_matching_loss = torch.mean(output_matching_loss)  # []
             else:
@@ -229,6 +376,16 @@ class VAEModule(lightning.LightningModule):
         self.set_optimizer_and_scheduler()
         self.verbose = verbose
 
+        if self.config.has_initial_norm:
+            num_channels = self.config.num_channels if self.config.num_channels is not None else 1
+            self.initial_norm = batchnorm.DimensionAgnosticBatchNorm(
+                num_channels=num_channels,
+                eps=1e-5,
+                affine=False,
+            )
+        else:
+            self.initial_norm = batchnorm.IdentityBatchNorm()
+
     @property
     def encoder(self):
         return self.encdec.encoder
@@ -237,9 +394,24 @@ class VAEModule(lightning.LightningModule):
     def decoder(self):
         return self.encdec.decoder
 
+    def preencode(self, x: Float[Tensor, "batch channels *shape"],  # noqa: F821, F722
+                  y: Float[Tensor, "batch *yshape"] | None = None):  # noqa: F821, F722
+        x = self.initial_norm(x)
+        return x
+
+    def postdecode(self, x_recon: Float[Tensor, "batch channels *shape"],  # noqa: F821, F722
+                   y: Float[Tensor, "batch *yshape"] | None = None):  # noqa: F821, F722
+        x_recon = self.initial_norm.unnorm(x_recon)
+        return x_recon
+
     def encode(self, x: Float[Tensor, "batch channels *shape"],  # noqa: F821, F722
                y: Float[Tensor, "batch *yshape"] | None = None,  # noqa: F821, F722
-               sample: bool = True):
+               sample: bool = True,
+               preencode: bool = None):
+        if preencode is None:
+            preencode = not self.training
+        if preencode:
+            x = self.preencode(x, y)
         z = self.encoder(x, y) if self.conditional else self.encoder(x)
         zdistrib = DiagonalGaussianDistribution(z)
         if sample:
@@ -249,13 +421,18 @@ class VAEModule(lightning.LightningModule):
         return {'zdistrib': zdistrib, 'zsample': zsample}
 
     def decode(self, zsample: Float[Tensor, "batch zdim *shape"],  # noqa: F821, F722
-               y: Float[Tensor, "batch *yshape"] | None = None):  # noqa: F821, F722
+               y: Float[Tensor, "batch *yshape"] | None = None,
+               postdecode: bool = None):  # noqa: F821, F722
+        if postdecode is None:
+            postdecode = not self.training
         x_recon = self.decoder(zsample, y) if self.conditional else self.decoder(zsample)
+        if postdecode:
+            x_recon = self.postdecode(x_recon, y)
         return x_recon
 
     def loss_fn(self, batch):
         x, y = self.select_batch(batch)
-
+        x = self.preencode(x, y)
         if self.is_adversarial:
             # Get VAE loss + intermediates for adversarial training
             vae_loss, vae_logs, encoder_outputs, x_recon = self.loss_module(
@@ -269,6 +446,7 @@ class VAEModule(lightning.LightningModule):
     def generator_loss_fn(self, batch):
         """Combined VAE + adversarial loss for generator"""
         x, y = self.select_batch(batch)
+        x = self.preencode(x, y)
         vae_loss, vae_logs, encoder_outputs, x_recon = self.loss_module(
             x, self, y, return_intermediates=True)
 
@@ -295,7 +473,7 @@ class VAEModule(lightning.LightningModule):
     def discriminator_loss_fn(self, batch):
         """Discriminator loss"""
         x, y = self.select_batch(batch)
-
+        x = self.preencode(x, y)
         # Generate fake samples (no gradients to generator)
         with torch.no_grad():
             encoder_outputs = self.encode(x, y)
@@ -310,8 +488,10 @@ class VAEModule(lightning.LightningModule):
             fake_pred = self.discriminator(x_fake)
 
         # Discriminator loss
-        real_loss = self.adversarial_loss(real_pred, torch.ones_like(real_pred))
-        fake_loss = self.adversarial_loss(fake_pred, torch.zeros_like(fake_pred))
+        real_labels = torch.ones_like(real_pred) * (1 - self.config.label_smoothing)
+        fake_labels = torch.ones_like(fake_pred) * self.config.label_smoothing
+        real_loss = self.adversarial_loss(real_pred, real_labels)
+        fake_loss = self.adversarial_loss(fake_pred, fake_labels)
         discriminator_loss = (real_loss + fake_loss) / 2
 
         # Accuracy monitoring
@@ -353,7 +533,9 @@ class VAEModule(lightning.LightningModule):
             disc_loss, disc_logs = self.discriminator_loss_fn(batch)
             d_acc = disc_logs['d_accuracy']
 
-            if d_acc < 0.85:  # Only train discriminator if not too strong
+            should_update_discriminator = (d_acc < self.config.discriminator_threshold) and \
+                                          (batch_idx % self.config.discriminator_frequency == 0)
+            if should_update_discriminator:
                 disc_opt.zero_grad()
                 self.manual_backward(disc_loss)
                 disc_opt.step()
@@ -366,8 +548,31 @@ class VAEModule(lightning.LightningModule):
             if self.verbose:
                 all_logs = {f'train_{k}': v for k, v in {**gen_logs, **disc_logs}.items()}
                 self.log_dict(all_logs, sync_dist=True)
+            return gen_loss.detach()
+
+    def log_images_to_tensorboard(self, x, x_recon, batch_idx, max_images=4):
+        # Only log up to max_images
+        x = x[:max_images]
+        x_recon = x_recon[:max_images]
+        # Assume images are [B, C, H, W] and in range [0, 1] or [0, 255]
+        # If not, normalize as needed
+        grid = torch.cat([x, x_recon], dim=0)  # Stack originals and reconstructions
+        grid = torchvision.utils.make_grid(grid, nrow=max_images)
+        # Log to TensorBoard
+        if hasattr(self.logger, "experiment"):
+            self.logger.experiment.add_image("val/input_and_recon", grid, self.global_step)
 
     def validation_step(self, batch, batch_idx):
+
+        # TODO: Remove this
+        if batch_idx == 0:  # Only log for the first batch to avoid flooding
+            x, y = self.select_batch(batch)
+            x = self.preencode(x, y)
+            encoder_outputs = self.encode(x, y)
+            x_recon = self.decode(encoder_outputs['zsample'], y)
+            # Log images
+            self.log_images_to_tensorboard(x, x_recon, batch_idx)
+
         if not self.is_adversarial:
             # Standard VAE validation
             loss, logs = self.loss_fn(batch)
@@ -387,6 +592,7 @@ class VAEModule(lightning.LightningModule):
             if self.verbose:
                 all_logs = {f'val_{k}': v for k, v in {**gen_logs, **disc_logs}.items()}
                 self.log_dict(all_logs, sync_dist=True)
+            return gen_loss.detach()
 
     def configure_optimizers(self):
         if not self.is_adversarial:
@@ -396,7 +602,12 @@ class VAEModule(lightning.LightningModule):
                         "scheduler": self.lr_scheduler,
                         "interval": self.lr_scheduler_interval
                     }]
-                return self.optimizer
+                else:
+                    self.lr_scheduler = default_scheduler(self.optimizer)
+                    return [self.optimizer], [{
+                        "scheduler": self.lr_scheduler,
+                        "interval": self.lr_scheduler_interval
+                    }]
             else:
                 return torch.optim.AdamW(
                     self.parameters(),
@@ -412,11 +623,15 @@ class VAEModule(lightning.LightningModule):
                     "scheduler": self.gen_scheduler,
                     "interval": "step"
                 })
+            else:
+                self.gen_scheduler = default_scheduler(self.gen_optimizer)
             if self.disc_scheduler is not None:
                 schedulers.append({
                     "scheduler": self.disc_scheduler,
                     "interval": "step"
                 })
+            else:
+                self.disc_scheduler = default_scheduler(self.disc_optimizer)
             return optimizers, schedulers if schedulers else None
 
     def set_optimizer_and_scheduler(self,
@@ -445,6 +660,9 @@ class VAEModule(lightning.LightningModule):
             torch.optim.lr_scheduler._LRScheduler]
             if None, no scheduler is used for adversarial training
         """
+        self.lr_scheduler_interval = scheduler_interval
+
+        # Set optimizer and scheduler
         if not self.is_adversarial:
             if optimizer is not None:
                 self.optimizer = optimizer
@@ -458,11 +676,7 @@ class VAEModule(lightning.LightningModule):
             if scheduler is not None:
                 self.lr_scheduler = scheduler
             else:
-                self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
-                    self.optimizer,
-                    lr_lambda=lambda step: 1.0 + 0 * step
-                )  # Neutral scheduler
-            self.lr_scheduler_interval = scheduler_interval
+                self.lr_scheduler = default_scheduler(self.optimizer)
         else:
             if adversarial_optimizers is not None:
                 self.gen_optimizer, self.disc_optimizer = adversarial_optimizers
@@ -482,8 +696,8 @@ class VAEModule(lightning.LightningModule):
             if adversarial_schedulers is not None:
                 self.gen_scheduler, self.disc_scheduler = adversarial_schedulers
             else:
-                self.gen_scheduler = None
-                self.disc_scheduler = None
+                self.gen_scheduler = default_scheduler(self.gen_optimizer)
+                self.disc_scheduler = default_scheduler(self.disc_optimizer)
 
     def select_batch(self, batch):
         if isinstance(batch, dict):
@@ -570,6 +784,16 @@ class DiagonalGaussianDistribution(torch.nn.Module):
         reduce_operator = torch.mean if reduce_mean else torch.sum
         if other is None:
             other_mean = torch.zeros_like(self.mean)
+            other_std = torch.ones_like(self.std)
+        else:
+            other_mean = other.mean
+            other_std = other.std
+
+        mean_term = torch.pow(self.mean - other_mean, 2)
+        std_term = torch.pow(self.std - other_std, 2)
+        result = reduce_operator(mean_term + std_term, dim=dims)
+        return result
+
             other_std = torch.ones_like(self.std)
         else:
             other_mean = other.mean
