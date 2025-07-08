@@ -794,16 +794,6 @@ class DiagonalGaussianDistribution(torch.nn.Module):
         result = reduce_operator(mean_term + std_term, dim=dims)
         return result
 
-            other_std = torch.ones_like(self.std)
-        else:
-            other_mean = other.mean
-            other_std = other.std
-
-        mean_term = torch.pow(self.mean - other_mean, 2)
-        std_term = torch.pow(self.std - other_std, 2)
-        result = reduce_operator(mean_term + std_term, dim=dims)
-        return result
-
     def mode(self):
         return self.mean
 
