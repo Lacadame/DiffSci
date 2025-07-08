@@ -334,7 +334,7 @@ class EdgeDetectionPreprocessor(nn.Module):
         x_windowed = self._apply_border_window(x)
 
         # TODO: Remove the tanh that I will pass
-        x_windowed = torch.tanh(x_windowed)
+        # x_windowed = torch.tanh(x_windowed)
 
         # Apply selected processors with precomputed normalized weights
         for p in self.processors:
