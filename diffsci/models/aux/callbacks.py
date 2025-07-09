@@ -6,7 +6,7 @@ import torch
 
 class EMACallback(pl_callbacks.StochasticWeightAveraging):
     def __init__(self, decay=0.99):
-        super().__init__()
+        super().__init__(decay)
         self.decay = decay
 
     def avg_fn(self,

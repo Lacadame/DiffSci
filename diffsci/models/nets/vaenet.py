@@ -7,7 +7,7 @@ import yaml
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+import einops
 
 from .patched_conv import get_patch_conv
 
@@ -38,7 +38,8 @@ class VAENetConfig:
         double_z: bool = True,             # Double the output in encoder for mean and logvar
         num_groups: int = 32,              # Number of groups for GroupNorm
         patch_size: int = None,            # Patch size for patch-based convolutions
-        memory_efficient_variant: bool = False  # Use memory efficient decoding
+        memory_efficient_variant: bool = False,  # Use memory efficient decoding
+        use_flash_attention: bool = True,  # Use torch.nn.functional.scaled_dot_product_attention
     ):
         assert dimension in [1, 2, 3], f"Dimension must be 1, 2, or 3, got {dimension}"
 
@@ -65,6 +66,7 @@ class VAENetConfig:
         self.num_groups = num_groups
         self.patch_size = patch_size
         self.memory_efficient_variant = memory_efficient_variant
+        self.use_flash_attention = use_flash_attention
 
     def export_description(self) -> dict:
         """Export configuration as a dictionary."""
@@ -90,13 +92,14 @@ class VAENetConfig:
             "double_z": self.double_z,
             "num_groups": self.num_groups,
             "patch_size": self.patch_size,
-            "memory_efficient_variant": self.memory_efficient_variant
+            "memory_efficient_variant": self.memory_efficient_variant,
+            "use_flash_attention": self.use_flash_attention
         }
-    
+
     @classmethod
     def from_description(cls, description: dict):
         return cls(**description)
-    
+
     @classmethod
     def from_config_file(cls, config_file: pathlib.Path | str):
         with open(config_file, "r") as f:
@@ -233,7 +236,7 @@ class PatchedConv(torch.nn.Module):
             x = torch.nn.functional.pad(x, pd)
 
         return self.conv(x)
-        
+
     @property
     def weight(self):
         return self.conv.weight
@@ -322,11 +325,12 @@ class ResnetBlock(nn.Module):
 class AttnBlock(nn.Module):
     """Self-attention block with dimension flexibility."""
 
-    def __init__(self, dimension, in_channels, num_groups=32, patch_size=None):
+    def __init__(self, dimension, in_channels, num_groups=32, patch_size=None, use_flash_attention=True):
         super().__init__()
         self.dimension = dimension
         self.in_channels = in_channels
         self.patch_size = patch_size
+        self.use_flash_attention = use_flash_attention
 
         self.norm = get_norm(in_channels, num_groups=num_groups)
 
@@ -336,6 +340,9 @@ class AttnBlock(nn.Module):
         self.v = Conv(in_channels, in_channels, kernel_size=1, stride=1, padding=0, patch_size=patch_size)
         self.proj_out = Conv(in_channels, in_channels, kernel_size=1, stride=1, padding=0, patch_size=patch_size)
 
+        # Store scale for attention
+        self.scale = (in_channels ** -0.5)
+
     def forward(self, x):
         h_ = x
         h_ = self.norm(h_)
@@ -343,6 +350,81 @@ class AttnBlock(nn.Module):
         k = self.k(h_)
         v = self.v(h_)
 
+        if self.use_flash_attention:
+            # Use optimized scaled_dot_product_attention
+            h_ = self._flash_attention_forward(q, k, v)
+        else:
+            # Use original attention implementation
+            h_ = self._original_attention_forward(q, k, v)
+
+        h_ = self.proj_out(h_)
+        return x + h_
+
+    # def forward(self, x):
+    #     h_ = x
+    #     h_ = self.norm(h_)
+    #     q = self.q(h_)
+    #     k = self.k(h_)
+    #     v = self.v(h_)
+
+    #     # compute attention
+    #     flat_q, orig_shape = DimensionHelper.flatten_spatial_dims(q, self.dimension)
+    #     flat_k, _ = DimensionHelper.flatten_spatial_dims(k, self.dimension)
+    #     flat_v, _ = DimensionHelper.flatten_spatial_dims(v, self.dimension)
+
+    #     b, c, hw = flat_q.shape
+    #     flat_q = flat_q.permute(0, 2, 1)    # b, hw, c
+
+    #     w_ = torch.bmm(flat_q, flat_k)      # b, hw, hw
+    #     w_ = w_ * (int(c)**(-0.5))
+    #     w_ = F.softmax(w_, dim=2)
+
+    #     # attend to values
+    #     w_ = w_.permute(0, 2, 1)   # b, hw, hw (first hw of k, second of q)
+    #     h_ = torch.bmm(flat_v, w_)  # b, c, hw (hw of q)
+
+    #     h_ = DimensionHelper.unflatten_spatial_dims(h_, self.dimension, orig_shape)
+    #     h_ = self.proj_out(h_)
+
+    #     return x + h_
+
+    def _flash_attention_forward(self, q, k, v):
+        """Forward pass using torch.nn.functional.scaled_dot_product_attention."""
+        # Get spatial dimensions before flattening
+        orig_shape = q.shape[2:]
+
+        # Flatten spatial dimensions: [b, c, *spatial] -> [b, c, seq_len]
+        flat_q, spatial_size = DimensionHelper.flatten_spatial_dims(q, self.dimension)
+        flat_k, _ = DimensionHelper.flatten_spatial_dims(k, self.dimension)
+        flat_v, _ = DimensionHelper.flatten_spatial_dims(v, self.dimension)
+
+        b, c, seq_len = flat_q.shape
+
+        # Reshape for scaled_dot_product_attention: [b, c, seq_len] -> [b, 1, seq_len, c]
+        # We treat this as single-head attention with head_dim = c
+        q_attn = einops.rearrange(flat_q, 'b c s -> b 1 s c')
+        k_attn = einops.rearrange(flat_k, 'b c s -> b 1 s c')
+        v_attn = einops.rearrange(flat_v, 'b c s -> b 1 s c')
+
+        # Apply scaled dot product attention
+        attn_output = F.scaled_dot_product_attention(
+            q_attn, k_attn, v_attn,
+            attn_mask=None,
+            dropout_p=0.0,
+            is_causal=False,
+            scale=self.scale
+        )
+
+        # Reshape back: [b, 1, seq_len, c] -> [b, c, seq_len]
+        attn_output = einops.rearrange(attn_output, 'b 1 s c -> b c s')
+
+        # Unflatten spatial dimensions
+        h_ = DimensionHelper.unflatten_spatial_dims(attn_output, self.dimension, spatial_size)
+
+        return h_
+
+    def _original_attention_forward(self, q, k, v):
+        """Original attention implementation for fallback."""
         # compute attention
         flat_q, orig_shape = DimensionHelper.flatten_spatial_dims(q, self.dimension)
         flat_k, _ = DimensionHelper.flatten_spatial_dims(k, self.dimension)
@@ -352,7 +434,7 @@ class AttnBlock(nn.Module):
         flat_q = flat_q.permute(0, 2, 1)    # b, hw, c
 
         w_ = torch.bmm(flat_q, flat_k)      # b, hw, hw
-        w_ = w_ * (int(c)**(-0.5))
+        w_ = w_ * self.scale
         w_ = F.softmax(w_, dim=2)
 
         # attend to values
@@ -360,9 +442,7 @@ class AttnBlock(nn.Module):
         h_ = torch.bmm(flat_v, w_)  # b, c, hw (hw of q)
 
         h_ = DimensionHelper.unflatten_spatial_dims(h_, self.dimension, orig_shape)
-        h_ = self.proj_out(h_)
-
-        return x + h_
+        return h_
 
 
 class LinearAttention(nn.Module):
@@ -420,12 +500,25 @@ class LinAttnBlock(nn.Module):
         return self.attn(x)
 
 
-def make_attn(dimension, in_channels, attn_type="vanilla", num_groups=32, patch_size=None):
+def make_attn(
+    dimension,
+    in_channels,
+    attn_type="vanilla",
+    num_groups=32,
+    patch_size=None,
+    use_flash_attention=True,
+):
     """Factory function to create an attention block of specified type."""
     assert attn_type in ["vanilla", "linear", "none"], f'attn_type {attn_type} unknown'
 
     if attn_type == "vanilla":
-        return AttnBlock(dimension, in_channels, num_groups=num_groups, patch_size=patch_size)
+        return AttnBlock(
+            dimension,
+            in_channels,
+            num_groups=num_groups,
+            patch_size=patch_size,
+            use_flash_attention=use_flash_attention,
+        )
     elif attn_type == "none":
         return nn.Identity()
     else:
@@ -561,7 +654,8 @@ class VAEEncoder(nn.Module):
                         block_in,
                         attn_type=config.attn_type,
                         num_groups=config.num_groups,
-                        patch_size=config.patch_size
+                        patch_size=config.patch_size,
+                        use_flash_attention=config.use_flash_attention,
                     ))
 
             down = nn.Module()
@@ -593,7 +687,8 @@ class VAEEncoder(nn.Module):
                 block_in,
                 attn_type=config.attn_type,
                 num_groups=config.num_groups,
-                patch_size=config.patch_size
+                patch_size=config.patch_size,
+                use_flash_attention=config.use_flash_attention,
             )
 
         self.mid.block_2 = ResnetBlock(
@@ -627,7 +722,7 @@ class VAEEncoder(nn.Module):
 
     def forward(self, x, time=None):
         # print(f"Input x shape: {x.shape}, 10th item: {x.flatten()[9] if x.numel() > 9 else None}")
-        
+
         # Time embedding
         temb = None
         if self.config.with_time_emb and time is not None:
@@ -645,7 +740,7 @@ class VAEEncoder(nn.Module):
             for i_block in range(self.config.num_res_blocks):
                 h = self.down[i_level].block[i_block](hs[-1], temb)
                 # print(f"  After down[{i_level}].block[{i_block}] shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
-                
+
                 if len(self.down[i_level].attn) > i_block:
                     h = self.down[i_level].attn[i_block](h)
                     # print(f"  After down[{i_level}].attn[{i_block}] shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
@@ -658,24 +753,24 @@ class VAEEncoder(nn.Module):
         # Middle
         h = hs[-1]
         # print(f"Middle input shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
-        
+
         h = self.mid.block_1(h, temb)
         # print(f"After mid.block_1 shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
-        
+
         if hasattr(self.mid, 'attn_1'):
             h = self.mid.attn_1(h)
             # print(f"After mid.attn_1 shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
-        
+
         h = self.mid.block_2(h, temb)
         # print(f"After mid.block_2 shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
 
         # Normalize and project
         h = self.norm_out(h)
         # print(f"After norm_out shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
-        
+
         h = nonlinearity(h)
         # print(f"After nonlinearity shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
-        
+
         h = self.conv_out(h)
         # print(f"After conv_out shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
 
@@ -746,7 +841,8 @@ class VAEDecoder(nn.Module):
                 block_in,
                 attn_type=config.attn_type,
                 num_groups=config.num_groups,
-                patch_size=config.patch_size
+                patch_size=config.patch_size,
+                use_flash_attention=config.use_flash_attention,
             )
 
         self.mid.block_2 = ResnetBlock(
@@ -790,7 +886,8 @@ class VAEDecoder(nn.Module):
                         block_in,
                         attn_type=config.attn_type,
                         num_groups=config.num_groups,
-                        patch_size=config.patch_size
+                        patch_size=config.patch_size,
+                        use_flash_attention=config.use_flash_attention,
                     ))
 
             up = nn.Module()
@@ -818,7 +915,7 @@ class VAEDecoder(nn.Module):
 
     def forward(self, z, time=None):
         # print(f"Input z shape: {z.shape}, 10th item: {z.flatten()[9] if z.numel() > 9 else None}")
-        
+
         # Time embedding
         temb = None
         if self.config.with_time_emb and time is not None:
@@ -836,7 +933,7 @@ class VAEDecoder(nn.Module):
         # Middle block
         h = self.mid.block_1(h, temb)
         # print(f"After mid.block_1 shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
-        
+
         if hasattr(self.mid, 'attn_1'):
             h = self.mid.attn_1(h)
             # print(f"After mid.attn_1 shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
@@ -850,29 +947,29 @@ class VAEDecoder(nn.Module):
             for i_block in range(len(self.up[i_level].block)):
                 h = self.up[i_level].block[i_block](h, temb)
                 # print(f"  After up[{i_level}].block[{i_block}] shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
-                
+
                 if len(self.up[i_level].attn) > i_block:
                     h = self.up[i_level].attn[i_block](h)
                     # print(f"  After up[{i_level}].attn[{i_block}] shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
-            
+
             if i_level != 0:
                 h = self.up[i_level].upsample(h)
                 # print(f"  After up[{i_level}].upsample shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
-        
+
         # Output normalization and convolution
         h = self.norm_out(h)
         # print(f"After norm_out shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
-        
+
         h = nonlinearity(h)
         # print(f"After nonlinearity shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
-        
+
         h = self.conv_out(h)
         # print(f"After conv_out shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
 
         if self.config.tanh_out:
             h = torch.tanh(h)
             # print(f"After tanh shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
-        
+
         return h
 
 
