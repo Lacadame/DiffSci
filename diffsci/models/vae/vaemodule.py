@@ -7,7 +7,7 @@ import lightning
 from torch import Tensor
 from jaxtyping import Float
 
-from diffsci.models.aux import batchnorm, preprocessors
+from diffsci.models.aux_scripts import batchnorm, preprocessors
 
 
 LatentMatchingType = Literal["kl", "mse", "modhell", "wasserstein"]

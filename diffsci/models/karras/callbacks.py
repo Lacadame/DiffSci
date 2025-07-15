@@ -1,1 +1,1 @@
-from diffsci.models.aux.callbacks import *
+from diffsci.models.aux_scripts.callbacks import *

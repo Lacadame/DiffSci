@@ -1,1 +1,1 @@
-from diffsci.models.aux.batchnorm import *
+from diffsci.models.aux_scripts.batchnorm import *

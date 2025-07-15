@@ -272,6 +272,8 @@ class KarrasModule(lightning.LightningModule):
             self.loss_metric = torch.nn.MSELoss(reduction="none")
         elif self.config.loss_metric == "huber":
             self.loss_metric = torch.nn.HuberLoss(reduction="none")
+        elif self.config.loss_metric == "our_loss":
+            self.loss_metric = 
         # elif self.config.loss_metric == "sinkhorn":
             # self.config.loss_metric = SinkhornLoss()
         else:

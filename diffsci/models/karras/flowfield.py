@@ -8,7 +8,7 @@ import numpy as np
 import lightning
 
 from diffsci.torchutils import broadcast_from_below, dict_unsqueeze
-from diffsci.models.aux import DimensionAgnosticBatchNorm, IdentityBatchNorm, HyperparameterManager
+from diffsci.models.aux_scripts import DimensionAgnosticBatchNorm, IdentityBatchNorm, HyperparameterManager
 
 
 SampleType = Float[Tensor, "batch *shape"]
