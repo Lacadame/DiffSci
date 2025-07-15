@@ -4,6 +4,7 @@ import torch
 import lightning
 from torch import Tensor
 from jaxtyping import Float, Bool
+from typing import Tuple
 
 from diffsci.torchutils import (broadcast_from_below,
                                 linear_interpolation,
@@ -31,6 +32,8 @@ class KarrasModuleConfig(object):
                  tag: str = "custom",
                  has_edm_batch_norm: bool = False,
                  dynamic_loss_weight: int | None = None,
+                 spatial_shape: Tuple[int] | None = None,
+                 focus_radius: float | None = None,
                  extra_args: None | dict[str, Any] = None):
         self.preconditioner = preconditioner
         self.noisesampler = noisesampler
@@ -39,6 +42,8 @@ class KarrasModuleConfig(object):
         self.tag = tag
         self.has_edm_batch_norm = has_edm_batch_norm
         self.dynamic_loss_weight = dynamic_loss_weight
+        self.spatial_shape = spatial_shape
+        self.focus_radius = focus_radius
         if extra_args is None:
             self.extra_args = dict()
         else:
@@ -73,6 +78,41 @@ class KarrasModuleConfig(object):
                                   tag=tag,
                                   has_edm_batch_norm=has_edm_batch_norm,
                                   dynamic_loss_weight=dynamic_loss_weight,
+                                  extra_args=extra_args)
+
+    @classmethod
+    def from_edm_weighted_gaussian(self,
+                                   spatial_shape: Tuple[int],
+                                   focus_radius: float,
+                                   sigma_data: float = 0.5,
+                                   prior_mean: float = -1.2,
+                                   prior_std: float = 1.2,
+                                   has_edm_batch_norm: bool = False,
+                                   dynamic_loss_weight: int | None = None):
+
+        preconditioner = preconditioners.EDMPreconditioner(
+                            sigma_data=sigma_data
+                        )
+        noisesampler = noisesamplers.EDMNoiseSampler(
+                            sigma_data=sigma_data,
+                            prior_mean=prior_mean,
+                            prior_std=prior_std
+                        )
+        noisescheduler = schedulers.EDMScheduler()
+        loss_metric = "weighted_gaussian"
+        tag = "edm_weighted_gaussian"
+        extra_args = {"sigma_data": sigma_data,
+                      "prior_mean": prior_mean,
+                      "prior_std": prior_std}
+        return KarrasModuleConfig(preconditioner=preconditioner,
+                                  noisesampler=noisesampler,
+                                  noisescheduler=noisescheduler,
+                                  loss_metric=loss_metric,
+                                  tag=tag,
+                                  has_edm_batch_norm=has_edm_batch_norm,
+                                  dynamic_loss_weight=dynamic_loss_weight,
+                                  spatial_shape=spatial_shape,
+                                  focus_radius=focus_radius,
                                   extra_args=extra_args)
 
     @classmethod
@@ -272,6 +312,12 @@ class KarrasModule(lightning.LightningModule):
             self.loss_metric = torch.nn.MSELoss(reduction="none")
         elif self.config.loss_metric == "huber":
             self.loss_metric = torch.nn.HuberLoss(reduction="none")
+        elif self.config.loss_metric == "weighted_gaussian":
+            if self.config.spatial_shape is None or self.config.focus_radius is None:
+                raise AttributeError("config must have shape tuple and focus radius")
+            else:
+                self.loss_metric = GaussianWeightedMSELoss(shape=self.config.spatial_shape,
+                                                           focus_radius=self.config.focus_radius)
         # elif self.config.loss_metric == "sinkhorn":
             # self.config.loss_metric = SinkhornLoss()
         else:
