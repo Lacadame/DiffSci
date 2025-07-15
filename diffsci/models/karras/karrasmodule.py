@@ -11,6 +11,7 @@ from diffsci.torchutils import (broadcast_from_below,
                                 dict_unsqueeze,
                                 dict_to)
 from diffsci.utils import get_minibatch_sizes
+from diffsci.custom_losses import GaussianWeightedMSELoss
 from . import preconditioners
 from . import noisesamplers
 from . import schedulers
