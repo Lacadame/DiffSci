@@ -308,21 +308,53 @@ class KarrasModule(lightning.LightningModule):
     def set_loss_metric(self):
         """
         Set the loss function to be used.
+        
+        Supports two formats:
+        1. String: "mse", "huber", etc. (backward compatible)
+        2. Dict: {"smoothed_indicator": {"thresholds": [0.5, 1.0], "fp_penalty": 1.5}}
         """
-        if self.config.loss_metric == "mse":
-            self.loss_metric = torch.nn.MSELoss(reduction="none")
-        elif self.config.loss_metric == "huber":
-            self.loss_metric = torch.nn.HuberLoss(reduction="none")
-        elif self.config.loss_metric == "weighted_gaussian":
-            if self.config.spatial_shape is None or self.config.focus_radius is None:
-                raise AttributeError("config must have shape tuple and focus radius")
+        
+        if isinstance(self.config.loss_metric, str):
+            # Original string-based method (backward compatible)
+            if self.config.loss_metric == "mse":
+                self.loss_metric = torch.nn.MSELoss(reduction="none")
+            elif self.config.loss_metric == "huber":
+                self.loss_metric = torch.nn.HuberLoss(reduction="none")
             else:
-                self.loss_metric = GaussianWeightedMSELoss(shape=self.config.spatial_shape,
-                                                           focus_radius=self.config.focus_radius)
-        # elif self.config.loss_metric == "sinkhorn":
-            # self.config.loss_metric = SinkhornLoss()
+                raise ValueError(f"loss_type {self.config.loss_metric} not recognized")
+        
+        elif isinstance(self.config.loss_metric, dict):
+            # New dict-based method with parameters
+            if len(self.config.loss_metric) != 1:
+                raise ValueError(f"Loss config dict must have exactly one key, got {list(self.config.loss_metric.keys())}")
+            
+            loss_name = list(self.config.loss_metric.keys())[0]
+            loss_params = self.config.loss_metric[loss_name]
+            
+            if loss_name == "mse":
+                self.loss_metric = torch.nn.MSELoss(reduction="none")
+
+            elif loss_name == "huber":
+                delta = loss_params.get('delta', 1.0)
+                self.loss_metric = torch.nn.HuberLoss(reduction="none", delta=delta)
+
+            elif loss_name == "weighted_gaussian":
+                shape = loss_params.get('shape', self.config.spatial_shape)
+                focus_radius = loss_params.get('focus_radius', self.config.focus_radius)
+
+                if shape is None or focus_radius is None:
+                    raise AttributeError("weighted_gaussian requires shape and focus_radius")
+                self.loss_metric = GaussianWeightedMSELoss(*loss_params)
+
+            elif loss_name == "smoothed_indicator":
+                from diffsci.custom_losses import MultiThresholdSmoothIndicatorLoss
+                self.loss_metric = MultiThresholdSmoothIndicatorLoss(**loss_params)
+
+            else:
+                raise ValueError(f"loss_name '{loss_name}' not recognized")
+        
         else:
-            raise ValueError(f"loss_type {self.loss_metric} not recognized")
+            raise ValueError(f"loss_metric must be string or dict, got {type(self.config.loss_metric)}")
 
     def loss_fn(self,
                 x: Float[Tensor, "batch *shape"],  # noqa: F821
@@ -357,9 +389,14 @@ class KarrasModule(lightning.LightningModule):
             modifier = broadcast_from_below(modifier, x)  # [nbatch, *1]
             weight = weight/torch.exp(modifier)
             bias = bias + modifier
-        # Compute the loss
-        loss = self.loss_metric(denoiser, x)  # [nbatch]
 
+        # Compute the loss
+        if self.config.loss_metric == "smoothed_indicator":
+            loss = self.loss_metric.forward(denoiser, x, mask)
+            loss = (weight * loss + bias).mean()
+            return loss
+
+        loss = self.loss_metric(denoiser, x)  # [nbatch]
         if mask is not None:
             # Apply the mask if it is provided
             # We assume that the mask is 1 where the data is absent

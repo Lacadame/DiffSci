@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from typing import Tuple
+from typing import Tuple, Union, Optional, List
 
 class GaussianWeightedMSELoss(nn.Module):
     """
@@ -92,4 +92,247 @@ class GaussianWeightedMSELoss(nn.Module):
         
         # 3. Return the weighted error tensor without reduction
         return weighted_squared_error
+
+class MultiThresholdSmoothIndicatorLoss(torch.nn.Module):
+    """
+    Smooth approximation of indicator function loss for multiple threshold high current detection.
+    
+    This loss focuses on whether the model correctly predicts high currents above
+    multiple thresholds, rather than exact values. Uses smooth approximations to
+    maintain differentiability and handles False Positives appropriately.
+    """
+    
+    def __init__(self, 
+                 thresholds: Union[List[float], float],
+                 temperature: float = 10.0,
+                 loss_type: str = 'sigmoid',
+                 focus_weights: Optional[Union[List[float], float]] = None,
+                 background_weights: Optional[Union[List[float], float]] = None,
+                 fp_penalty: float = 1.0,
+                 se_weight: float = 0.1,
+                 aggregation: str = 'mean'):
+        """
+        Args:
+            thresholds: Single threshold or list of current magnitude thresholds
+            temperature: Controls smoothness (higher = sharper transition)
+            loss_type: Type of smooth approximation ('sigmoid', 'tanh', 'gumbel')
+            focus_weights: Weight for high current regions (above each threshold)
+            background_weights: Weight for low current regions (below each threshold)
+            fp_penalty: Penalty weight for False Positives (pred high, target low)
+            se_weight: Weight for squared error component
+            aggregation: How to combine losses across thresholds ('mean', 'sum', 'max')
+        """
+        super().__init__()
+        
+        # Convert single threshold to list
+        if isinstance(thresholds, (int, float)):
+            self.thresholds = [float(thresholds)]
+        else:
+            self.thresholds = list(thresholds)
+        
+        self.n_thresholds = len(self.thresholds)
+        self.temperature = temperature
+        self.loss_type = loss_type
+        self.fp_penalty = fp_penalty
+        self.se_weight = se_weight
+        self.aggregation = aggregation
+        
+        # Handle weights for each threshold
+        if focus_weights is None:
+            self.focus_weights = [2.0] * self.n_thresholds
+        elif isinstance(focus_weights, (int, float)):
+            self.focus_weights = [float(focus_weights)] * self.n_thresholds
+        else:
+            assert len(focus_weights) == self.n_thresholds, \
+                f"focus_weights length {len(focus_weights)} != thresholds length {self.n_thresholds}"
+            self.focus_weights = list(focus_weights)
+        
+        if background_weights is None:
+            self.background_weights = [0.1] * self.n_thresholds
+        elif isinstance(background_weights, (int, float)):
+            self.background_weights = [float(background_weights)] * self.n_thresholds
+        else:
+            assert len(background_weights) == self.n_thresholds, \
+                f"background_weights length {len(background_weights)} != thresholds length {self.n_thresholds}"
+            self.background_weights = list(background_weights)
+    
+    def smooth_indicator(self, x: torch.Tensor, threshold: float) -> torch.Tensor:
+        """Smooth approximation of indicator function I(x > threshold)"""
+        if self.loss_type == 'sigmoid':
+            return torch.sigmoid(self.temperature * (x - threshold))
+        elif self.loss_type == 'tanh':
+            return 0.5 * (1 + torch.tanh(self.temperature * (x - threshold)))
+        elif self.loss_type == 'gumbel':
+            # Gumbel softmax approximation
+            logits = torch.stack([torch.zeros_like(x), 
+                                 self.temperature * (x - threshold)], dim=-1)
+            return torch.nn.functional.softmax(logits, dim=-1)[..., 1]
+        else:
+            raise ValueError(f"Unknown loss_type: {self.loss_type}")
+    
+    def compute_threshold_loss(self, pred: torch.Tensor, target: torch.Tensor, 
+                              threshold: float, focus_weight: float, 
+                              background_weight: float,
+                              mask: Optional[torch.Tensor] = None) -> dict:
+        """Compute loss for a single threshold with proper BCE and squared error"""
+        
+        # Smooth indicators
+        target_indicator = self.smooth_indicator(target, threshold)
+        pred_indicator = self.smooth_indicator(pred, threshold)
+        
+        eps = 1e-8
+        
+        # Standard Binary Cross-Entropy Loss
+        bce_loss = -(target_indicator * torch.log(pred_indicator + eps) + 
+                    (1 - target_indicator) * torch.log(1 - pred_indicator + eps))
+        
+        # Apply False Positive penalty: extra penalty when target=0 but pred=1
+        fp_penalty_term = (1 - target_indicator) * pred_indicator * (self.fp_penalty - 1.0)
+        
+        # Combined BCE + FP penalty
+        indicator_loss = bce_loss + fp_penalty_term
+        
+        # Squared Error Loss (for value accuracy)
+        squared_error = (pred - target) ** 2
+        
+        # Apply spatial weighting
+        weighted_indicator_loss = (focus_weight * indicator_loss * target_indicator + 
+                                  background_weight * indicator_loss * (1 - target_indicator))
+        
+        # Weight squared error by target intensity (focus more on high current regions)
+        weighted_squared_error = squared_error * (1.0 + target_indicator)
+        
+        # Apply mask if provided
+        if mask is not None:
+            valid_mask = (~mask).float()
+            weighted_indicator_loss = weighted_indicator_loss * valid_mask
+            weighted_squared_error = weighted_squared_error * valid_mask
+            
+            # Compute detailed statistics for analysis
+            # TP: target high (>0.5), pred high (>0.5)
+            tp_mask = (target_indicator > 0.5) & (pred_indicator > 0.5) & valid_mask.bool()
+            # FP: target low (<=0.5), pred high (>0.5)  
+            fp_mask = (target_indicator <= 0.5) & (pred_indicator > 0.5) & valid_mask.bool()
+            # FN: target high (>0.5), pred low (<=0.5)
+            fn_mask = (target_indicator > 0.5) & (pred_indicator <= 0.5) & valid_mask.bool()
+            # TN: target low (<=0.5), pred low (<=0.5)
+            tn_mask = (target_indicator <= 0.5) & (pred_indicator <= 0.5) & valid_mask.bool()
+            
+            stats = {
+                'indicator_loss': weighted_indicator_loss.sum() / valid_mask.sum().clamp(min=1),
+                'squared_error': weighted_squared_error.sum() / valid_mask.sum().clamp(min=1),
+                'bce_loss': (bce_loss * valid_mask).sum() / valid_mask.sum().clamp(min=1),
+                'fp_penalty': (fp_penalty_term * valid_mask).sum() / valid_mask.sum().clamp(min=1),
+                'tp_count': tp_mask.sum().float(),
+                'fp_count': fp_mask.sum().float(),
+                'fn_count': fn_mask.sum().float(),
+                'tn_count': tn_mask.sum().float(),
+                'tp_avg_pred': pred_indicator[tp_mask].mean() if tp_mask.any() else torch.tensor(0.0),
+                'fp_avg_pred': pred_indicator[fp_mask].mean() if fp_mask.any() else torch.tensor(0.0),
+                'fn_avg_pred': pred_indicator[fn_mask].mean() if fn_mask.any() else torch.tensor(0.0),
+                'tn_avg_pred': pred_indicator[tn_mask].mean() if tn_mask.any() else torch.tensor(0.0),
+                'n_high_target': (target_indicator > 0.5).sum().float(),
+                'n_low_target': (target_indicator <= 0.5).sum().float()
+            }
+        else:
+            # Without mask
+            tp_mask = (target_indicator > 0.5) & (pred_indicator > 0.5)
+            fp_mask = (target_indicator <= 0.5) & (pred_indicator > 0.5)
+            fn_mask = (target_indicator > 0.5) & (pred_indicator <= 0.5)
+            tn_mask = (target_indicator <= 0.5) & (pred_indicator <= 0.5)
+            
+            stats = {
+                'indicator_loss': weighted_indicator_loss.mean(),
+                'squared_error': weighted_squared_error.mean(),
+                'bce_loss': bce_loss.mean(),
+                'fp_penalty': fp_penalty_term.mean(),
+                'tp_count': tp_mask.sum().float(),
+                'fp_count': fp_mask.sum().float(),
+                'fn_count': fn_mask.sum().float(),
+                'tn_count': tn_mask.sum().float(),
+                'tp_avg_pred': pred_indicator[tp_mask].mean() if tp_mask.any() else torch.tensor(0.0),
+                'fp_avg_pred': pred_indicator[fp_mask].mean() if fp_mask.any() else torch.tensor(0.0),
+                'fn_avg_pred': pred_indicator[fn_mask].mean() if fn_mask.any() else torch.tensor(0.0),
+                'tn_avg_pred': pred_indicator[tn_mask].mean() if tn_mask.any() else torch.tensor(0.0),
+                'n_high_target': (target_indicator > 0.5).sum().float(),
+                'n_low_target': (target_indicator <= 0.5).sum().float()
+            }
+        
+        return stats
+    
+    def forward(self, pred: torch.Tensor, target: torch.Tensor, 
+                mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Args:
+            pred: Predicted current magnitudes [batch, ...]
+            target: Target current magnitudes [batch, ...]
+            mask: Optional mask for valid regions [batch, ...]
+        
+        Returns:
+            Single tensor loss value compatible with your training setup
+        """
+        
+        all_losses = []
+        
+        for i, threshold in enumerate(self.thresholds):
+            stats = self.compute_threshold_loss(
+                pred, target, threshold, 
+                self.focus_weights[i], self.background_weights[i], mask
+            )
+            
+            # Combine indicator loss and squared error
+            combined_loss = stats['indicator_loss'] + self.se_weight * stats['squared_error']
+            all_losses.append(combined_loss)
+        
+        # Aggregate losses across thresholds
+        if self.aggregation == 'mean':
+            total_loss = torch.stack(all_losses).mean()
+        elif self.aggregation == 'sum':
+            total_loss = torch.stack(all_losses).sum()
+        elif self.aggregation == 'max':
+            total_loss = torch.stack(all_losses).max()
+        else:
+            raise ValueError(f"Unknown aggregation: {self.aggregation}")
+        
+        return total_loss
+    
+    def forward_with_stats(self, pred: torch.Tensor, target: torch.Tensor, 
+                          mask: Optional[torch.Tensor] = None) -> dict:
+        """
+        Alternative forward method that returns detailed statistics.
+        Use this for analysis/debugging, but use forward() for training.
+        """
+        
+        all_losses = []
+        threshold_stats = {}
+        
+        for i, threshold in enumerate(self.thresholds):
+            stats = self.compute_threshold_loss(
+                pred, target, threshold, 
+                self.focus_weights[i], self.background_weights[i], mask
+            )
+            
+            # Combine indicator loss and squared error
+            combined_loss = stats['indicator_loss'] + self.se_weight * stats['squared_error']
+            all_losses.append(combined_loss)
+            threshold_stats[f'threshold_{threshold}'] = stats
+        
+        # Aggregate losses across thresholds
+        if self.aggregation == 'mean':
+            total_loss = torch.stack(all_losses).mean()
+        elif self.aggregation == 'sum':
+            total_loss = torch.stack(all_losses).sum()
+        elif self.aggregation == 'max':
+            total_loss = torch.stack(all_losses).max()
+        else:
+            raise ValueError(f"Unknown aggregation: {self.aggregation}")
+        
+        result = {
+            'total_loss': total_loss,
+            'individual_losses': all_losses,
+            'threshold_stats': threshold_stats,
+            'thresholds': self.thresholds
+        }
+        
+        return result
 
