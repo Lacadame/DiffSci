@@ -4,14 +4,14 @@ import torch
 import lightning
 from torch import Tensor
 from jaxtyping import Float, Bool
-from typing import Tuple
+from typing import Tuple, Union, Dict, Any, Callable, Optional
 
 from diffsci.torchutils import (broadcast_from_below,
                                 linear_interpolation,
                                 dict_unsqueeze,
                                 dict_to)
 from diffsci.utils import get_minibatch_sizes
-from diffsci.custom_losses import GaussianWeightedMSELoss
+from diffsci.custom_losses import GaussianWeightedMSELoss, MultiSpaceLoss, MultiThresholdSmoothIndicatorLoss
 from . import preconditioners
 from . import noisesamplers
 from . import schedulers
@@ -29,13 +29,30 @@ class KarrasModuleConfig(object):
                  preconditioner: preconditioners.KarrasPreconditioner,
                  noisesampler: noisesamplers.NoiseSampler,
                  noisescheduler: schedulers.Scheduler,
-                 loss_metric: str = "huber",
+                 loss_metric: Union[str, Dict[str, Any]] = "huber",
                  tag: str = "custom",
                  has_edm_batch_norm: bool = False,
                  dynamic_loss_weight: int | None = None,
-                 spatial_shape: Tuple[int] | None = None,
-                 focus_radius: float | None = None,
-                 extra_args: None | dict[str, Any] = None):
+                 extra_args: None | dict[str, Any] = None,
+                 # Legacy parameters for backward compatibility
+                 spatial_shape: tuple = None,
+                 focus_radius: float = None):
+        """
+        Args:
+            preconditioner: Karras preconditioner
+            noisesampler: Noise sampler
+            noisescheduler: Scheduler
+            loss_metric: Loss configuration - can be:
+                - str: "mse", "huber", etc. (backward compatible)
+                - dict: {"smoothed_indicator": {"thresholds": [0.5, 1.0], ...}}
+                - dict: {"losses": [{"name": "loss1", "type": "mse", ...}, ...]}
+            tag: Configuration tag
+            has_edm_batch_norm: Whether to use EDM batch norm
+            dynamic_loss_weight: Dynamic loss weight configuration
+            extra_args: Extra arguments for reconstruction
+            spatial_shape: Legacy parameter for weighted_gaussian loss
+            focus_radius: Legacy parameter for weighted_gaussian loss
+        """
         self.preconditioner = preconditioner
         self.noisesampler = noisesampler
         self.noisescheduler = noisescheduler
@@ -45,19 +62,35 @@ class KarrasModuleConfig(object):
         self.dynamic_loss_weight = dynamic_loss_weight
         self.spatial_shape = spatial_shape
         self.focus_radius = focus_radius
+        
         if extra_args is None:
             self.extra_args = dict()
         else:
             self.extra_args = extra_args
 
     @classmethod
-    def from_edm(self,
+    def from_edm(cls,
                  sigma_data: float = 0.5,
                  prior_mean: float = -1.2,
                  prior_std: float = 1.2,
                  has_edm_batch_norm: bool = False,
-                 dynamic_loss_weight: int | None = None):
-
+                 dynamic_loss_weight: int | None = None,
+                 loss_metric: Union[str, Dict[str, Any]] = "huber",
+                 spatial_shape: tuple = None,
+                 focus_radius: float = None):
+        """
+        Create EDM configuration with flexible loss support.
+        
+        Args:
+            sigma_data: Sigma data parameter
+            prior_mean: Prior mean
+            prior_std: Prior standard deviation
+            has_edm_batch_norm: Whether to use EDM batch norm
+            dynamic_loss_weight: Dynamic loss weight
+            loss_metric: Loss configuration (new flexible format)
+            spatial_shape: For weighted_gaussian loss (legacy)
+            focus_radius: For weighted_gaussian loss (legacy)
+        """
         preconditioner = preconditioners.EDMPreconditioner(
                             sigma_data=sigma_data
                         )
@@ -67,62 +100,39 @@ class KarrasModuleConfig(object):
                             prior_std=prior_std
                         )
         noisescheduler = schedulers.EDMScheduler()
-        loss_metric = "huber"
         tag = "edm"
-        extra_args = {"sigma_data": sigma_data,
-                      "prior_mean": prior_mean,
-                      "prior_std": prior_std}
-        return KarrasModuleConfig(preconditioner=preconditioner,
-                                  noisesampler=noisesampler,
-                                  noisescheduler=noisescheduler,
-                                  loss_metric=loss_metric,
-                                  tag=tag,
-                                  has_edm_batch_norm=has_edm_batch_norm,
-                                  dynamic_loss_weight=dynamic_loss_weight,
-                                  extra_args=extra_args)
+        extra_args = {
+            "sigma_data": sigma_data,
+            "prior_mean": prior_mean,
+            "prior_std": prior_std,
+            "loss_metric": loss_metric,
+            "spatial_shape": spatial_shape,
+            "focus_radius": focus_radius
+        }
+        return cls(preconditioner=preconditioner,
+                   noisesampler=noisesampler,
+                   noisescheduler=noisescheduler,
+                   loss_metric=loss_metric,
+                   tag=tag,
+                   has_edm_batch_norm=has_edm_batch_norm,
+                   dynamic_loss_weight=dynamic_loss_weight,
+                   extra_args=extra_args,
+                   spatial_shape=spatial_shape,
+                   focus_radius=focus_radius)
 
     @classmethod
-    def from_edm_weighted_gaussian(self,
-                                   spatial_shape: Tuple[int],
-                                   focus_radius: float,
-                                   sigma_data: float = 0.5,
-                                   prior_mean: float = -1.2,
-                                   prior_std: float = 1.2,
-                                   has_edm_batch_norm: bool = False,
-                                   dynamic_loss_weight: int | None = None):
-
-        preconditioner = preconditioners.EDMPreconditioner(
-                            sigma_data=sigma_data
-                        )
-        noisesampler = noisesamplers.EDMNoiseSampler(
-                            sigma_data=sigma_data,
-                            prior_mean=prior_mean,
-                            prior_std=prior_std
-                        )
-        noisescheduler = schedulers.EDMScheduler()
-        loss_metric = "weighted_gaussian"
-        tag = "edm_weighted_gaussian"
-        extra_args = {"sigma_data": sigma_data,
-                      "prior_mean": prior_mean,
-                      "prior_std": prior_std}
-        return KarrasModuleConfig(preconditioner=preconditioner,
-                                  noisesampler=noisesampler,
-                                  noisescheduler=noisescheduler,
-                                  loss_metric=loss_metric,
-                                  tag=tag,
-                                  has_edm_batch_norm=has_edm_batch_norm,
-                                  dynamic_loss_weight=dynamic_loss_weight,
-                                  spatial_shape=spatial_shape,
-                                  focus_radius=focus_radius,
-                                  extra_args=extra_args)
-
-    @classmethod
-    def from_vp(self,
+    def from_vp(cls,
                 beta_data: float = 19.9,
                 beta_min: float = 0.1,
                 epsilon_min: float = 1e-3,
                 epsilon_sampler: float = 1e-5,
-                M: int = 1000):
+                M: int = 1000,
+                loss_metric: Union[str, Dict[str, Any]] = "huber",
+                spatial_shape: tuple = None,
+                focus_radius: float = None):
+        """
+        Create VP configuration with flexible loss support.
+        """
         noisescheduler = schedulers.VPScheduler(epsilon_min=epsilon_min,
                                                 beta_data=beta_data,
                                                 beta_min=beta_min)
@@ -134,24 +144,36 @@ class KarrasModuleConfig(object):
             noise_scheduler=noisescheduler,
             epsilon=epsilon_sampler
         )
-        loss_metric = "huber"
         tag = "vp"
-        extra_args = {"beta_data": beta_data,
-                      "beta_min": beta_min,
-                      "epsilon_min": epsilon_min,
-                      "epsilon_sampler": epsilon_sampler,
-                      "M": M}
-        return KarrasModuleConfig(preconditioner=preconditioner,
-                                  noisesampler=noisesampler,
-                                  noisescheduler=noisescheduler,
-                                  loss_metric=loss_metric,
-                                  tag=tag,
-                                  extra_args=extra_args)
+        extra_args = {
+            "beta_data": beta_data,
+            "beta_min": beta_min,
+            "epsilon_min": epsilon_min,
+            "epsilon_sampler": epsilon_sampler,
+            "M": M,
+            "loss_metric": loss_metric,
+            "spatial_shape": spatial_shape,
+            "focus_radius": focus_radius
+        }
+        return cls(preconditioner=preconditioner,
+                   noisesampler=noisesampler,
+                   noisescheduler=noisescheduler,
+                   loss_metric=loss_metric,
+                   tag=tag,
+                   extra_args=extra_args,
+                   spatial_shape=spatial_shape,
+                   focus_radius=focus_radius)
 
     @classmethod
-    def from_ve(self,
+    def from_ve(cls,
                 sigma_min: float = 0.02,
-                sigma_max: float = 100):
+                sigma_max: float = 100,
+                loss_metric: Union[str, Dict[str, Any]] = "huber",
+                spatial_shape: tuple = None,
+                focus_radius: float = None):
+        """
+        Create VE configuration with flexible loss support.
+        """
         noisescheduler = schedulers.VEScheduler(sigma_min=sigma_min,
                                                 sigma_max=sigma_max)
         preconditioner = preconditioners.VEPreconditioner()
@@ -159,21 +181,33 @@ class KarrasModuleConfig(object):
             sigma_min=sigma_min,
             sigma_max=sigma_max
         )
-        loss_metric = "huber"
         tag = "ve"
-        extra_args = {"sigma_min": sigma_min,
-                      "sigma_max": sigma_max}
-        return KarrasModuleConfig(preconditioner=preconditioner,
-                                  noisesampler=noisesampler,
-                                  noisescheduler=noisescheduler,
-                                  loss_metric=loss_metric,
-                                  tag=tag,
-                                  extra_args=extra_args)
+        extra_args = {
+            "sigma_min": sigma_min,
+            "sigma_max": sigma_max,
+            "loss_metric": loss_metric,
+            "spatial_shape": spatial_shape,
+            "focus_radius": focus_radius
+        }
+        return cls(preconditioner=preconditioner,
+                   noisesampler=noisesampler,
+                   noisescheduler=noisescheduler,
+                   loss_metric=loss_metric,
+                   tag=tag,
+                   extra_args=extra_args,
+                   spatial_shape=spatial_shape,
+                   focus_radius=focus_radius)
 
     @classmethod
-    def conditionalSR3(self,
+    def conditionalSR3(cls,
                        sigma_min: float = 0.02,
-                       sigma_max: float = 100):
+                       sigma_max: float = 100,
+                       loss_metric: Union[str, Dict[str, Any]] = "huber",
+                       spatial_shape: tuple = None,
+                       focus_radius: float = None):
+        """
+        Create conditional SR3 configuration with flexible loss support.
+        """
         noisescheduler = schedulers.EDMScheduler(sigma_min=sigma_min,
                                                  sigma_max=sigma_max)
         preconditioner = preconditioners.SR3Preconditioner()
@@ -181,51 +215,91 @@ class KarrasModuleConfig(object):
             sigma_min=sigma_min,
             sigma_max=sigma_max
         )
-        loss_metric = "huber"
         tag = "conditionalSR3"
-        extra_args = {"sigma_min": sigma_min,
-                      "sigma_max": sigma_max}
-        return KarrasModuleConfig(preconditioner=preconditioner,
-                                  noisesampler=noisesampler,
-                                  noisescheduler=noisescheduler,
-                                  loss_metric=loss_metric,
-                                  tag=tag,
-                                  extra_args=extra_args)
+        extra_args = {
+            "sigma_min": sigma_min,
+            "sigma_max": sigma_max,
+            "loss_metric": loss_metric,
+            "spatial_shape": spatial_shape,
+            "focus_radius": focus_radius
+        }
+        return cls(preconditioner=preconditioner,
+                   noisesampler=noisesampler,
+                   noisescheduler=noisescheduler,
+                   loss_metric=loss_metric,
+                   tag=tag,
+                   extra_args=extra_args,
+                   spatial_shape=spatial_shape,
+                   focus_radius=focus_radius)
 
     def export_description(self) -> dict[str, Any]:
+        """Export configuration for saving/loading."""
         return dict(tag=self.tag,
                     extra_args=self.extra_args)
 
     @classmethod
-    def load_from_description_with_tag(self,
+    def load_from_description_with_tag(cls,
                                        description: dict[str, Any]):
+        """Load configuration from saved description."""
         tag = description["tag"]
         extra_args = description["extra_args"]
         if tag == "custom":
             raise ValueError("Cannot load from a custom tag")
         elif tag == "edm":
-            return KarrasModuleConfig.from_edm(**extra_args)
+            return cls.from_edm(**extra_args)
         elif tag == "vp":
-            return KarrasModuleConfig.from_vp(**extra_args)
+            return cls.from_vp(**extra_args)
         elif tag == "ve":
-            return KarrasModuleConfig.from_ve(**extra_args)
+            return cls.from_ve(**extra_args)
         elif tag == "conditionalSR3":
-            return KarrasModuleConfig.conditionalSR3(**extra_args)
+            return cls.conditionalSR3(**extra_args)
+        else:
+            raise ValueError(f"Unknown tag: {tag}")
 
     @property
     def has_dynamic_loss_weight(self):
+        """Check if dynamic loss weight is enabled."""
         return self.dynamic_loss_weight is not None
+
+    def update_loss_metric(self, loss_config: Union[str, Dict[str, Any]]):
+        """
+        Update the loss metric configuration.
+        
+        Useful for programmatically changing loss configuration after creation.
+        
+        Args:
+            loss_config: New loss configuration
+        """
+        self.loss_metric = loss_config
+        # Update extra_args for proper serialization
+        if 'loss_metric' in self.extra_args:
+            self.extra_args['loss_metric'] = loss_config
+
+    def get_loss_summary(self) -> str:
+        """
+        Get a human-readable summary of the loss configuration.
+        """
+        if isinstance(self.loss_metric, str):
+            return f"Single loss: {self.loss_metric}"
+        elif isinstance(self.loss_metric, dict):
+            if "losses" in self.loss_metric:
+                n_losses = len(self.loss_metric["losses"])
+                loss_names = [loss["name"] for loss in self.loss_metric["losses"]]
+                return f"Multi-space loss: {n_losses} losses ({', '.join(loss_names)})"
+            else:
+                loss_name = list(self.loss_metric.keys())[0]
+                return f"Single advanced loss: {loss_name}"
+        else:
+            return f"Unknown loss type: {type(self.loss_metric)}"
+
 
 
 class KarrasModule(lightning.LightningModule):
-    """
-    A diffusion model using the framework found in
-    "Elucidating the Design Space of Diffusion-Based
-     Generative Models", by Karras et al, 2022.
-    """
+    """Updated KarrasModule with multi-space loss support"""
+    
     def __init__(self,
                  model: torch.nn.Module,
-                 config: KarrasModuleConfig,
+                 config: 'KarrasModuleConfig',
                  conditional: bool = False,
                  masked: bool = False,
                  autoencoder: None | torch.nn.Module = None,
@@ -241,13 +315,18 @@ class KarrasModule(lightning.LightningModule):
         if self.autoencoder:
             self.freeze_autoencoder()
         self.autoencoder_conditional = autoencoder_conditional
-        self.encode_y = encode_y  # FIXME: What the fuck is this code?
-        self.decode_original_y = decode_original_y  # FIXME: What the fuck is this code?
+        self.encode_y = encode_y
+        self.decode_original_y = decode_original_y
         self.set_optimizer_and_scheduler()
         self.set_loss_metric()
         self.start_edm_batch_norm()
         self.start_dynamic_loss_weight()
-        self.norm = 1.0    # TODO: find better way to normalize latent space
+        self.norm = 1.0
+
+    def freeze_autoencoder(self):
+        """Freezes the autoencoder to prevent its weights from being updated during training."""
+        for param in self.autoencoder.parameters():
+            param.requires_grad = False
 
     def export_description(self) -> dict[str, Any]:
         config_description = self.config.export_description()
@@ -262,14 +341,6 @@ class KarrasModule(lightning.LightningModule):
                     autoencoder=autoencoder,
                     autoencoder_conditional=autoencoder_conditional,
                     encode_y=encode_y)
-
-    def freeze_autoencoder(self):
-        """
-        Freezes the autoencoder to prevent its weights from being updated
-        during training.
-        """
-        for param in self.autoencoder.parameters():
-            param.requires_grad = False
 
     def set_optimizer_and_scheduler(self,
                                     optimizer=None,
@@ -307,107 +378,157 @@ class KarrasModule(lightning.LightningModule):
 
     def set_loss_metric(self):
         """
-        Set the loss function to be used.
+        Set the loss function(s) to be used.
         
-        Supports two formats:
-        1. String: "mse", "huber", etc. (backward compatible)
-        2. Dict: {"smoothed_indicator": {"thresholds": [0.5, 1.0], "fp_penalty": 1.5}}
+        Supports three formats:
+        1. String: "mse" (backward compatible)
+        2. Dict with single loss: {"smoothed_indicator": {...}} (single loss)
+        3. Dict with multiple losses: {"losses": [...]} (multi-space losses)
         """
         
-        if isinstance(self.config.loss_metric, str):
-            # Original string-based method (backward compatible)
-            if self.config.loss_metric == "mse":
-                self.loss_metric = torch.nn.MSELoss(reduction="none")
-            elif self.config.loss_metric == "huber":
-                self.loss_metric = torch.nn.HuberLoss(reduction="none")
-            else:
-                raise ValueError(f"loss_type {self.config.loss_metric} not recognized")
+        loss_config = self.config.loss_metric
         
-        elif isinstance(self.config.loss_metric, dict):
-            # New dict-based method with parameters
-            if len(self.config.loss_metric) != 1:
-                raise ValueError(f"Loss config dict must have exactly one key, got {list(self.config.loss_metric.keys())}")
+        if isinstance(loss_config, str):
+            # Original string format - create single loss
+            self._set_single_loss_string(loss_config)
             
-            loss_name = list(self.config.loss_metric.keys())[0]
-            loss_params = self.config.loss_metric[loss_name]
-            
-            if loss_name == "mse":
-                self.loss_metric = torch.nn.MSELoss(reduction="none")
-
-            elif loss_name == "huber":
-                delta = loss_params.get('delta', 1.0)
-                self.loss_metric = torch.nn.HuberLoss(reduction="none", delta=delta)
-
-            elif loss_name == "weighted_gaussian":
-                shape = loss_params.get('shape', self.config.spatial_shape)
-                focus_radius = loss_params.get('focus_radius', self.config.focus_radius)
-
-                if shape is None or focus_radius is None:
-                    raise AttributeError("weighted_gaussian requires shape and focus_radius")
-                self.loss_metric = GaussianWeightedMSELoss(*loss_params)
-
-            elif loss_name == "smoothed_indicator":
-                from diffsci.custom_losses import MultiThresholdSmoothIndicatorLoss
-                self.loss_metric = MultiThresholdSmoothIndicatorLoss(**loss_params)
-
+        elif isinstance(loss_config, dict):
+            if "losses" in loss_config:
+                # Multi-space loss configuration
+                self.multi_space_loss = MultiSpaceLoss(loss_config, self.autoencoder)
+                self.loss_metric = None  # Will use multi_space_loss instead
             else:
-                raise ValueError(f"loss_name '{loss_name}' not recognized")
-        
+                # Single loss dict format
+                self._set_single_loss_dict(loss_config)
         else:
-            raise ValueError(f"loss_metric must be string or dict, got {type(self.config.loss_metric)}")
+            raise ValueError(f"loss_metric must be string or dict, got {type(loss_config)}")
+
+    def _set_single_loss_string(self, loss_name: str):
+        """Handle single loss string format (backward compatible)"""
+        if loss_name == "mse":
+            self.loss_metric = torch.nn.MSELoss(reduction="none")
+        elif loss_name == "huber":
+            self.loss_metric = torch.nn.HuberLoss(reduction="none")
+        elif loss_name == "weighted_gaussian":
+            if self.config.spatial_shape is None or self.config.focus_radius is None:
+                raise AttributeError("config must have shape tuple and focus radius")
+            self.loss_metric = GaussianWeightedMSELoss(shape=self.config.spatial_shape,
+                                                       focus_radius=self.config.focus_radius)
+        elif loss_name == "smoothed_indicator":
+            self.loss_metric = MultiThresholdSmoothIndicatorLoss()
+        else:
+            raise ValueError(f"loss_type {loss_name} not recognized")
+
+    def _set_single_loss_dict(self, loss_config: Dict[str, Any]):
+        """Handle single loss dict format"""
+        loss_name = list(loss_config.keys())[0]
+        loss_params = loss_config[loss_name]
+        
+        if loss_name == "mse":
+            self.loss_metric = torch.nn.MSELoss(reduction="none")
+        elif loss_name == "huber":
+            delta = loss_params.get('delta', 1.0)
+            self.loss_metric = torch.nn.HuberLoss(reduction="none", delta=delta)
+        elif loss_name == "smoothed_indicator":
+            self.loss_metric = MultiThresholdSmoothIndicatorLoss(**loss_params)
+        # ... add other loss types as needed
+        else:
+            raise ValueError(f"loss_name '{loss_name}' not recognized")
 
     def loss_fn(self,
-                x: Float[Tensor, "batch *shape"],  # noqa: F821
-                sigma: Float[Tensor, "batch"],  # noqa: F821
-                y: None | Float[Tensor, "batch *yshape"] = None,  # noqa: F821
-                mask: None | Float[Tensor, "batch *shape"] = None  # noqa: F821
-                ) -> Float[Tensor, ""]:  # noqa: F821, F722
-
+            x: Float[Tensor, "batch *shape"],  # noqa: F821
+            sigma: Float[Tensor, "batch"],  # noqa: F821
+            y: None | Float[Tensor, "batch *yshape"] = None,  # noqa: F821
+            mask: None | Float[Tensor, "batch *shape"] = None  # noqa: F821
+            ) -> Float[Tensor, ""]:  # noqa: F821, F722
         """
-        Parameters
-        ---------
-        x : torch.Tensor of shape [B, *[shapex]], the original noise
-        sigma : torch.Tensor of shape [B]
-        y : None or torch.Tensor of shape [B, *[yshape]], the conditional data,
-        depending on whether we are dealing with a conditional or unconditional
-        model
+        Loss function with support for multi-space losses and smart mask handling.
         """
+        
+        # Store original pixel space data
+        x_pixel = x.clone()
+        mask_pixel = mask.clone() if mask is not None else None
+        
+        # Encode to latent space
         if self.encode_y:
-            x, y = self.encode(x, y)
+            x_latent, y = self.encode(x, y)
         else:
-            x = self.encode(x, y)
-        broadcasted_sigma = broadcast_from_below(sigma, x)  # [nbatch, *1]
-        noise = broadcasted_sigma*torch.randn_like(x)  # [nbatch, *shapex]
-        x_noised = x + noise  # [nbatch, *shapex]
-        denoiser, cond_noise = self.get_denoiser(x_noised, sigma, y)  # [nbatch, *shapex]
-        weight = self.config.noisesampler.loss_weighting(
-                    broadcasted_sigma
-                )  # [nbatch, *1]
+            x_latent = self.encode(x, y)
+        
+        # Add noise and get denoiser output
+        broadcasted_sigma = broadcast_from_below(sigma, x_latent)
+        noise = broadcasted_sigma * torch.randn_like(x_latent)
+        x_noised = x_latent + noise
+        denoiser_latent, cond_noise = self.get_denoiser(x_noised, sigma, y)
+        
+        # Compute loss weighting
+        weight = self.config.noisesampler.loss_weighting(broadcasted_sigma)
         bias = torch.zeros_like(weight)
         if self.config.has_dynamic_loss_weight:
-            modifier = self.dynamic_loss_weight(cond_noise)  # [nbatch]
-            modifier = broadcast_from_below(modifier, x)  # [nbatch, *1]
-            weight = weight/torch.exp(modifier)
+            modifier = self.dynamic_loss_weight(cond_noise)
+            modifier = broadcast_from_below(modifier, x_latent)
+            weight = weight / torch.exp(modifier)
             bias = bias + modifier
 
-        # Compute the loss
-        if self.config.loss_metric == "smoothed_indicator":
-            loss = self.loss_metric.forward(denoiser, x, mask)
-            loss = (weight * loss + bias).mean()
-            return loss
-
-        loss = self.loss_metric(denoiser, x)  # [nbatch]
-        if mask is not None:
-            # Apply the mask if it is provided
-            # We assume that the mask is 1 where the data is absent
-            mask = mask.expand_as(loss)
-            adjusted_loss = loss * (1 - mask)
-            loss = (weight * adjusted_loss + bias).mean()
+        # Check if using multi-space loss system
+        if hasattr(self, 'multi_space_loss') and self.multi_space_loss is not None:
+            # Multi-space loss computation
+            loss_results = self.multi_space_loss.compute_loss(
+                denoiser_latent=denoiser_latent,
+                target_latent=x_latent,
+                target_pixel=x_pixel,
+                mask_latent=mask,
+                mask_pixel=mask_pixel
+            )
+            
+            total_loss = loss_results["total"]
+            
+            # Check if total_loss is scalar (mask already handled) or tensor (needs mask handling)
+            if total_loss.dim() == 0:
+                # Scalar loss - mask already handled internally
+                final_loss = weight.mean() * total_loss + bias.mean()
+            else:
+                # Tensor loss - apply mask externally
+                if mask is not None:
+                    mask_expanded = mask.expand_as(total_loss)
+                    adjusted_loss = total_loss * (1 - mask_expanded)
+                    final_loss = (weight * adjusted_loss + bias).mean()
+                else:
+                    final_loss = (weight * total_loss + bias).mean()
+            
+            return final_loss
+        
         else:
-            # Compute mean loss as usual if no mask is provided
-            loss = (weight * loss + bias).mean()
-
-        return loss
+            # Single loss computation (backward compatible)
+            # Check if the loss function accepts mask parameter
+            loss = self._compute_single_loss(denoiser_latent, x_latent, mask)
+            
+            # Check if loss is scalar (mask handled internally) or tensor (needs external mask)
+            if loss.dim() == 0:
+                # Scalar loss - mask already handled internally (e.g., smoothed_indicator)
+                final_loss = weight.mean() * loss + bias.mean()
+            else:
+                # Tensor loss - apply mask externally (e.g., MSE, Huber)
+                if mask is not None:
+                    mask_expanded = mask.expand_as(loss)
+                    adjusted_loss = loss * (1 - mask_expanded)
+                    final_loss = (weight * adjusted_loss + bias).mean()
+                else:
+                    final_loss = (weight * loss + bias).mean()
+            
+            return final_loss        
+    
+    def _compute_single_loss(self, pred: torch.Tensor, target: torch.Tensor, 
+                               mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Simpler version - just try with mask first, fallback without mask.
+        """
+        try:
+            # Try calling with mask parameter first
+            return self.loss_metric(pred, target, mask)
+        except TypeError:
+            # If that fails, call without mask parameter
+            return self.loss_metric(pred, target)
 
     def get_denoiser(
             self,

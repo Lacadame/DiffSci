@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from typing import Tuple, Union, Optional, List
+from typing import Tuple, Union, Optional, List, Dict, Any
 
 class GaussianWeightedMSELoss(nn.Module):
     """
@@ -336,3 +336,183 @@ class MultiThresholdSmoothIndicatorLoss(torch.nn.Module):
         
         return result
 
+class MultiSpaceLoss:
+    """
+    Handles multiple losses that can be applied in different spaces (latent/pixel).
+    Automatically detects if losses handle masks internally or need external mask handling.
+    
+    Configuration format:
+    {
+        "losses": [
+            {
+                "name": "mse_latent",
+                "type": "mse", 
+                "space": "latent",
+                "weight": 1.0,
+                "use_mask": False
+            },
+            {
+                "name": "smoothed_indicator_pixel",
+                "type": "smoothed_indicator",  # Handles mask internally
+                "space": "pixel", 
+                "weight": 0.5,
+                "use_mask": True,
+                "params": {
+                    "thresholds": [0.5, 0.7, 1.0],
+                    "fp_penalty": 1.5
+                }
+            }
+        ]
+    }
+    """
+    
+    def __init__(self, loss_config: Dict[str, Any], autoencoder=None):
+        """
+        Args:
+            loss_config: Dictionary containing loss configuration
+            autoencoder: Autoencoder for latent<->pixel conversion
+        """
+        self.autoencoder = autoencoder
+        self.losses = []
+        
+        for loss_spec in loss_config["losses"]:
+            loss_instance = self._create_loss_instance(loss_spec)
+            self.losses.append({
+                "name": loss_spec["name"],
+                "loss_fn": loss_instance,
+                "space": loss_spec["space"],
+                "weight": loss_spec.get("weight", 1.0),
+                "use_mask": loss_spec.get("use_mask", True),
+                "handles_mask_internally": self._check_if_handles_mask_internally(loss_spec["type"])
+            })
+    
+    def _check_if_handles_mask_internally(self, loss_type: str) -> bool:
+        """
+        Check if a loss type handles masks internally and returns scalar loss.
+        
+        Returns:
+            True if loss handles mask internally (returns scalar)
+            False if loss needs external mask handling (returns tensor)
+        """
+        internal_mask_losses = {
+            "smoothed_indicator",
+            "multi_threshold_focal", 
+            "multi_threshold_combined"
+            # Add other custom losses that handle masks internally
+        }
+        
+        return loss_type in internal_mask_losses
+    
+    def _create_loss_instance(self, loss_spec: Dict[str, Any]):
+        """Create a loss function instance from specification"""
+        loss_type = loss_spec["type"]
+        params = loss_spec.get("params", {})
+        
+        if loss_type == "mse":
+            return torch.nn.MSELoss(reduction="none")
+        elif loss_type == "huber":
+            delta = params.get("delta", 1.0)
+            return torch.nn.HuberLoss(reduction="none", delta=delta)
+        elif loss_type == "smoothed_indicator":
+            from your_loss_module import MultiThresholdSmoothIndicatorLoss
+            return MultiThresholdSmoothIndicatorLoss(**params)
+        elif loss_type == "multi_threshold_focal":
+            from your_loss_module import MultiThresholdFocalIndicatorLoss
+            return MultiThresholdFocalIndicatorLoss(**params)
+        elif loss_type == "multi_threshold_combined":
+            from your_loss_module import MultiThresholdCombinedLoss
+            return MultiThresholdCombinedLoss(**params)
+        else:
+            raise ValueError(f"Unknown loss type: {loss_type}")
+    
+    def compute_loss(self, 
+                    denoiser_latent: torch.Tensor,
+                    target_latent: torch.Tensor, 
+                    target_pixel: Optional[torch.Tensor] = None,
+                    mask_latent: Optional[torch.Tensor] = None,
+                    mask_pixel: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+        """
+        Compute all configured losses with smart mask handling.
+        
+        Args:
+            denoiser_latent: Denoiser output in latent space
+            target_latent: Target in latent space  
+            target_pixel: Target in pixel space (optional, computed if needed)
+            mask_latent: Mask in latent space (can be None)
+            mask_pixel: Mask in pixel space (can be None)
+            
+        Returns:
+            Dictionary with individual and total losses
+        """
+        
+        # Decode to pixel space if any loss needs it
+        denoiser_pixel = None
+        if any(loss["space"] == "pixel" for loss in self.losses):
+            if self.autoencoder is None:
+                raise ValueError("Autoencoder required for pixel space losses")
+            denoiser_pixel = self.autoencoder.decode(denoiser_latent)
+            
+            if target_pixel is None:
+                target_pixel = self.autoencoder.decode(target_latent)
+        
+        loss_values = {}
+        total_loss = 0.0
+        tensor_losses = []  # For losses that return tensors (need external mask handling)
+        scalar_losses = []  # For losses that return scalars (handle masks internally)
+        
+        for loss_config in self.losses:
+            name = loss_config["name"]
+            loss_fn = loss_config["loss_fn"]
+            space = loss_config["space"]
+            weight = loss_config["weight"]
+            use_mask = loss_config["use_mask"]
+            handles_mask_internally = loss_config["handles_mask_internally"]
+            
+            # Select appropriate tensors based on space
+            if space == "latent":
+                pred = denoiser_latent
+                target = target_latent
+                mask = mask_latent if use_mask else None
+            elif space == "pixel":
+                pred = denoiser_pixel
+                target = target_pixel
+                mask = mask_pixel if use_mask else None
+            else:
+                raise ValueError(f"Unknown space: {space}")
+            
+            # Compute loss based on whether it handles masks internally
+            if handles_mask_internally:
+                # Loss handles mask internally (e.g., smoothed_indicator)
+                try:
+                    loss_value = loss_fn(pred, target, mask)
+                except TypeError:
+                    # Fallback if mask parameter not supported
+                    loss_value = loss_fn(pred, target)
+                
+                # Should be scalar
+                individual_loss = loss_value
+                scalar_losses.append((weight, individual_loss))
+                
+            else:
+                # Loss needs external mask handling (e.g., MSE)
+                loss_value = loss_fn(pred, target)  # Don't pass mask
+                
+                # Apply mask externally if needed
+                if mask is not None and use_mask:
+                    mask_expanded = mask.expand_as(loss_value)
+                    masked_loss = loss_value * (1 - mask_expanded)
+                    # Reduce to scalar
+                    individual_loss = masked_loss.sum() / (1 - mask_expanded).sum().clamp(min=1)
+                else:
+                    individual_loss = loss_value.mean()
+                
+                tensor_losses.append((weight, individual_loss))
+            
+            loss_values[name] = individual_loss
+        
+        # Combine all losses
+        for weight, loss_val in scalar_losses + tensor_losses:
+            total_loss += weight * loss_val
+        
+        loss_values["total"] = total_loss
+        return loss_values
