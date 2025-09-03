@@ -25,8 +25,8 @@ from .integrators import (Integrator,
                           HeunIntegrator,
                           EulerMaruyamaIntegrator,
                           KarrasIntegrator)
-from .edmbatchnorm import (EDMBatchNorm)
 from .callbacks import (ScheduleFreeCallback,
-                        EDMBatchNormCallback,
-                        NanToZeroGradCallback)
-
+                        NanToZeroGradCallback,
+                        EMACallback)
+from .flowfield import (SIModule,
+                        SIModuleConfig)

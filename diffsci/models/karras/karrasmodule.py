@@ -426,7 +426,7 @@ class KarrasModule(lightning.LightningModule):
                 samples.append(result["samples"])
                 filters.append(result["filter"])
                 num_positive += result['filter'].sum().item()
-            hit_rate = num_positive/nsamples
+            hit_rate = num_positive / nsamples
             catdim = 1 if record_history else 0
             samples = torch.cat(samples, dim=catdim)
             filters = torch.cat(filters, dim=catdim)
@@ -885,7 +885,7 @@ class KarrasModule(lightning.LightningModule):
             self.edm_batch_norm = None
         else:
             sigma_data = self.config.extra_args.get("sigma_data", 0.5)
-            self.edm_batch_norm = edmbatchnorm.EDMBatchNorm(sigma=sigma_data)
+            self.edm_batch_norm = edmbatchnorm.DimensionAgnosticBatchNorm(sigma=sigma_data)
 
     def start_dynamic_loss_weight(self):
         if self.config.has_dynamic_loss_weight:
@@ -918,7 +918,7 @@ class DynamicLossWeight(torch.nn.Module):
         # x : [batch]
         # returns : [batch]
         x = x.unsqueeze(1)  # [batch, 1]
-        h = x*self.fourier_weights + self.fourier_bias  # [batch, nhidden]
+        h = x * self.fourier_weights + self.fourier_bias  # [batch, nhidden]
         h = torch.cos(h)  # [batch, nhidden]
         h = self.linear(h)  # [batch, 1]
         h = h.squeeze(1)  # [batch]
