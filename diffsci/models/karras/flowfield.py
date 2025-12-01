@@ -558,6 +558,7 @@ class SIModule(lightning.LightningModule):
         mask_falloff: int = 0,  # Soft mask gradient width (0 = hard mask)
         resample_steps: int = 0,  # Number of resample iterations (RePaint-style)
         jump_length: int = 1,  # Steps to jump back when resampling
+        mask_start_t: float = 1.0,  # When to start applying mask (1.0 = always, 0.5 = halfway)
     ) -> Float[Tensor, "batch *shape"]:  # noqa F821, typing
         # mask: 1 for where data is present, 0 for where data is absent
         warnings.warn("We are assuming we are in latent space for inpainting")
@@ -604,27 +605,37 @@ class SIModule(lightning.LightningModule):
                             integrate_on_sigma=integrate_on_sigma,
                             noise_injection=True
                         )
-                        sigma = broadcast_from_below(self.config.sigma_fn(t_next), x_orig)
-                        alpha = broadcast_from_below(self.config.alpha_fn(t_next), x_orig)
 
-                        x_patch = alpha * x_orig + sigma * torch.randn_like(x_orig)
-                        x = (1 - soft_mask) * x + soft_mask * x_patch
+                        # Only apply mask when t_next <= mask_start_t
+                        # (t goes from 1 to 0, so we apply when closer to 0)
+                        if time_schedule[i + 1].item() <= mask_start_t:
+                            sigma = broadcast_from_below(
+                                self.config.sigma_fn(t_next), x_orig
+                            )
+                            alpha = broadcast_from_below(
+                                self.config.alpha_fn(t_next), x_orig
+                            )
 
-                        # Jump back if not last resample iteration and not at final timestep
-                        if r < resample_steps and i + jump_length < len(time_schedule) - 1:
-                            # Jump back by adding noise
-                            t_jump = time_schedule[i]  # Jump back to current timestep
-                            sigma_jump = broadcast_from_below(
-                                self.config.sigma_fn(t_jump), x
-                            )
-                            alpha_jump = broadcast_from_below(
-                                self.config.alpha_fn(t_jump), x
-                            )
-                            # Re-noise the sample
-                            x = alpha_jump * x + sigma_jump * torch.randn_like(x)
-                            # Also update the patch for the jumped state
-                            x_patch_jump = alpha_jump * x_orig + sigma_jump * torch.randn_like(x_orig)
-                            x = (1 - soft_mask) * x + soft_mask * x_patch_jump
+                            x_patch = alpha * x_orig + sigma * torch.randn_like(x_orig)
+                            x = (1 - soft_mask) * x + soft_mask * x_patch
+
+                            # Jump back if not last resample iteration
+                            if r < resample_steps and i + jump_length < len(time_schedule) - 1:
+                                # Jump back by adding noise
+                                t_jump = time_schedule[i]  # Jump back to current timestep
+                                sigma_jump = broadcast_from_below(
+                                    self.config.sigma_fn(t_jump), x
+                                )
+                                alpha_jump = broadcast_from_below(
+                                    self.config.alpha_fn(t_jump), x
+                                )
+                                # Re-noise the sample
+                                x = alpha_jump * x + sigma_jump * torch.randn_like(x)
+                                # Also update the patch for the jumped state
+                                x_patch_jump = (
+                                    alpha_jump * x_orig + sigma_jump * torch.randn_like(x_orig)
+                                )
+                                x = (1 - soft_mask) * x + soft_mask * x_patch_jump
 
                 x = self.initial_norm.unnorm(x)
                 return x

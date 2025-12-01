@@ -920,13 +920,29 @@ class CircularConv2d(torch.nn.Module):
                  in_channels,
                  out_channels,
                  kernel_size,
+                 circular_dims: list[int] | None = None,
                  *args, **kwargs):
+        """
+        2D convolution with circular (periodic) padding.
+
+        Args:
+            in_channels: Number of input channels
+            out_channels: Number of output channels
+            kernel_size: Size of the convolutional kernel (must be odd)
+            circular_dims: List of spatial dimension indices to use circular padding.
+                          For [B, C, H, W]: [0] = H, [1] = W
+                          [0, 1] or None = both circular (default)
+                          Empty list = all zero padding
+        """
         super().__init__()
         assert (kernel_size % 2 == 1)
         self.kernel_size = kernel_size
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.padding = kernel_size // 2
+        if circular_dims is None:
+            circular_dims = [0, 1]
+        self.circular_dims = set(circular_dims)
 
         kwargs['padding'] = 0
         self.conv = torch.nn.Conv2d(in_channels,
@@ -934,12 +950,25 @@ class CircularConv2d(torch.nn.Module):
                                     kernel_size,
                                     *args,
                                     **kwargs)
-        self.pad = torch.nn.CircularPad2d(self.padding)
 
     def forward(self, x):
-        x = self.pad(x)
-        x = self.conv(x)
-        return x
+        p = self.padding
+        # F.pad format for 2D: (W_left, W_right, H_top, H_bottom)
+        # Pad each dimension separately to control mode per dimension
+
+        # Pad W (dim 1 in spatial, index -1)
+        if 1 in self.circular_dims:
+            x = torch.nn.functional.pad(x, (p, p, 0, 0), mode='circular')
+        else:
+            x = torch.nn.functional.pad(x, (p, p, 0, 0), mode='constant', value=0)
+
+        # Pad H (dim 0 in spatial, index -2)
+        if 0 in self.circular_dims:
+            x = torch.nn.functional.pad(x, (0, 0, p, p), mode='circular')
+        else:
+            x = torch.nn.functional.pad(x, (0, 0, p, p), mode='constant', value=0)
+
+        return self.conv(x)
 
 
 class CircularConv3d(torch.nn.Module):
@@ -947,21 +976,59 @@ class CircularConv3d(torch.nn.Module):
                  in_channels,
                  out_channels,
                  kernel_size,
+                 circular_dims: list[int] | None = None,
                  *args, **kwargs):
+        """
+        3D convolution with circular (periodic) padding.
+
+        Args:
+            in_channels: Number of input channels
+            out_channels: Number of output channels
+            kernel_size: Size of the convolutional kernel (must be odd)
+            circular_dims: List of spatial dimension indices to use circular padding.
+                          For [B, C, D, H, W]: [0] = D, [1] = H, [2] = W
+                          [0, 1] = D and H circular, W zero-padded
+                          [0, 1, 2] or None = all circular (default)
+                          Empty list = all zero padding
+        """
         super().__init__()
         assert (kernel_size % 2 == 1)
         self.kernel_size = kernel_size
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.padding = kernel_size // 2
+        if circular_dims is None:
+            circular_dims = [0, 1, 2]
+        self.circular_dims = set(circular_dims)
+
+        kwargs['padding'] = 0
         self.conv = torch.nn.Conv3d(in_channels,
                                     out_channels,
                                     kernel_size,
                                     *args, **kwargs)
-        self.pad = torch.nn.CircularPad3d(self.padding)
 
     def forward(self, x):
-        x = self.pad(x)
+        p = self.padding
+        # F.pad format for 3D: (W_left, W_right, H_top, H_bottom, D_front, D_back)
+
+        # Pad W (dim 2 in spatial, index -1)
+        if 2 in self.circular_dims:
+            x = torch.nn.functional.pad(x, (p, p, 0, 0, 0, 0), mode='circular')
+        else:
+            x = torch.nn.functional.pad(x, (p, p, 0, 0, 0, 0), mode='constant', value=0)
+
+        # Pad H (dim 1 in spatial, index -2)
+        if 1 in self.circular_dims:
+            x = torch.nn.functional.pad(x, (0, 0, p, p, 0, 0), mode='circular')
+        else:
+            x = torch.nn.functional.pad(x, (0, 0, p, p, 0, 0), mode='constant', value=0)
+
+        # Pad D (dim 0 in spatial, index -3)
+        if 0 in self.circular_dims:
+            x = torch.nn.functional.pad(x, (0, 0, 0, 0, p, p), mode='circular')
+        else:
+            x = torch.nn.functional.pad(x, (0, 0, 0, 0, p, p), mode='constant', value=0)
+
         return self.conv(x)
 
 

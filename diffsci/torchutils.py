@@ -107,9 +107,14 @@ def load_submodule(model, checkpoint_path, model_name="model"):
 def periodic_getitem(tensor, *indices):
     """Extract periodic slice from tensor with dimension-by-dimension wrapping.
 
+    Supports slices larger than the dimension size by tiling the tensor.
+    For example, with a size-3 tensor [0, 1, 2] and slice(-2, 7), returns
+    [1, 2, 0, 1, 2, 0, 1, 2, 0] (9 elements from index -2 to 7).
+
     Usage:
         periodic_getitem(a, slice(7, 2), slice(None), slice(3, 1))
         periodic_getitem(a, slice(7, 2))  # for 1D
+        periodic_getitem(a, slice(-5, 37))  # slice larger than tensor size
     """
     if not indices:
         return tensor
@@ -126,27 +131,66 @@ def periodic_getitem(tensor, *indices):
             stop = idx.stop if idx.stop is not None else size
             step = idx.step if idx.step is not None else 1
 
-            if abs(start - stop) > size:
-                raise ValueError(f"Slice {idx} is too large for dimension {dim} with size {size}")
-            # Normalize negatives
-            start = start % size if start < 0 else start
-            stop = stop % size if stop < 0 else stop
-
-            # Normalize greater than size
-            start = start % size if start > size else start
-            stop = stop % size if stop > size else stop
-
-            if step == 1 and stop < start:
-                # Wrap around
-                tail = result.narrow(dim, start, size - start)
-                head = result.narrow(dim, 0, stop)
-                result = torch.cat([tail, head], dim=dim)
-            elif step == 1:
-                # Normal slice
-                result = result.narrow(dim, start, max(0, stop - start))
-            else:
-                # With step
+            if step != 1:
                 raise NotImplementedError("Only step=1 supported in periodic_getitem")
+
+            # Number of elements we need
+            n_elements = stop - start
+
+            if n_elements <= 0:
+                # Empty slice
+                result = result.narrow(dim, 0, 0)
+            elif n_elements <= size:
+                # Slice fits within one period - use original logic
+                # Normalize start to [0, size)
+                start_norm = start % size
+
+                if start_norm + n_elements <= size:
+                    # Contiguous slice within bounds
+                    result = result.narrow(dim, start_norm, n_elements)
+                else:
+                    # Wrap around within one period
+                    tail_len = size - start_norm
+                    head_len = n_elements - tail_len
+                    tail = result.narrow(dim, start_norm, tail_len)
+                    head = result.narrow(dim, 0, head_len)
+                    result = torch.cat([tail, head], dim=dim)
+            else:
+                # Slice spans multiple periods - need to tile
+                # Normalize start to [0, size)
+                start_norm = start % size
+
+                # Calculate how many full copies we need plus partial
+                # First, get the offset into the first period
+                first_partial_len = (size - start_norm) % size
+                if first_partial_len == 0 and n_elements > 0:
+                    first_partial_len = size
+
+                remaining_after_first = n_elements - first_partial_len
+                n_full_copies = remaining_after_first // size
+                last_partial_len = remaining_after_first % size
+
+                parts = []
+
+                # First partial (from start_norm to end of period, or less)
+                if first_partial_len > 0:
+                    if start_norm + first_partial_len <= size:
+                        parts.append(result.narrow(dim, start_norm, first_partial_len))
+                    else:
+                        # This shouldn't happen given our logic, but just in case
+                        tail = result.narrow(dim, start_norm, size - start_norm)
+                        head = result.narrow(dim, 0, first_partial_len - (size - start_norm))
+                        parts.append(torch.cat([tail, head], dim=dim))
+
+                # Full copies
+                for _ in range(n_full_copies):
+                    parts.append(result)
+
+                # Last partial (from beginning of period)
+                if last_partial_len > 0:
+                    parts.append(result.narrow(dim, 0, last_partial_len))
+
+                result = torch.cat(parts, dim=dim)
         else:
             raise TypeError(f"Unsupported index type: {type(idx)}")
 
@@ -180,8 +224,11 @@ def periodic_setitem(tensor, value, *indices):
         stop = idx.stop if idx.stop is not None else size
         step = idx.step if idx.step is not None else 1
 
+        # Note: For setitem, we don't support slices larger than size
+        # because it's ambiguous which period to write to
         if abs(start - stop) > size:
-            raise ValueError(f"Slice {idx} is too large for dimension {dim} with size {size}")
+            raise ValueError(f"Slice {idx} is too large for dimension {dim} with size {size}. "
+                             "periodic_setitem does not support multi-period writes.")
 
         if step != 1:
             raise ValueError("Only step=1 supported in simple version")
