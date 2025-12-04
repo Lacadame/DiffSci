@@ -99,6 +99,11 @@ class PUNetG(torch.nn.Module):
         self.attn_resnet_block, self.attn_block = \
             self.make_attn_bottom_blocks()
         self.cond_dropout = torch.nn.Dropout(config.cond_dropout)
+        if config.cond_drop is not None and config.cond_drop > 0:
+            self.cond_drop = commonlayers.ConditionDrop(
+                p=config.cond_drop, hidden_dim=config.model_channels, null_is_learnable=config.cond_drop_learnable)
+        else:
+            self.cond_drop = None
 
     def export_description(self) -> dict[Any]:
         has_conditional_embedding = self.conditional_embedding is not None
@@ -208,7 +213,7 @@ class PUNetG(torch.nn.Module):
             padding='same',
             bias=self.config.bias)
         return self.convin, self.convout
-
+    
     def choose_conv_cls(self):
         if self.config.dimension == 1:
             raise NotImplementedError("1D convolution not implemented yet")
@@ -400,7 +405,10 @@ class PUNetG(torch.nn.Module):
             if ye.ndim > te.ndim:
                 new_te_shape = list(te.shape) + [1] * (ye.ndim - te.ndim)
                 te = te.reshape(new_te_shape)
+            if self.cond_drop is not None:
+                ye = self.cond_drop(ye)
             te = te + self.cond_dropout(ye)  # [B, C]
+
         x, intermediate_outputs = self.encode(x, te)
         x = self.bottom_forward(x, te)
         x = self.decode(x, te, intermediate_outputs)

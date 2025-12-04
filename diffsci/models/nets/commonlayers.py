@@ -1095,3 +1095,33 @@ class CornerPool3d(torch.nn.Module):
 
     def extra_repr(self):
         return f'kernel_size={self.kernel_size}, stride={self.stride}, padding={self.padding}'
+
+
+class ConditionDrop(torch.nn.Module):
+    def __init__(self, p: float, hidden_dim: int, null_is_learnable: bool = True):
+        """
+        Args:
+            p (float): Probability of dropping the condition (0 to 1).
+            hidden_dim (int): Dimension of the embedding.
+            null_is_learnable (bool): If True, learns a 'null' embedding.
+                                      If False, uses zeros.
+        """
+        super().__init__()
+        self.p = p
+        if null_is_learnable:
+            self.null_embedding = torch.nn.Parameter(torch.randn(1, hidden_dim))
+        else:
+            self.register_buffer('null_embedding', torch.zeros(1, hidden_dim))
+
+    def forward(self, x):
+        """
+        x: (Batch_Size, Hidden_Dim) or (Batch_Size, Sequence_Length, Hidden_Dim)
+        """
+        if not self.training or self.p == 0.0:
+            return x
+
+        batch_size = x.shape[0]
+        mask_shape = (batch_size, ) + (1,) * (x.ndim - 1)
+        mask = torch.bernoulli(torch.full(mask_shape, 1 - self.p, device=x.device))
+
+        return torch.where(mask == 1, x, self.null_embedding)

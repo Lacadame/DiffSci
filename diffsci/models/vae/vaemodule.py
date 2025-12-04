@@ -404,7 +404,8 @@ class VAEModule(lightning.LightningModule):
                  config: VAEModuleConfig,
                  discriminator: torch.nn.Module | None = None,
                  conditional: bool = False,
-                 verbose: bool = False):
+                 verbose: bool = False,
+                 encoder_outputs_tensor: bool=False):
         super().__init__()
         self.encdec = encdec
         assert hasattr(self.encdec, "encoder") and hasattr(self.encdec, "decoder"), \
@@ -425,7 +426,7 @@ class VAEModule(lightning.LightningModule):
 
         self.set_optimizer_and_scheduler()
         self.verbose = verbose
-
+        self.encoder_outputs_tensor = encoder_outputs_tensor
         if self.config.has_initial_norm:
             num_channels = self.config.num_channels if self.config.num_channels is not None else 1
             self.initial_norm = batchnorm.DimensionAgnosticBatchNorm(
@@ -468,7 +469,10 @@ class VAEModule(lightning.LightningModule):
             zsample = zdistrib.sample()
         else:
             zsample = zdistrib.mode()
-        return {'zdistrib': zdistrib, 'zsample': zsample}
+        if self.encoder_outputs_tensor:
+            return zsample
+        else:
+            return {'zdistrib': zdistrib, 'zsample': zsample}
 
     def decode(self, zsample: Float[Tensor, "batch zdim *shape"],  # noqa: F821, F722
                y: Float[Tensor, "batch *yshape"] | None = None,  # noqa: F821, F722

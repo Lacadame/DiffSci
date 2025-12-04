@@ -38,7 +38,11 @@ from typing import List, Tuple, Optional, Union
 from dataclasses import dataclass
 
 import torch
-from diffsci.torchutils import periodic_getitem, periodic_setitem  # setitem unused here (writes don't wrap)
+from diffsci.torchutils import (
+    periodic_getitem,
+    periodic_setitem,
+    periodic_getitem_extended,
+)  # setitem unused here (writes don't wrap)
 
 
 # ------------------------------- tiny helpers ------------------------------ #
@@ -279,7 +283,7 @@ class _CPUStageBuffer:
         sz = slice(z0, z1, None)  # D axis (fourth)
 
         # WRAPPED FETCH on spatial dims (channels=first dim)
-        sub = periodic_getitem(flat, slice(None), sy, sx, sz)
+        sub = periodic_getitem_extended(flat, slice(None), sy, sx, sz)
 
         # Back to [B, C, h, w, d]
         sub = sub.reshape(B, C, sub.shape[1], sub.shape[2], sub.shape[3])
@@ -596,7 +600,8 @@ def _compute_tile_crop_coords(
     """
 
     def wrap_delta(start: int, target: int, size: int, periodic: bool) -> int:
-        return ((target - start) % size) if periodic else (target - start)
+        # return ((target - start) % size) if periodic else (target - start)
+        return (target - start)
 
     # ---- D (last axis) ----
     leftD_lat  = wrap_delta(read_win.rsD_lat, sub_tile.z0, D_lat, perD)
@@ -777,7 +782,7 @@ def chunk_decode_strategy_b_3d(  # noqa: C901 (complex by design; heavily commen
                                     sz = slice(read_win.rsD_lat, read_win.reD_lat, None)
 
                                     # periodic_getitem on [B*zC, H, W, D]
-                                    x_in_flat = periodic_getitem(flat, slice(None), sy, sx, sz)
+                                    x_in_flat = periodic_getitem_extended(flat, slice(None), sy, sx, sz)
 
                                     # Back to [B, zC, h, w, d] on the target device/dtype
                                     x_in = x_in_flat.reshape(B0, C0, x_in_flat.shape[1], x_in_flat.shape[2], x_in_flat.shape[3])
@@ -793,7 +798,7 @@ def chunk_decode_strategy_b_3d(  # noqa: C901 (complex by design; heavily commen
                                     sx = slice(read_win.rsW_src, read_win.reW_src, None)
                                     sz = slice(read_win.rsD_src, read_win.reD_src, None)
 
-                                    x_in_flat = periodic_getitem(flat, slice(None), sy, sx, sz)
+                                    x_in_flat = periodic_getitem_extended(flat, slice(None), sy, sx, sz)
 
                                     # Back to [B, C, h, w, d]
                                     x_in = x_in_flat.reshape(Bp, Cp, x_in_flat.shape[1], x_in_flat.shape[2], x_in_flat.shape[3])
@@ -817,6 +822,18 @@ def chunk_decode_strategy_b_3d(  # noqa: C901 (complex by design; heavily commen
                                     if cfg.debug:
                                         print(f"[S{s}] Alloc dest buffer shape={(B_, C_out, Hs_out, Ws_out, Ds_out)}")
 
+                                if cfg.debug:
+                                    print(f"sub_tile: {sub_tile}")
+                                    print(f"read_win: {read_win}")
+                                    print(f"src_scale: {src_scale}")
+                                    print(f"dest_scale: {dest_scale}")
+                                    print(f"up_factor: {up_factor}")
+                                    print(f"D_lat: {cfg.D}")
+                                    print(f"H_lat: {cfg.H}")
+                                    print(f"W_lat: {cfg.W}")
+                                    print(f"perD: {cfg.periodicD}")
+                                    print(f"perH: {cfg.periodicH}")
+                                    print(f"perW: {cfg.periodicW}")
                                 # --- CROP VALID CENTER FROM y_tile & WRITE TO CPU DEST ---
                                 crop = _compute_tile_crop_coords(
                                     sub_tile, read_win, src_scale, dest_scale, up_factor,

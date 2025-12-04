@@ -25,6 +25,8 @@ class PUNetGConfig(object):
                  transition_kernel_size: int = 3,
                  dropout: float = 0.0,
                  cond_dropout: float = 0.0,
+                 cond_drop: float = 0.0,
+                 cond_drop_learnable: bool = True,
                  first_resblock_norm: str = 'GroupLN',
                  second_resblock_norm: str = 'GroupRMS',
                  affine_norm: bool = True,
@@ -54,6 +56,8 @@ class PUNetGConfig(object):
         self.transition_kernel_size = transition_kernel_size
         self.dropout = dropout
         self.cond_dropout = cond_dropout
+        self.cond_drop = cond_drop
+        self.cond_drop_learnable = cond_drop_learnable
         self.first_resblock_norm = first_resblock_norm
         self.second_resblock_norm = second_resblock_norm
         self.affine_norm = affine_norm
@@ -90,6 +94,8 @@ class PUNetGConfig(object):
             transition_kernel_size=self.transition_kernel_size,
             dropout=self.dropout,
             cond_dropout=self.cond_dropout,
+            cond_drop=self.cond_drop,
+            cond_drop_learnable=self.cond_drop_learnable,
             first_resblock_norm=self.first_resblock_norm,
             second_resblock_norm=self.second_resblock_norm,
             affine_norm=self.affine_norm,
