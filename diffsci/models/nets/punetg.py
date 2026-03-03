@@ -420,6 +420,215 @@ class PUNetG(torch.nn.Module):
             conditional_embedding: torch.nn.Module | None = None):
         self.conditional_embedding = conditional_embedding
 
+    def calculate_receptive_field(self) -> dict:
+        """
+        Calculate the theoretical receptive field (RF) of the PUNetG model.
+
+        The receptive field is the region of input space that influences a single
+        output pixel. For UNet architectures, we must trace through all conv operations
+        accounting for the cumulative stride from downsampling.
+
+        RF Calculation Formula:
+            rf += (kernel_size - 1) * current_stride
+
+        This formula accounts for the fact that after downsampling, each "pixel" in
+        the feature map corresponds to a larger region in the input space.
+
+        Architecture components analyzed:
+        - convin: Single conv with in_out_kernel_size
+        - ResnetBlockC: TWO convolutions with kernel_size (norm -> act -> conv1 -> conv2)
+        - DownSampler: MaxPool(scale_factor) followed by conv(transition_kernel_size)
+        - UpSampler: Upsample (nearest neighbor interpolation) + conv(transition_kernel_size)
+        - Attention blocks: GLOBAL attention (flatten all spatial dims) -> infinite RF
+        - convout: Single conv with in_out_kernel_size
+
+        Returns
+        -------
+        dict
+            Contains:
+            - 'rf': The receptive field size (int or float('inf'))
+            - 'has_attention': Whether the model uses attention (makes RF infinite)
+            - 'trace': List of strings describing RF accumulation at each step
+            - 'config_summary': Dict of relevant config parameters
+        """
+        config = self.config
+        trace = []
+
+        # =====================================================================
+        # STEP 1: Check for attention blocks
+        # =====================================================================
+        # The attention blocks (TwoDimensionalAttention / ThreeDimensionalAttention)
+        # flatten ALL spatial dimensions and perform global self-attention.
+        # This means every output pixel depends on every input pixel -> RF = infinity.
+        #
+        # Looking at attn_block_fn: it creates (number_resnet_attn_block - 1) attention layers.
+        # So if number_resnet_attn_block >= 2, there are attention layers.
+        num_attention_layers = config.number_resnet_attn_block - 1
+
+        if num_attention_layers > 0:
+            trace.append(f"ATTENTION DETECTED: {num_attention_layers} global attention layer(s)")
+            trace.append("Global attention flattens all spatial dims -> RF is INFINITE")
+            return {
+                'rf': float('inf'),
+                'has_attention': True,
+                'num_attention_layers': num_attention_layers,
+                'trace': trace,
+                'feasible_chunking': False,
+                'config_summary': {
+                    'number_resnet_attn_block': config.number_resnet_attn_block,
+                    'kernel_size': config.kernel_size,
+                    'in_out_kernel_size': config.in_out_kernel_size,
+                    'channel_expansion': config.channel_expansion,
+                }
+            }
+
+        # =====================================================================
+        # STEP 2: Calculate RF through all convolutional layers (no attention case)
+        # =====================================================================
+        # We track:
+        #   - rf: current receptive field size in input pixels
+        #   - stride: cumulative stride (how many input pixels per current feature pixel)
+
+        rf = 1  # Start with single pixel
+        stride = 1  # Initially no downsampling
+        trace.append(f"Initial: RF = {rf}, stride = {stride}")
+
+        # Helper function for conv RF contribution
+        def add_conv_rf(rf, kernel_size, stride, name):
+            """A convolution with kernel k adds (k-1) * stride to the RF."""
+            rf_add = (kernel_size - 1) * stride
+            rf_new = rf + rf_add
+            trace.append(f"{name} (k={kernel_size}): RF = {rf} + {rf_add} = {rf_new}")
+            return rf_new
+
+        # Helper function for ResnetBlockC RF contribution
+        def add_resblock_rf(rf, kernel_size, stride, name):
+            """ResnetBlockC has TWO convolutions with the same kernel size."""
+            # First conv
+            rf_add1 = (kernel_size - 1) * stride
+            rf = rf + rf_add1
+            # Second conv
+            rf_add2 = (kernel_size - 1) * stride
+            rf = rf + rf_add2
+            trace.append(f"{name} (2x k={kernel_size}): RF += 2*{(kernel_size-1)*stride} = {rf}")
+            return rf
+
+        # =====================================================================
+        # convin: Initial convolution
+        # =====================================================================
+        # Note: ConvolutionalFourierProjection (if in_embedding=True) also uses
+        # spatial dimensions but doesn't add RF (it's effectively 1x1 with Fourier features).
+        # Regular convin is a conv with in_out_kernel_size.
+        if not config.in_embedding:
+            rf = add_conv_rf(rf, config.in_out_kernel_size, stride, "convin")
+        else:
+            trace.append("convin (Fourier embedding): no RF change (1x1 equivalent)")
+
+        # =====================================================================
+        # Downward path: For each level, apply ResnetBlockC blocks then DownSampler
+        # =====================================================================
+        # extended_channel_expansion = [1] + channel_expansion, e.g., [1, 2, 4]
+        # We iterate over pairs: (1->2), (2->4), i.e., len(channel_expansion) levels
+        num_down_levels = len(config.channel_expansion)
+        trace.append(f"\n--- DOWNWARD PATH ({num_down_levels} levels) ---")
+
+        for level_idx in range(num_down_levels):
+            trace.append(f"\nLevel {level_idx}:")
+
+            # ResnetBlockC blocks at this level
+            for block_idx in range(config.number_resnet_downward_block):
+                rf = add_resblock_rf(rf, config.kernel_size, stride,
+                                     f"  down[{level_idx}].resnet[{block_idx}]")
+
+            # DownSampler: MaxPool(scale_factor) then conv(transition_kernel_size)
+            # MaxPool with kernel k: RF += (k-1) * stride, then stride *= k
+            pool_size = config.transition_scale_factor
+            rf_add_pool = (pool_size - 1) * stride
+            rf = rf + rf_add_pool
+            stride = stride * pool_size
+            trace.append(f"  down[{level_idx}].maxpool (k={pool_size}): "
+                         f"RF += {rf_add_pool} = {rf}, stride = {stride}")
+
+            # Conv after pooling
+            rf = add_conv_rf(rf, config.transition_kernel_size, stride,
+                             f"  down[{level_idx}].downsample_conv")
+
+        # =====================================================================
+        # Bottom: before_block + attn_resnet_block (no attention here) + after_block
+        # =====================================================================
+        trace.append(f"\n--- BOTTOM (at stride {stride}) ---")
+
+        # before_block: number_resnet_before_attn_block ResnetBlockC
+        for block_idx in range(config.number_resnet_before_attn_block):
+            rf = add_resblock_rf(rf, config.kernel_size, stride,
+                                 f"  before_block[{block_idx}]")
+
+        # attn_resnet_block: number_resnet_attn_block ResnetBlockC (but 0 attention layers)
+        # Note: Even with 0 attention layers, the resnet blocks still exist
+        for block_idx in range(config.number_resnet_attn_block):
+            rf = add_resblock_rf(rf, config.kernel_size, stride,
+                                 f"  attn_resnet_block[{block_idx}]")
+
+        # after_block: number_resnet_after_attn_block ResnetBlockC
+        for block_idx in range(config.number_resnet_after_attn_block):
+            rf = add_resblock_rf(rf, config.kernel_size, stride,
+                                 f"  after_block[{block_idx}]")
+
+        # =====================================================================
+        # Upward path: For each level, apply UpSampler then ResnetBlockC blocks
+        # =====================================================================
+        trace.append(f"\n--- UPWARD PATH ({num_down_levels} levels) ---")
+
+        for level_idx in range(num_down_levels - 1, -1, -1):
+            trace.append(f"\nLevel {level_idx}:")
+
+            # UpSampler: Upsample (nearest neighbor) then conv(transition_kernel_size)
+            # Upsample (nearest neighbor interpolation) does NOT change RF in input space
+            # It just spreads values to more pixels. The stride decreases.
+            stride = stride // config.transition_scale_factor
+            trace.append(f"  up[{level_idx}].upsample: no RF change, stride = {stride}")
+
+            # Conv after upsampling
+            rf = add_conv_rf(rf, config.transition_kernel_size, stride,
+                             f"  up[{level_idx}].upsample_conv")
+
+            # Skip connection (element-wise add) does not change RF
+            trace.append(f"  up[{level_idx}].skip_add: no RF change")
+
+            # ResnetBlockC blocks at this level
+            for block_idx in range(config.number_resnet_upward_block):
+                rf = add_resblock_rf(rf, config.kernel_size, stride,
+                                     f"  up[{level_idx}].resnet[{block_idx}]")
+
+        # =====================================================================
+        # convout: Final convolution
+        # =====================================================================
+        trace.append(f"\n--- OUTPUT ---")
+        rf = add_conv_rf(rf, config.in_out_kernel_size, stride, "convout")
+
+        trace.append(f"\nFINAL RF = {rf} pixels")
+
+        return {
+            'rf': rf,
+            'has_attention': False,
+            'num_attention_layers': 0,
+            'trace': trace,
+            'feasible_chunking': True,
+            'downsampling_factor': config.transition_scale_factor ** num_down_levels,
+            'config_summary': {
+                'number_resnet_attn_block': config.number_resnet_attn_block,
+                'number_resnet_downward_block': config.number_resnet_downward_block,
+                'number_resnet_upward_block': config.number_resnet_upward_block,
+                'number_resnet_before_attn_block': config.number_resnet_before_attn_block,
+                'number_resnet_after_attn_block': config.number_resnet_after_attn_block,
+                'kernel_size': config.kernel_size,
+                'in_out_kernel_size': config.in_out_kernel_size,
+                'transition_kernel_size': config.transition_kernel_size,
+                'transition_scale_factor': config.transition_scale_factor,
+                'channel_expansion': config.channel_expansion,
+            }
+        }
+
 
 class PUNetGCond(PUNetG):
 

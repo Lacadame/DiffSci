@@ -124,3 +124,6 @@ repopack-output.txt
 
 # Claude
 claude/*
+
+# external repos
+external_repos/
