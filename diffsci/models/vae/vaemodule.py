@@ -53,8 +53,8 @@ class VAEModuleConfig:
                  kl_weight: float = 1e-3,
                  nll_weight: float = 1.0,
                  logvar_init: float = 0.0,
-                 trainable_logvar: bool = True,
-                 reduce_mean: bool = False,
+                 trainable_logvar: bool = False,
+                 reduce_mean: bool = True,
                  teacher_encdec: torch.nn.Module | None = None,
                  teaching_mode: TeachingMode = "both",
                  distillation_alpha: float = 0.5,
@@ -566,8 +566,13 @@ class VAEModule(lightning.LightningModule):
 
     def log_images_to_tensorboard(self, x, x_recon, batch_idx, max_images=4):
         # Only log up to max_images
-        x = x[:max_images]
-        x_recon = x_recon[:max_images]
+        # Take first slice if 5D tensor, otherwise keep as is
+        if x.dim() == 5:
+            x = x[:max_images, ..., 0]
+            x_recon = x_recon[:max_images, ..., 0]
+        else:
+            x = x[:max_images]
+            x_recon = x_recon[:max_images]
         # Assume images are [B, C, H, W] and in range [0, 1] or [0, 255]
         # If not, normalize as needed
         grid = torch.cat([x, x_recon], dim=0)  # Stack originals and reconstructions
@@ -760,6 +765,30 @@ class DiagonalGaussianDistribution(torch.nn.Module):
                 torch.pow(self.mean - other.mean, 2) / other.var
                 + self.var / other.var - 1.0 - self.logvar + other.logvar,
                 dim=dims)
+        return result
+
+    def kl_thresholded(
+        self,
+        other: "DiagonalGaussianDistribution | None" = None,
+        reduce_mean: bool = False,
+        threshold: float = 0.5
+    ):
+        dims = list(range(2, len(self.mean.shape)))
+        if not reduce_mean:
+            raise NotImplementedError("kl_thresholded only supports reduce_mean=True")
+        reduce_operator = torch.mean if reduce_mean else torch.sum
+        if other is None:
+            result = 0.5 * reduce_operator((torch.pow(self.mean, 2)
+                                            + self.var - 1.0 - self.logvar),
+                                           dim=dims)
+        else:  # Other is the unit Gaussian
+            result = 0.5 * reduce_operator(
+                torch.pow(self.mean - other.mean, 2) / other.var
+                + self.var / other.var - 1.0 - self.logvar + other.logvar,
+                dim=dims)
+        
+        threshold = threshold * torch.ones((result.shape[0], 1)).to(result)
+        result = torch.maximum(result, threshold)
         return result
 
     def nll(self, sample: Float[Tensor, "batch zdim *shape"], reduce_mean: bool = False):  # noqa: F821, F722

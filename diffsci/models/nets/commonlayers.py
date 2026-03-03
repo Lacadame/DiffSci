@@ -190,6 +190,42 @@ class GaussianFourierProjection(torch.nn.Module):
         return x_proj
 
 
+class GeneralizedFourierProjection(torch.nn.Module):
+    def __init__(self, embed_dim, sample_distribution, scale=30.0):
+        """
+        Parameters
+        ----------
+        embed_dim : int
+            The dimension of the embedding
+        sample_distribution : torch.distributions.Distribution
+            The distribution to sample from
+        scale : float
+            The scale of the distribution
+        """
+        super().__init__()
+        self.register_buffer(
+            'W',
+            sample_distribution.sample([embed_dim // 2])*scale
+        )
+
+    def forward(self, x):
+        """
+        Parameters
+        ----------
+        x : torch.Tensor of shape (...)
+
+        Returns
+        -------
+        x_proj : torch.Tensor of shape (..., embed_dim)
+        """
+        x = x[..., None]  # (..., 1)
+        x_proj = 2*math.pi*x*self.W  # (..., embed_dim//2)
+        x_proj = torch.cat(
+            [torch.sin(x_proj), torch.cos(x_proj)], dim=-1
+        )  # (..., embed_dim)
+        return x_proj
+
+
 class ConvolutionalFourierProjection(torch.nn.Module):
     def __init__(self,
                  input_dim,
@@ -235,6 +271,44 @@ class GaussianFourierProjectionVector(torch.nn.Module):
         self.input_dim = input_dim
         self.embed_dim = embed_dim
         W = torch.randn((input_dim, embed_dim//2))*scale
+        self.register_buffer('W',
+                             W)
+
+    def forward(self, x):
+        """
+        Parameters
+        ----------
+        x : torch.Tensor of shape (..., input_dim)
+
+        Returns
+        -------
+        x_proj : torch.Tensor of shape (..., embed_dim)
+        """
+        x_proj = 2*math.pi*x@self.W  # (..., embed_dim//2)
+        x_proj = torch.cat(
+            [torch.sin(x_proj), torch.cos(x_proj)], dim=-1
+        )  # (..., embed_dim)
+        return x_proj
+
+
+class GeneralizedFourierProjectionVector(torch.nn.Module):
+    def __init__(self, input_dim, embed_dim, sample_distribution, scale=30.0):
+        """
+        Parameters
+        ----------
+        input_dim : int
+            The dimension of the input
+        embed_dim : int
+            The dimension of the embedding
+        sample_distribution : torch.distributions.Distribution
+            The distribution to sample from
+        scale : float
+            The scale of the distribution
+        """
+        super().__init__()
+        self.input_dim = input_dim
+        self.embed_dim = embed_dim
+        W = sample_distribution.sample([input_dim, embed_dim//2])*scale
         self.register_buffer('W',
                              W)
 
@@ -834,7 +908,7 @@ class CircularConv3d(torch.nn.Module):
         self.kernel_size = kernel_size
         self.in_channels = in_channels
         self.out_channels = out_channels
-        self.padding = kernel_size//2
+        self.padding = kernel_size // 2
         self.conv = torch.nn.Conv3d(in_channels,
                                     out_channels,
                                     kernel_size,

@@ -85,3 +85,20 @@ def dict_squeeze(d, dim):
 def dict_to(d, device):
     f = lambda x: x.to(device)  # noqa: E731
     return dict_map(f, d)
+
+
+def load_submodule(model, checkpoint_path, model_name="model"):
+    checkpoint = torch.load(checkpoint_path)
+    state_dict = checkpoint['state_dict']
+    
+    # Create new state dict with modified keys
+    new_state_dict = {}
+    prefix = model_name + "."
+    for key, value in state_dict.items():
+        if key.startswith(prefix):
+            new_key = key[len(prefix):]  # Remove prefix
+            new_state_dict[new_key] = value
+            
+    # Load the modified state dict
+    model.load_state_dict(new_state_dict)
+    return model

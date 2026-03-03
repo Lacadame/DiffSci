@@ -381,14 +381,17 @@ class PUNetG(torch.nn.Module):
         x = self.resnet_block_forward(x, te, self.after_block)
         return x
 
-    def forward(self, x, t, y=None):
+    def forward(self, x, t=None, y=None):
         if not self.config.bias:
             xe_shape = list(x.shape)
             xe_shape[1] = 1
             xe = torch.ones(xe_shape).to(x)
             x = torch.cat([x, xe], dim=1)
         x = self.convin(x)
-        te = self.time_projection(t)  # [B, C]
+        if t is not None:
+            te = self.time_projection(t)  # [B, C]
+        else:
+            te = torch.zeros(x.shape[0], self.config.model_channels).to(x)
         if y is not None:
             if self.conditional_embedding is None:
                 ye = y

@@ -11,9 +11,11 @@ import einops
 
 from .patched_conv import get_patch_conv
 
+# THIS SCRIPT IS A WORK IN PROGRESS
+
 
 class VAENetConfig:
-    """Configuration class for dimensionally-flexible VAE architecture."""
+    """Configuration class for dimensionally-flexible time dependent VAE architecture."""
 
     def __init__(
         self,
@@ -37,7 +39,7 @@ class VAENetConfig:
         with_time_emb: bool = False,       # Use time embeddings
         double_z: bool = True,             # Double the output in encoder for mean and logvar
         num_groups: int = 32,              # Number of groups for GroupNorm
-        patch_size: int = None,            # Patch size for patch-based convolutions
+        patch_size: int | None = None,     # Patch size for patch-based convolutions
         memory_efficient_variant: bool = False,  # Use memory efficient decoding
         use_flash_attention: bool = True,  # Use torch.nn.functional.scaled_dot_product_attention
         minimal_rf_mode: bool = False,  # Enable minimal receptive field architecture
