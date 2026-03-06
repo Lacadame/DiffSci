@@ -7,6 +7,7 @@ from .toy_datasets import (AnalyticalDataset,
                            ZeroMeanGaussianDataset,
                            MixtureOfPointsDataset,
                            MixtureOfGaussiansDataset,
+                           GeneralMixtureOfGaussiansDataset,
                            DiagonalGaussianDataset,
                            Single1DUniformDataset,
                            MixtureOf1DUniformsDataset)
