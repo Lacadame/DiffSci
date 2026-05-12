@@ -131,3 +131,5 @@ temp.txt
 # Env
 .env
 .env.local
+
+.claude/
