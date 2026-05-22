@@ -624,6 +624,8 @@ class VAEModule(lightning.LightningModule):
     def validation_step(self, batch, batch_idx):
 
         # TODO: Remove this
+        # TODO: Check with Danilo if this is correct
+        """
         if batch_idx == 0:  # Only log for the first batch to avoid flooding
             x, y = self.select_batch(batch)
             x = self.preencode(x, y)
@@ -632,7 +634,7 @@ class VAEModule(lightning.LightningModule):
             # x_recon = self.postdecode(x_recon, y)
             # Log images
             self.log_images_to_tensorboard(x, x_recon, batch_idx)
-
+        """
         if not self.is_adversarial:
             # Standard VAE validation
             loss, logs = self.loss_fn(batch)

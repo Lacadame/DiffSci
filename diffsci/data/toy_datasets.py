@@ -1,4 +1,6 @@
+import json
 import math
+import time
 
 import torch
 from torch import Tensor
@@ -411,6 +413,25 @@ class MixtureOfGaussiansDataset(AnalyticalDataset):
         self.means = means
         self.weights = weights/torch.sum(weights)  # We guarantee normalization
         self.scale = scale
+        # region agent log
+        with open("/home/ubuntu/repos/DiffSci/.cursor/debug-db569c.log", "a", encoding="utf-8") as _f:
+            _f.write(json.dumps({
+                "sessionId": "db569c",
+                "runId": "pre-fix",
+                "hypothesisId": "H1",
+                "location": "diffsci/data/toy_datasets.py:MixtureOfGaussiansDataset.__init__",
+                "message": "MoG init argument summary",
+                "data": {
+                    "num_samples": int(num_samples),
+                    "means_shape": list(means.shape),
+                    "weights_shape": list(weights.shape),
+                    "scale_type": str(type(scale)),
+                    "scale_dim": int(scale.dim()) if isinstance(scale, Tensor) else None,
+                    "scale_shape": list(scale.shape) if isinstance(scale, Tensor) else None
+                },
+                "timestamp": int(time.time() * 1000)
+            }) + "\n")
+        # endregion
         super().__init__(num_samples)
 
     def sample(self
@@ -419,9 +440,43 @@ class MixtureOfGaussiansDataset(AnalyticalDataset):
                                     self.num_samples,
                                     replacement=True)
         means = self.means[indexes, ...]
+        # region agent log
+        with open("/home/ubuntu/repos/DiffSci/.cursor/debug-db569c.log", "a", encoding="utf-8") as _f:
+            _f.write(json.dumps({
+                "sessionId": "db569c",
+                "runId": "pre-fix",
+                "hypothesisId": "H2",
+                "location": "diffsci/data/toy_datasets.py:MixtureOfGaussiansDataset.sample",
+                "message": "MoG sample before scale branch",
+                "data": {
+                    "indexes_shape": list(indexes.shape),
+                    "means_shape": list(means.shape),
+                    "scale_is_float": isinstance(self.scale, float),
+                    "scale_type": str(type(self.scale)),
+                    "scale_dim": int(self.scale.dim()) if isinstance(self.scale, Tensor) else None,
+                    "scale_shape": list(self.scale.shape) if isinstance(self.scale, Tensor) else None
+                },
+                "timestamp": int(time.time() * 1000)
+            }) + "\n")
+        # endregion
         if isinstance(self.scale, float):
             scale = self.scale
         else:
+            # region agent log
+            with open("/home/ubuntu/repos/DiffSci/.cursor/debug-db569c.log", "a", encoding="utf-8") as _f:
+                _f.write(json.dumps({
+                    "sessionId": "db569c",
+                    "runId": "pre-fix",
+                    "hypothesisId": "H3",
+                    "location": "diffsci/data/toy_datasets.py:MixtureOfGaussiansDataset.sample",
+                    "message": "MoG sample taking tensor scale branch",
+                    "data": {
+                        "about_to_index_scale": True,
+                        "scale_dim": int(self.scale.dim()) if isinstance(self.scale, Tensor) else None
+                    },
+                    "timestamp": int(time.time() * 1000)
+                }) + "\n")
+            # endregion
             scale = self.scale[indexes].unsqueeze(-1)
         noise = scale * torch.randn_like(means)
         return means + noise
@@ -820,7 +875,8 @@ class Single1DUniformDataset(AnalyticalDataset):
 
     def prob(self,
              x: Tensor,  # noqa: F821
-             sigma: Tensor  # noqa: F821
+             sigma: Tensor,  # noqa: F821
+             scaling: float | Tensor = 1.0  # noqa: F821
              ) -> Tensor:  # noqa: F821
         """
         Calculate the probability of x.
@@ -910,7 +966,8 @@ class MixtureOf1DUniformsDataset(AnalyticalDataset):
 
     def prob(self,
              x: Tensor,  # noqa: F821
-             sigma: Tensor  # noqa: F821
+             sigma: Tensor,  # noqa: F821
+             scaling: float | Tensor = 1.0  # noqa: F821
              ) -> Tensor:  # noqa: F821
         """
         Calculate the probability of x for the mixture distribution.
@@ -926,13 +983,20 @@ class MixtureOf1DUniformsDataset(AnalyticalDataset):
         """
         normal_dist = Normal(0, 1)
         sigma = broadcast_from_below(sigma, x)
-        total_prob = torch.zeros(x.shape)
+        if isinstance(scaling, float) or isinstance(scaling, int):
+            scaling_tensor = torch.full_like(sigma, float(scaling))
+        else:
+            scaling_tensor = broadcast_from_below(scaling, x)
+        sigma_scaled = scaling_tensor * sigma
+        total_prob = torch.zeros_like(x)
 
         # Sum the probabilities from each uniform component in the mixture
         for i, (a, b) in enumerate(self.intervals):
-            phi_a = normal_dist.cdf((x - a) / sigma)
-            phi_b = normal_dist.cdf((x - b) / sigma)
-            prob_i = 1 / (b - a) * (phi_a - phi_b)
+            a_scaled = scaling_tensor * a
+            b_scaled = scaling_tensor * b
+            phi_a = normal_dist.cdf((x - a_scaled) / sigma_scaled)
+            phi_b = normal_dist.cdf((x - b_scaled) / sigma_scaled)
+            prob_i = 1 / (b_scaled - a_scaled) * (phi_a - phi_b)
             total_prob += self.weights[i] * prob_i
 
         total_prob = total_prob.squeeze(-1)
@@ -941,6 +1005,7 @@ class MixtureOf1DUniformsDataset(AnalyticalDataset):
     def gradlogprob(self,
                     x: Tensor,  # noqa: F821
                     sigma: Tensor,  # noqa: F821
+                    scaling: float | Tensor = 1.0,  # noqa: F821
                     epsilon: float = 1e-15
                     ) -> Tensor:  # noqa: F821
         """
@@ -957,20 +1022,27 @@ class MixtureOf1DUniformsDataset(AnalyticalDataset):
         """
         normal_dist = Normal(0, 1)
         sigma = broadcast_from_below(sigma, x)
-        total_p = torch.zeros(x.shape)
-        total_gradp = torch.zeros(x.shape)
+        if isinstance(scaling, float) or isinstance(scaling, int):
+            scaling_tensor = torch.full_like(sigma, float(scaling))
+        else:
+            scaling_tensor = broadcast_from_below(scaling, x)
+        sigma_scaled = scaling_tensor * sigma
+        total_p = torch.zeros_like(x)
+        total_gradp = torch.zeros_like(x)
 
         # Sum the gradients from each uniform component in the mixture
         for i, (a, b) in enumerate(self.intervals):
-            pdf_a = normal_dist.log_prob((x - a) / sigma).exp()
-            pdf_b = normal_dist.log_prob((x - b) / sigma).exp()
-            phi_a = normal_dist.cdf((x - a) / sigma)
-            phi_b = normal_dist.cdf((x - b) / sigma)
+            a_scaled = scaling_tensor * a
+            b_scaled = scaling_tensor * b
+            pdf_a = normal_dist.log_prob((x - a_scaled) / sigma_scaled).exp()
+            pdf_b = normal_dist.log_prob((x - b_scaled) / sigma_scaled).exp()
+            phi_a = normal_dist.cdf((x - a_scaled) / sigma_scaled)
+            phi_b = normal_dist.cdf((x - b_scaled) / sigma_scaled)
 
-            gradp = (pdf_a - pdf_b) / (b-a)
-            p = (phi_a - phi_b) / (b-a)
+            gradp = (pdf_a - pdf_b) / (b_scaled - a_scaled)
+            p = (phi_a - phi_b) / (b_scaled - a_scaled)
             total_gradp += self.weights[i] * gradp
             total_p += self.weights[i] * p
 
-        grad_logp = total_gradp / (total_p * sigma + epsilon)
+        grad_logp = total_gradp / (total_p * sigma_scaled + epsilon)
         return grad_logp

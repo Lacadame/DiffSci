@@ -1,4 +1,4 @@
-from copy import deepcopy
+from typing import Callable, Any
 
 import torch
 import lightning
@@ -11,20 +11,20 @@ from diffsci.torchutils import (broadcast_from_below,
                                 dict_unsqueeze,
                                 dict_to)
 from diffsci.utils import get_minibatch_sizes
-from diffsci.custom_losses import GaussianWeightedMSELoss, MultiSpaceLoss, MultiThresholdSmoothIndicatorLoss
+from diffsci.custom_losses import EnsembleAwareMSELoss, EnsembleAwareHuberLoss, EnsembleAwareGaussianWeightedMSELoss, EnsembleAwareSmoothedIndicatorLoss, MultiSpaceLoss, EnsembleAwareCRPSLoss
 from . import preconditioners
 from . import noisesamplers
 from . import schedulers
 from . import edmbatchnorm
 from . import integrators
-
+from .autoregressivesample import LatentSpaceAutoregressive
 
 Scaler = Callable[[Float[Tensor, '*shape']],  # noqa: F821
                   Float[Tensor, '*shape']]  # noqa: F821
 Sampler = Callable[[list[int]], Float[Tensor, '...']]
 
 
-class KarrasModuleConfig(object):
+class EnsembleKarrasModuleConfig(object):
     def __init__(self,
                  preconditioner: preconditioners.KarrasPreconditioner,
                  noisesampler: noisesamplers.NoiseSampler,
@@ -34,6 +34,9 @@ class KarrasModuleConfig(object):
                  has_edm_batch_norm: bool = False,
                  dynamic_loss_weight: int | None = None,
                  extra_args: None | dict[str, Any] = None,
+                 ensemble_size_train: int = 1,
+                 ensemble_size_val: int = 1,
+                 ensemble_size_test: int = 1,
                  # Legacy parameters for backward compatibility
                  spatial_shape: tuple = None,
                  focus_radius: float = None):
@@ -50,6 +53,9 @@ class KarrasModuleConfig(object):
             has_edm_batch_norm: Whether to use EDM batch norm
             dynamic_loss_weight: Dynamic loss weight configuration
             extra_args: Extra arguments for reconstruction
+            ensemble_size_train: Ensemble size for training
+            ensemble_size_val: Ensemble size for validation
+            ensemble_size_test: Ensemble size for testing
             spatial_shape: Legacy parameter for weighted_gaussian loss
             focus_radius: Legacy parameter for weighted_gaussian loss
         """
@@ -62,7 +68,9 @@ class KarrasModuleConfig(object):
         self.dynamic_loss_weight = dynamic_loss_weight
         self.spatial_shape = spatial_shape
         self.focus_radius = focus_radius
-        
+        self.ensemble_size_train = ensemble_size_train
+        self.ensemble_size_val = ensemble_size_val
+        self.ensemble_size_test = ensemble_size_test
         if extra_args is None:
             self.extra_args = dict()
         else:
@@ -294,33 +302,12 @@ class KarrasModuleConfig(object):
 
 
 
-class KarrasModule(lightning.LightningModule):
+class EnsembleKarrasModule(lightning.LightningModule):
     """Updated KarrasModule with multi-space loss support"""
-
-    @classmethod
-    def load_from_checkpoint(
-            cls,
-            checkpoint_path: str,
-            map_location: Any = None,
-            hparams_file: Any = None,
-            strict: Any = None,
-            **kwargs: Any):
-        cloned_kwargs = dict(kwargs)
-        if "model" in cloned_kwargs and cloned_kwargs["model"] is not None:
-            cloned_kwargs["model"] = deepcopy(cloned_kwargs["model"])
-        if "config" in cloned_kwargs and cloned_kwargs["config"] is not None:
-            cloned_kwargs["config"] = deepcopy(cloned_kwargs["config"])
-        return super().load_from_checkpoint(
-            checkpoint_path=checkpoint_path,
-            map_location=map_location,
-            hparams_file=hparams_file,
-            strict=strict,
-            **cloned_kwargs,
-        )
     
     def __init__(self,
                  model: torch.nn.Module,
-                 config: 'KarrasModuleConfig',
+                 config: 'EnsembleKarrasModuleConfig',
                  conditional: bool = False,
                  masked: bool = False,
                  autoencoder: None | torch.nn.Module = None,
@@ -397,32 +384,51 @@ class KarrasModule(lightning.LightningModule):
                                 )  # Neutral scheduler
         self.lr_scheduler_interval = scheduler_interval
 
+
     def set_loss_metric(self):
         """
         Set the loss function(s) to be used.
+        
+        Now supports ensemble inputs [B, E, C, H, W]!
         
         Supports three formats:
         1. String: "mse" (backward compatible)
         2. Dict with single loss: {"smoothed_indicator": {...}} (single loss)
         3. Dict with multiple losses: {"losses": [...]} (multi-space losses)
         """
-        
         loss_config = self.config.loss_metric
-        
-        if isinstance(loss_config, str):
-            # Original string format - create single loss
-            self._set_single_loss_string(loss_config)
+
+        if self.config.ensemble_size_train == 1 and self.config.ensemble_size_train ==1 and self.config.ensemble_size_test == 1:
+            if isinstance(loss_config, str):
+                 # Original string format - create single loss
+                 self._set_single_loss_string(loss_config)
             
-        elif isinstance(loss_config, dict):
-            if "losses" in loss_config:
-                # Multi-space loss configuration
-                self.multi_space_loss = MultiSpaceLoss(loss_config, self.autoencoder)
-                self.loss_metric = None  # Will use multi_space_loss instead
+            elif isinstance(loss_config, dict):
+                if "losses" in loss_config:
+                    self.multi_space_loss = MultiSpaceLoss(loss_config, self.autoencoder)
+                    self.loss_metric = None
+                else:
+                    # Single loss dict format
+                    self._set_single_loss_dict(loss_config)
             else:
-                # Single loss dict format
-                self._set_single_loss_dict(loss_config)
+                raise ValueError(f"loss_metric must be string or dict, got {type(loss_config)}")
+
         else:
-            raise ValueError(f"loss_metric must be string or dict, got {type(loss_config)}")
+ 
+            if isinstance(loss_config, str):
+                # Original string format - create single loss
+                self._set_enseble_single_loss_string(loss_config)
+                
+            elif isinstance(loss_config, dict):
+                if "losses" in loss_config:
+                    # Multi-space loss configuration (skip for now)
+                    self.multi_space_loss = MultiSpaceLoss(loss_config, self.autoencoder)
+                    self.loss_metric = None
+                else:
+                    # Single loss dict format
+                    self._set_enseble_single_loss_dict(loss_config)
+            else:
+                raise ValueError(f"loss_metric must be string or dict, got {type(loss_config)}")
 
     def _set_single_loss_string(self, loss_name: str):
         """Handle single loss string format (backward compatible)"""
@@ -437,6 +443,8 @@ class KarrasModule(lightning.LightningModule):
                                                        focus_radius=self.config.focus_radius)
         elif loss_name == "smoothed_indicator":
             self.loss_metric = MultiThresholdSmoothIndicatorLoss()
+        elif loss_name == "CRPS":
+            self.loss_metric = EnsembleAwareCRPSLoss()
         else:
             raise ValueError(f"loss_type {loss_name} not recognized")
 
@@ -456,14 +464,254 @@ class KarrasModule(lightning.LightningModule):
         else:
             raise ValueError(f"loss_name '{loss_name}' not recognized")
 
+    def _set_enseble_single_loss_string(self, loss_name: str):
+        """Handle single loss string format (backward compatible + ensemble-aware)"""
+        if loss_name == "mse":
+            self.loss_metric = EnsembleAwareMSELoss(reduction="none")
+        elif loss_name == "huber":
+            self.loss_metric = EnsembleAwareHuberLoss(reduction="none")
+        elif loss_name == "weighted_gaussian":
+            if self.config.spatial_shape is None or self.config.focus_radius is None:
+                raise AttributeError("config must have shape tuple and focus radius")
+            self.loss_metric = EnsembleAwareGaussianWeightedMSELoss(
+                shape=self.config.spatial_shape,
+                focus_radius=self.config.focus_radius
+            )
+        elif loss_name == "smoothed_indicator":
+            # Wrap your original smoothed indicator with ensemble support
+            original_loss = MultiThresholdSmoothIndicatorLoss()
+            self.loss_metric = EnsembleAwareSmoothedIndicatorLoss(original_loss)
+        elif loss_name == "CRPS":
+            self.loss_metric = EnsembleAwareCRPSLoss()
+        else:
+            raise ValueError(f"loss_type {loss_name} not recognized")
+
+
+    def _set_enseble_single_loss_dict(self, loss_config: Dict[str, Any]):
+        """Handle single loss dict format (with ensemble support)"""
+        loss_name = list(loss_config.keys())[0]
+        loss_params = loss_config[loss_name]
+        
+        if loss_name == "mse":
+            self.loss_metric = EnsembleAwareMSELoss(reduction="none")
+        elif loss_name == "huber":
+            delta = loss_params.get('delta', 1.0)
+            self.loss_metric = EnsembleAwareHuberLoss(delta=delta, reduction="none")
+        elif loss_name == "weighted_gaussian":
+            shape = loss_params.get('shape') or self.config.spatial_shape
+            focus_radius = loss_params.get('focus_radius') or self.config.focus_radius
+            self.loss_metric = EnsembleAwareGaussianWeightedMSELoss(
+                shape=shape,
+                focus_radius=focus_radius
+            )
+        elif loss_name == "smoothed_indicator":
+            # Wrap your original smoothed indicator with ensemble support
+            original_loss = MultiThresholdSmoothIndicatorLoss(**loss_params)
+            self.loss_metric = EnsembleAwareSmoothedIndicatorLoss(original_loss)
+
+        elif loss_name == "CRPS":
+            self.loss_metric = EnsembleAwareCRPSLoss(*loss_params)
+        
+        else:
+            raise ValueError(f"loss_name '{loss_name}' not recognized")
+
+
     def loss_fn(self,
+            x: Float[Tensor, "batch *shape"],
+            sigma: Float[Tensor, "batch"],
+            y: None | Float[Tensor, "batch *yshape"] = None,
+            mask: None | Float[Tensor, "batch *shape"] = None,
+            n_ensemble: int = 1) -> Float[Tensor, ""]:
+        """
+        Loss function with vectorized ensemble generation.
+        
+        Args:
+            x: Input tensor [B, C, H, W]
+            sigma: Noise level/timestep [B]
+            y: Conditioning
+            mask: Optional mask
+            n_ensemble: Number of ensemble members
+        
+        The key optimization here:
+            1. Generate all ensemble noises at once: [B, E, C, H, W]
+            2. Reshape to [B*E, C, H, W] for batch processing
+            3. Call denoiser once with parallelism across B*E
+            4. Reshape back to [B, E, C, H, W] for CRPS
+        
+        Returns:
+            Scalar loss
+        """
+        if n_ensemble <= 1:
+            # old loss function for backward compatibility
+            return self.old_loss_fn(x, sigma, y, mask)
+        # Store original pixel space data   
+        device = x.device
+        sigma = sigma.to(device)
+
+        if y is not None:
+            if isinstance(y, dict):
+                y = {k: v.to(device) if isinstance(v, torch.Tensor) else v 
+                    for k, v in y.items()}
+            else:
+                y = y.to(device)
+
+
+        x_pixel = x.clone()
+        
+        mask_pixel = mask.clone().to(device) if mask is not None else None
+        
+        # Encode to latent space
+        if self.encode_y:
+            x_latent, y = self.encode(x, y)
+        else:
+            x_latent = self.encode(x, y)
+        
+        # === VECTORIZED ENSEMBLE GENERATION ===
+        # This is the KEY optimization
+        
+        B, C, H, W = x_latent.shape
+        
+        # Broadcast sigma to spatial dimensions
+        broadcasted_sigma = broadcast_from_below(sigma, x_latent)  # [B, 1, 1, 1]
+        
+        # Generate ALL ensemble noises at once
+        # Shape: [B, n_ensemble, C, H, W]
+        # Use torch.randn_like with expanded shape
+        noise_shape = (B, n_ensemble, C, H, W)
+        noise_ensemble = torch.randn(noise_shape, device=device, dtype=x_latent.dtype)
+        
+        # Scale by sigma: [B, 1, 1, 1] * [B, E, C, H, W] -> [B, E, C, H, W]
+        # Need to expand sigma for broadcasting
+
+        
+        broadcasted_sigma_expanded = broadcasted_sigma.unsqueeze(1)  # [B, 1, 1, 1, 1]
+        noise_ensemble = broadcasted_sigma_expanded * noise_ensemble  # [B, E, C, H, W]
+        
+        # Add noise to input: [B, 1, C, H, W] + [B, E, C, H, W] -> [B, E, C, H, W]
+        x_latent_expanded = x_latent.view(B, 1, C, H, W)  # [B, 1, C, H, W]
+        x_noised_ensemble = x_latent_expanded + noise_ensemble  # [B, E, C, H, W]
+        
+        # === RESHAPE TO BATCH DIMENSION FOR PARALLELISM ===
+        # Reshape [B, E, C, H, W] -> [B*E, C, H, W] for parallel processing
+        x_noised_flat = x_noised_ensemble.view(B * n_ensemble, C, H, W)
+        x_noised_flat = x_noised_flat.to(device)
+        # === EXPAND SIGMA FOR BATCH ===
+        # We need sigma to also be [B*E] for the denoiser
+        # Repeat sigma: [B] -> [B, E] -> [B*E]
+        sigma_expanded = sigma.unsqueeze(1).expand(B, n_ensemble).reshape(B * n_ensemble)
+        sigma_expanded = sigma_expanded.to(device)
+        # === EXPAND Y FOR BATCH (if needed) ===
+        # If y is [B, ...], expand to [B*E, ...]
+        y_expanded = y
+        if y is not None:
+            # y shape might be [B, ...] or dict of [B, ...]
+            if isinstance(y, dict):
+                y_expanded = {}
+                for key, val in y.items():
+                    if val is not None:
+                        # [B, ...] -> [B, E, ...] -> [B*E, ...]
+                        if key in ['dates', 'latlon_grid', 'ssh']:
+                            # TODO: Handle dates for ensemble generation and for models that uses it
+                            continue
+                        if key == 'bat':
+                            val_expanded = val.expand(
+                            B, n_ensemble, *val.shape[-2:])
+                            val_expanded = val_expanded.reshape(B * n_ensemble, *val.shape[-2:])
+                            y_expanded[key] = val_expanded.unsqueeze(1).to(device)
+
+                        else:
+                            val_expanded = val.unsqueeze(1).expand(
+                                B, n_ensemble, *val.shape[1:]
+                            ).reshape(B * n_ensemble, *val.shape[1:])
+                            y_expanded[key] = val_expanded.to(device)
+            else:
+                y_expanded = y.unsqueeze(1).expand(
+                    B, n_ensemble, *y.shape[1:]
+                ).reshape(B * n_ensemble, *y.shape[1:]).to(device)
+        
+        # === SINGLE DENOISER CALL ===
+        # All B*E samples processed in parallel!
+        denoiser_flat, cond_noise = self.get_denoiser(
+            x_noised_flat,      # [B*E, C, H, W]
+            sigma_expanded,     # [B*E]
+            y_expanded          # [B*E, ...]
+        )  # Returns [B*E, C, H, W]
+        
+        # === RESHAPE BACK TO ENSEMBLE DIMENSION ===
+        denoiser_latent = denoiser_flat.view(B, n_ensemble, C, H, W)  # [B, E, C, H, W]
+        cond_noise_reshaped = cond_noise.view(B, n_ensemble)  # [B, E]
+
+        # === AGGREGATE ENSEMBLE ===
+        # Update so that we pass the whole ensemble to the loss function
+        # For simple loss: average across ensemble
+        #denoiser_mean = denoiser_latent.mean(dim=1)  # [B, C, H, W]
+        
+        # For CRPS and advanced metrics: keep [B, E, C, H, W] format
+        # (see loss_fn_with_crps below)
+        
+        # === COMPUTE LOSS ===
+        
+        # Compute loss weighting
+        weight = self.config.noisesampler.loss_weighting(broadcasted_sigma)  # [B, 1, 1, 1]
+        bias = torch.zeros_like(weight)
+        
+        if self.config.has_dynamic_loss_weight:
+            modifier = self.dynamic_loss_weight(cond_noise.mean(dim=1))  # Average across ensemble
+            modifier = broadcast_from_below(modifier, x_latent)
+            weight = weight / torch.exp(modifier)
+            bias = bias + modifier
+        
+        # Multi-space loss
+        #TODO: Update so that we pass the whole ensemble to the loss function
+        if hasattr(self, 'multi_space_loss') and self.multi_space_loss is not None:
+            raise NotImplementedError("Multi-space loss is not implemented for ensemble generation")
+            loss_results = self.multi_space_loss.compute_loss(
+                denoiser_latent=denoiser_mean,  # [B, C, H, W]
+                target_latent=x_latent,         # [B, C, H, W]
+                target_pixel=x_pixel,
+                mask_latent=mask,
+                mask_pixel=mask_pixel
+            )
+            
+            total_loss = loss_results["total"]
+            
+            if total_loss.dim() == 0:
+                final_loss = weight.mean() * total_loss + bias.mean()
+            else:
+                if mask is not None:
+                    mask_expanded = mask.expand_as(total_loss)
+                    adjusted_loss = total_loss * (1 - mask_expanded)
+                    final_loss = (weight * adjusted_loss + bias).mean()
+                else:
+                    final_loss = (weight * total_loss + bias).mean()
+            
+            return final_loss
+        
+        else:
+            # Single loss computation
+            # DONE: Updated so that we can pass the whole ensemble to the loss function
+            loss = self._compute_single_loss(denoiser_latent, x_latent, mask)
+            
+            if loss.dim() == 0:
+                final_loss = weight.mean() * loss + bias.mean()
+            else:
+                if mask is not None:
+                    mask_expanded = mask.expand_as(loss)
+                    adjusted_loss = loss * (1 - mask_expanded)
+                    final_loss = (weight * adjusted_loss + bias).mean()
+                else:
+                    final_loss = (weight * loss + bias).mean()
+            
+            return final_loss
+
+    def old_loss_fn(self,
             x: Float[Tensor, "batch *shape"],  # noqa: F821
             sigma: Float[Tensor, "batch"],  # noqa: F821
             y: None | Float[Tensor, "batch *yshape"] = None,  # noqa: F821
             mask: None | Float[Tensor, "batch *shape"] = None  # noqa: F821
             ) -> Float[Tensor, ""]:  # noqa: F821, F722
         """
-        Loss function with support for multi-space losses and smart mask handling.
+        Loss function with support for multi-space losses smart mask handling and ensemble.
         """
         
         # Store original pixel space data
@@ -478,10 +726,12 @@ class KarrasModule(lightning.LightningModule):
         
         # Add noise and get denoiser output
         broadcasted_sigma = broadcast_from_below(sigma, x_latent)
-        noise = broadcasted_sigma * torch.randn_like(x_latent)
+        noise = broadcasted_sigma * torch.randn_like(x_latent) 
         x_noised = x_latent + noise
+
         denoiser_latent, cond_noise = self.get_denoiser(x_noised, sigma, y)
         
+
         # Compute loss weighting
         weight = self.config.noisesampler.loss_weighting(broadcasted_sigma)
         bias = torch.zeros_like(weight)
@@ -490,6 +740,7 @@ class KarrasModule(lightning.LightningModule):
             modifier = broadcast_from_below(modifier, x_latent)
             weight = weight / torch.exp(modifier)
             bias = bias + modifier
+
 
         # Check if using multi-space loss system
         if hasattr(self, 'multi_space_loss') and self.multi_space_loss is not None:
@@ -537,8 +788,8 @@ class KarrasModule(lightning.LightningModule):
                 else:
                     final_loss = (weight * loss + bias).mean()
             
-            return final_loss        
-
+            return final_loss           
+    
     def _compute_single_loss(self, pred: torch.Tensor, target: torch.Tensor, 
                                mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
@@ -748,7 +999,7 @@ class KarrasModule(lightning.LightningModule):
     def propagate_white_noise(
             self,
             x: Float[Tensor, "nsamples *shape"],  # noqa: F821
-            y: None | Float[Tensor, "*yshape"] = None,  # noqa: F821
+            y : None | Float[Tensor, "*yshape"] = None,  # noqa: F821
             guidance: float = 1.0,
             nsteps: int = 100,
             record_history: bool = False,
@@ -1026,18 +1277,20 @@ class KarrasModule(lightning.LightningModule):
 
     def training_step(self, batch, batch_idx):
         x, y, mask = self.select_batch(batch)
-        sigma = self.config.noisesampler.sample(x.shape[0]).to(x)  # [nbatch]
-        loss = self.loss_fn(x, sigma, y, mask)
+        sigma = self.config.noisesampler.sample(x.shape[0]).to(x)  # ← Different!
+        loss = self.loss_fn(x, sigma, y, mask, n_ensemble=self.config.ensemble_size_train)
         self.log("train_loss", loss, prog_bar=True, sync_dist=True)
-        return loss
 
+        return loss
+    
     def validation_step(self, batch, batch_idx):
         x, y, mask = self.select_batch(batch)
-        sigma = self.config.noisesampler.sample(x.shape[0]).to(x)  # [nbatch]
-        loss = self.loss_fn(x, sigma, y, mask)
+        sigma = self.config.noisesampler.sample(x.shape[0]).to(x)  # ← Different!
+        loss = self.loss_fn(x, sigma, y, mask, n_ensemble=self.config.ensemble_size_val)
         self.log("valid_loss", loss, prog_bar=True, sync_dist=True)
         self.log("val_loss", loss, prog_bar=True, sync_dist=True)  # For compat
         return loss
+
 
     def configure_optimizers(self):
         if self.lr_scheduler is not None:
