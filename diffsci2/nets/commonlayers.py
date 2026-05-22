@@ -1059,6 +1059,125 @@ class CircularConv3d(torch.nn.Module):
         return self.conv(x)
 
 
+class ReflectConv2d(torch.nn.Module):
+    def __init__(self,
+                 in_channels,
+                 out_channels,
+                 kernel_size,
+                 reflect_dims: list[int] | None = None,
+                 *args, **kwargs):
+        """
+        2D convolution with reflection padding.
+
+        Args:
+            in_channels: Number of input channels
+            out_channels: Number of output channels
+            kernel_size: Size of the convolutional kernel (must be odd)
+            reflect_dims: List of spatial dimension indices to use reflect padding.
+                          For [B, C, H, W]: [0] = H, [1] = W
+                          [0, 1] or None = both reflect (default)
+                          Empty list = all zero padding
+        """
+        super().__init__()
+        assert (kernel_size % 2 == 1)
+        self.kernel_size = kernel_size
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.padding = kernel_size // 2
+        if reflect_dims is None:
+            reflect_dims = [0, 1]
+        self.reflect_dims = set(reflect_dims)
+
+        kwargs['padding'] = 0
+        self.conv = torch.nn.Conv2d(in_channels,
+                                    out_channels,
+                                    kernel_size,
+                                    *args,
+                                    **kwargs)
+
+    def forward(self, x):
+        p = self.padding
+        # F.pad format for 2D: (W_left, W_right, H_top, H_bottom)
+
+        # Pad W (dim 1 in spatial, index -1)
+        if 1 in self.reflect_dims:
+            x = torch.nn.functional.pad(x, (p, p, 0, 0), mode='reflect')
+        else:
+            x = torch.nn.functional.pad(x, (p, p, 0, 0), mode='constant', value=0)
+
+        # Pad H (dim 0 in spatial, index -2)
+        if 0 in self.reflect_dims:
+            x = torch.nn.functional.pad(x, (0, 0, p, p), mode='reflect')
+        else:
+            x = torch.nn.functional.pad(x, (0, 0, p, p), mode='constant', value=0)
+
+        return self.conv(x)
+
+
+class ReflectConv3d(torch.nn.Module):
+    def __init__(self,
+                 in_channels,
+                 out_channels,
+                 kernel_size,
+                 reflect_dims: list[int] | None = None,
+                 *args, **kwargs):
+        """
+        3D convolution with reflection padding.
+
+        Args:
+            in_channels: Number of input channels
+            out_channels: Number of output channels
+            kernel_size: Size of the convolutional kernel (must be odd)
+            reflect_dims: List of spatial dimension indices to use reflect padding.
+                          For [B, C, D, H, W]: [0] = D, [1] = H, [2] = W
+                          [0, 1] = D and H reflect, W zero-padded
+                          [0, 1, 2] or None = all reflect (default)
+                          Empty list = all zero padding
+        """
+        super().__init__()
+        assert (kernel_size % 2 == 1)
+        self.kernel_size = kernel_size
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.padding = kernel_size // 2
+        if reflect_dims is None:
+            reflect_dims = [0, 1, 2]
+        self.reflect_dims = set(reflect_dims)
+
+        kwargs['padding'] = 0
+        self.conv = torch.nn.Conv3d(in_channels,
+                                    out_channels,
+                                    kernel_size,
+                                    *args, **kwargs)
+
+    def forward(self, x):
+        p = self.padding
+        # F.pad format for 3D: (W_left, W_right, H_top, H_bottom, D_front, D_back)
+        # torch.nn.functional.pad with mode='reflect' only supports padding one
+        # dimension at a time in 3D for some versions; we pad each axis separately
+        # to keep behavior identical to the circular counterpart.
+
+        # Pad W (dim 2 in spatial, index -1)
+        if 2 in self.reflect_dims:
+            x = torch.nn.functional.pad(x, (p, p, 0, 0, 0, 0), mode='reflect')
+        else:
+            x = torch.nn.functional.pad(x, (p, p, 0, 0, 0, 0), mode='constant', value=0)
+
+        # Pad H (dim 1 in spatial, index -2)
+        if 1 in self.reflect_dims:
+            x = torch.nn.functional.pad(x, (0, 0, p, p, 0, 0), mode='reflect')
+        else:
+            x = torch.nn.functional.pad(x, (0, 0, p, p, 0, 0), mode='constant', value=0)
+
+        # Pad D (dim 0 in spatial, index -3)
+        if 0 in self.reflect_dims:
+            x = torch.nn.functional.pad(x, (0, 0, 0, 0, p, p), mode='reflect')
+        else:
+            x = torch.nn.functional.pad(x, (0, 0, 0, 0, p, p), mode='constant', value=0)
+
+        return self.conv(x)
+
+
 class CornerPool1d(torch.nn.Module):
     """Subsampling that picks the first element of each pooling window."""
 

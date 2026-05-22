@@ -920,14 +920,28 @@ def prepare_decoder_for_cached_decode(
 
     This must be called once before using cached norm mode.
 
+    For PixelNorm-based decoders, this is a no-op (PixelNorm has spatial
+    RF=1, so cached norms is unnecessary).
+
     Args:
         decoder: VAE decoder module
         inplace: If True, modify decoder in place
 
     Returns:
-        Decoder with cached norm layers
+        Decoder with cached norm layers (or the unchanged decoder for
+        PixelNorm-based models)
     """
+    if not _needs_cached_norms(decoder):
+        return decoder
     return convert_to_cached_norms(decoder, inplace=inplace)
+
+
+def _needs_cached_norms(model) -> bool:
+    """Return True iff `model` uses GroupNorm (the only norm where cached-norm
+    calibration is actually necessary). PixelNorm has spatial RF=1, so cached
+    norms is a no-op — we silently skip the conversion and any per-tile
+    calibration for `norm_type='pixel'` VAEs."""
+    return getattr(getattr(model, "config", None), "norm_type", "group") == "group"
 
 
 def _has_cached_norms(model: torch.nn.Module) -> bool:
@@ -1493,10 +1507,15 @@ def chunk_decode_strategy_b(
 
     # Check if cached norms are available when requested
     if use_cached_norms and not _has_cached_norms(decoder):
-        raise RuntimeError(
-            "use_cached_norms=True but decoder has no cached norm layers. "
-            "Call prepare_decoder_for_cached_decode(decoder) first."
-        )
+        if not _needs_cached_norms(decoder):
+            # PixelNorm-based decoder: cached norms is a no-op. Silently
+            # downgrade rather than erroring on a benign request.
+            use_cached_norms = False
+        else:
+            raise RuntimeError(
+                "use_cached_norms=True but decoder has no cached norm layers. "
+                "Call prepare_decoder_for_cached_decode(decoder) first."
+            )
 
     # Create stage runners
     stage_runners = [
@@ -1841,10 +1860,15 @@ def chunk_decode_parallel(
 
     # Check cached norms
     if use_cached_norms and not _has_cached_norms(decoder):
-        raise RuntimeError(
-            "use_cached_norms=True but decoder has no cached norm layers. "
-            "Call prepare_decoder_for_cached_decode(decoder) first."
-        )
+        if not _needs_cached_norms(decoder):
+            # PixelNorm-based decoder: cached norms is a no-op. Silently
+            # downgrade rather than erroring on a benign request.
+            use_cached_norms = False
+        else:
+            raise RuntimeError(
+                "use_cached_norms=True but decoder has no cached norm layers. "
+                "Call prepare_decoder_for_cached_decode(decoder) first."
+            )
 
     # Setup configuration (use first device for config)
     cfg = setup_chunk_config(

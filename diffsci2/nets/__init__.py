@@ -19,7 +19,21 @@ from .embedder import (
 )
 
 from .vaenet import VAENet, VAENetConfig
+from .vaenet_mp import VAENetMP, VAENetMPConfig
 from . import commonlayers
+
+from .normedlayers import (
+    # CONFIG-D / CONFIG-E learned layers (forced WN + weight norm on use).
+    normalize,
+    MagnitudePreservingLinear,
+    MagnitudePreservingConv2d,
+    MagnitudePreservingConv3d,
+    # CONFIG-G fixed-function and lightweight learned layers.
+    PixelNorm,
+    Gain,
+    mp_silu,
+    mp_sum,
+)
 
 from .patched_conv import (
     patch_conv_1d,

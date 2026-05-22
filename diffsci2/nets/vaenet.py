@@ -10,6 +10,13 @@ import torch.nn.functional as F
 import einops
 
 from .patched_conv import get_patch_conv
+from .normedlayers import PixelNorm, Gain
+
+
+# Valid values for `VAENetConfig.norm_type`. 'group' is the historical
+# default (`nn.GroupNorm`); 'pixel' uses `PixelNorm` (per-pixel channel
+# RMS, spatial RF = 1).
+VALID_NORM_TYPES = ('group', 'pixel')
 
 
 class VAENetConfig:
@@ -41,8 +48,20 @@ class VAENetConfig:
         memory_efficient_variant: bool = False,  # Use memory efficient decoding
         use_flash_attention: bool = True,  # Use torch.nn.functional.scaled_dot_product_attention
         minimal_rf_mode: bool = False,  # Enable minimal receptive field architecture
+        norm_type: str = "group",          # 'group' (legacy default) or 'pixel'.
+                                           # 'pixel' uses PixelNorm — spatial RF = 1,
+                                           # enables calibration-free tiled inference.
+        output_gain_init: float | None = None,  # If set, append a learned scalar
+                                                # Gain layer after the decoder's
+                                                # `conv_out`. Init to this value
+                                                # (1.0 is the right default for VAEs;
+                                                # 0.0 for diffusion score nets).
+                                                # None (default) = no Gain layer →
+                                                # state_dict identical to legacy.
     ):
         assert dimension in [1, 2, 3], f"Dimension must be 1, 2, or 3, got {dimension}"
+        assert norm_type in VALID_NORM_TYPES, \
+            f"norm_type must be one of {VALID_NORM_TYPES}, got {norm_type!r}"
 
         self.dimension = dimension
         self.in_channels = in_channels
@@ -69,6 +88,8 @@ class VAENetConfig:
         self.memory_efficient_variant = memory_efficient_variant
         self.use_flash_attention = use_flash_attention
         self.minimal_rf_mode = minimal_rf_mode
+        self.norm_type = norm_type
+        self.output_gain_init = output_gain_init
 
     def export_description(self) -> dict:
         """Export configuration as a dictionary."""
@@ -96,12 +117,21 @@ class VAENetConfig:
             "patch_size": self.patch_size,
             "memory_efficient_variant": self.memory_efficient_variant,
             "use_flash_attention": self.use_flash_attention,
-            "minimal_rf_mode": self.minimal_rf_mode
+            "minimal_rf_mode": self.minimal_rf_mode,
+            "norm_type": self.norm_type,
+            "output_gain_init": self.output_gain_init,
         }
 
     @classmethod
     def from_description(cls, description: dict):
-        return cls(**description)
+        # Older descriptions may not contain the recently-added fields
+        # (`norm_type`, `output_gain_init`). The constructor has defaults
+        # for both that preserve the legacy behaviour, so a plain **kwargs
+        # expansion works — but unknown keys would raise. Filter to keys
+        # the constructor accepts to stay tolerant of older / newer files.
+        import inspect
+        valid = set(inspect.signature(cls.__init__).parameters.keys()) - {"self"}
+        return cls(**{k: v for k, v in description.items() if k in valid})
 
     @classmethod
     def from_config_file(cls, config_file: pathlib.Path | str):
@@ -250,12 +280,26 @@ class PatchedConv(torch.nn.Module):
 
 
 # Utility functions and blocks
-def get_norm(in_channels, num_groups=32):
-    """Normalized layer with dimension flexibility."""
-    return nn.GroupNorm(num_groups=num_groups,
-                        num_channels=in_channels,
-                        eps=1e-6,
-                        affine=True)
+def get_norm(in_channels, num_groups=32, norm_type='group'):
+    """Build a normalization layer.
+
+    - ``norm_type='group'`` (legacy default): `nn.GroupNorm` over channel
+      groups + all spatial dims. Per-output coupled to whole input —
+      spatial RF is **global**. Tiled inference needs a calibration
+      pass (`diffsci2.nets.cached_norms.gather_norm_stats_full`).
+    - ``norm_type='pixel'``: `PixelNorm` — per-pixel channel-RMS.
+      Spatial RF = 1. Compatible with truly calibration-free tiled
+      inference.
+    """
+    if norm_type == 'group':
+        return nn.GroupNorm(num_groups=num_groups,
+                            num_channels=in_channels,
+                            eps=1e-6,
+                            affine=True)
+    if norm_type == 'pixel':
+        # `num_groups` is ignored — PixelNorm has no group concept.
+        return PixelNorm(eps=1e-4)
+    raise ValueError(f"unknown norm_type: {norm_type!r}")
 
 
 def nonlinearity(x):
@@ -268,7 +312,7 @@ class ResnetBlock(nn.Module):
 
     def __init__(self, *, dimension, in_channels, out_channels=None,
                  conv_shortcut=False, dropout, temb_channels=0, num_groups=32,
-                 patch_size=None):
+                 patch_size=None, norm_type='group'):
         super().__init__()
         self.dimension = dimension
         self.in_channels = in_channels
@@ -279,14 +323,14 @@ class ResnetBlock(nn.Module):
 
         Conv = DimensionHelper.get_patch_conv_cls(dimension)
 
-        self.norm1 = get_norm(in_channels, num_groups=num_groups)
+        self.norm1 = get_norm(in_channels, num_groups=num_groups, norm_type=norm_type)
         self.conv1 = Conv(in_channels, out_channels, kernel_size=3, stride=1, padding=1,
                           patch_size=patch_size)
 
         if temb_channels > 0:
             self.temb_proj = nn.Linear(temb_channels, out_channels)
 
-        self.norm2 = get_norm(out_channels, num_groups=num_groups)
+        self.norm2 = get_norm(out_channels, num_groups=num_groups, norm_type=norm_type)
         self.dropout = nn.Dropout(dropout)
         self.conv2 = Conv(out_channels, out_channels, kernel_size=3, stride=1, padding=1,
                           patch_size=patch_size)
@@ -332,7 +376,8 @@ class MinimalResnetBlock(nn.Module):
     """
 
     def __init__(self, *, dimension, in_channels, out_channels=None,
-                 dropout, temb_channels=0, num_groups=32, patch_size=None):
+                 dropout, temb_channels=0, num_groups=32, patch_size=None,
+                 norm_type='group'):
         super().__init__()
         self.dimension = dimension
         self.in_channels = in_channels
@@ -343,7 +388,7 @@ class MinimalResnetBlock(nn.Module):
         Conv = DimensionHelper.get_patch_conv_cls(dimension)
 
         # Single convolution path
-        self.norm = get_norm(in_channels, num_groups=num_groups)
+        self.norm = get_norm(in_channels, num_groups=num_groups, norm_type=norm_type)
         self.conv = Conv(in_channels, out_channels, kernel_size=3, stride=1, padding=1,
                          patch_size=patch_size)
         self.dropout = nn.Dropout(dropout)
@@ -391,6 +436,7 @@ def make_resblock(config, dimension, in_channels, out_channels=None,
                   conv_shortcut=False, dropout=0.0, temb_channels=0,
                   num_groups=32, patch_size=None):
     """Factory function to create appropriate ResBlock based on config."""
+    norm_type = getattr(config, 'norm_type', 'group')
     if getattr(config, 'minimal_rf_mode', False):
         return MinimalResnetBlock(
             dimension=dimension,
@@ -399,7 +445,8 @@ def make_resblock(config, dimension, in_channels, out_channels=None,
             dropout=dropout,
             temb_channels=temb_channels,
             num_groups=num_groups,
-            patch_size=patch_size
+            patch_size=patch_size,
+            norm_type=norm_type,
         )
     else:
         return ResnetBlock(
@@ -410,21 +457,23 @@ def make_resblock(config, dimension, in_channels, out_channels=None,
             dropout=dropout,
             temb_channels=temb_channels,
             num_groups=num_groups,
-            patch_size=patch_size
+            patch_size=patch_size,
+            norm_type=norm_type,
         )
 
 
 class AttnBlock(nn.Module):
     """Self-attention block with dimension flexibility."""
 
-    def __init__(self, dimension, in_channels, num_groups=32, patch_size=None, use_flash_attention=True):
+    def __init__(self, dimension, in_channels, num_groups=32, patch_size=None,
+                 use_flash_attention=True, norm_type='group'):
         super().__init__()
         self.dimension = dimension
         self.in_channels = in_channels
         self.patch_size = patch_size
         self.use_flash_attention = use_flash_attention
 
-        self.norm = get_norm(in_channels, num_groups=num_groups)
+        self.norm = get_norm(in_channels, num_groups=num_groups, norm_type=norm_type)
 
         Conv = DimensionHelper.get_patch_conv_cls(dimension)
         self.q = Conv(in_channels, in_channels, kernel_size=1, stride=1, padding=0, patch_size=patch_size)
@@ -599,6 +648,7 @@ def make_attn(
     num_groups=32,
     patch_size=None,
     use_flash_attention=True,
+    norm_type='group',
 ):
     """Factory function to create an attention block of specified type."""
     assert attn_type in ["vanilla", "linear", "none"], f'attn_type {attn_type} unknown'
@@ -610,6 +660,7 @@ def make_attn(
             num_groups=num_groups,
             patch_size=patch_size,
             use_flash_attention=use_flash_attention,
+            norm_type=norm_type,
         )
     elif attn_type == "none":
         return nn.Identity()
@@ -749,6 +800,7 @@ class VAEEncoder(nn.Module):
                         num_groups=config.num_groups,
                         patch_size=config.patch_size,
                         use_flash_attention=config.use_flash_attention,
+                        norm_type=getattr(config, 'norm_type', 'group'),
                     ))
 
             down = nn.Module()
@@ -783,6 +835,7 @@ class VAEEncoder(nn.Module):
                 num_groups=config.num_groups,
                 patch_size=config.patch_size,
                 use_flash_attention=config.use_flash_attention,
+                norm_type=getattr(config, 'norm_type', 'group'),
             )
 
         self.mid.block_2 = make_resblock(
@@ -801,7 +854,10 @@ class VAEEncoder(nn.Module):
         if config.double_z:
             z_channels = 2 * z_channels
 
-        self.norm_out = get_norm(block_in, num_groups=config.num_groups)
+        self.norm_out = get_norm(
+            block_in, num_groups=config.num_groups,
+            norm_type=getattr(config, 'norm_type', 'group'),
+        )
         self.conv_out = Conv(
             block_in,
             z_channels,
@@ -1008,6 +1064,7 @@ class VAEDecoder(nn.Module):
                 num_groups=config.num_groups,
                 patch_size=config.patch_size,
                 use_flash_attention=config.use_flash_attention,
+                norm_type=getattr(config, 'norm_type', 'group'),
             )
 
         self.mid.block_2 = make_resblock(
@@ -1055,6 +1112,7 @@ class VAEDecoder(nn.Module):
                         num_groups=config.num_groups,
                         patch_size=config.patch_size,
                         use_flash_attention=config.use_flash_attention,
+                        norm_type=getattr(config, 'norm_type', 'group'),
                     ))
 
             up = nn.Module()
@@ -1069,7 +1127,10 @@ class VAEDecoder(nn.Module):
             self.up.insert(0, up)  # Insert at the beginning for correct order
 
         # Output normalization and convolution
-        self.norm_out = get_norm(block_in, num_groups=config.num_groups)
+        self.norm_out = get_norm(
+            block_in, num_groups=config.num_groups,
+            norm_type=getattr(config, 'norm_type', 'group'),
+        )
         self.conv_out = Conv(
             block_in,
             config.out_channels,
@@ -1079,6 +1140,14 @@ class VAEDecoder(nn.Module):
             bias=config.output_bias,
             patch_size=config.patch_size
         )
+        # Optional learned scalar gain at the decoder output. Only added when
+        # the config requests it; default (None) preserves the legacy
+        # state_dict structure exactly.
+        gain_init = getattr(config, 'output_gain_init', None)
+        if gain_init is not None:
+            self.gain_out = Gain(init=float(gain_init))
+        else:
+            self.gain_out = None
 
     def forward(self, z, time=None):
         # print(f"Input z shape: {z.shape}, 10th item: {z.flatten()[9] if z.numel() > 9 else None}")
@@ -1132,6 +1201,9 @@ class VAEDecoder(nn.Module):
 
         h = self.conv_out(h)
         # print(f"After conv_out shape: {h.shape}, 10th item: {h.flatten()[9] if h.numel() > 9 else None}")
+
+        if self.gain_out is not None:
+            h = self.gain_out(h)
 
         if self.config.tanh_out:
             h = torch.tanh(h)
