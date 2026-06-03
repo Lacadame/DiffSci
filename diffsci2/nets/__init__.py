@@ -21,6 +21,7 @@ from .embedder import (
 from .vaenet import VAENet, VAENetConfig
 from .vaenet_mp import VAENetMP, VAENetMPConfig
 from . import commonlayers
+from . import localattn
 
 from .normedlayers import (
     # CONFIG-D / CONFIG-E learned layers (forced WN + weight norm on use).

@@ -1,14 +1,21 @@
 """Convenience loaders for the production 3D pore VAEs.
 
-Five variants are supported:
+Seven variants are supported:
 
 | variant                     | architecture                              | downsample |
 | --------------------------- | ----------------------------------------- | ---------- |
 | `vae_groupnorm_legacy`      | `VAENet` (GroupNorm), z_dim=4              | 8x         |
+| `vae_groupnorm_sft_v1`      | same as `_legacy`, SFT'd dec-only (run01)  | 8x         |
+| `vae_groupnorm_sft_v2`      | same, SFT'd with encoder unfrozen (run05)  | 8x         |
 | `vae_pixnorm_s4_raw`        | `VAENet(norm_type='pixel')`, z_dim=2       | 4x         |
 | `vae_pixnorm_s4_sft`        | same as `_s4_raw`, SFT'd in run03          | 4x         |
 | `vae_pixnorm_s8_raw`        | `VAENetMP` approach_b, z_dim=4             | 8x         |
 | `vae_pixnorm_s8_sft`        | same as `_s8_raw`, SFT'd in run04          | 8x         |
+
+The PixelNorm variants emit a `UserWarning` on load: they are not the
+current production recommendation. The 3-way SFT comparison
+(eval_sft_comparison/, 2026-05-25) showed GroupNorm + Conv backbone
+wins 17/24 (stone, metric) cells; prefer `vae_groupnorm_sft_v2`.
 
 All variants return a **bare** VAE-like module with ``.encoder``,
 ``.decoder``, ``.config.z_dim`` (so anything that consumed the old
@@ -32,6 +39,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Optional
 import os
+import warnings
 
 import torch
 import torch.nn as nn
@@ -49,17 +57,17 @@ from diffsci2.nets import VAENetMP, VAENetMPConfig
 # ----------------------------------------------------------------------------
 
 _REPO_ROOT = "/home/ubuntu/repos/DiffSci2"
+_VAE_DIR = os.path.join(_REPO_ROOT, "savedmodels/pore/vae")
 
 
-# NOTE: paths below point at where the ckpts live *today* (training-run
-# directories under `notebooks/exploratory/...` and the existing
-# `savedmodels/pore/production/` slot). Danilo will physically copy
-# them into `savedmodels/vae/vae_<variant>.ckpt` as a separate step;
-# at that point the constants below should be updated to:
-#
-#   path=os.path.join(_REPO_ROOT, "savedmodels/vae/vae_<variant>.ckpt")
-#
-# Instructions for the migration: claude/report/VAE_PORT_MIGRATION.md.
+# The pixnorm variants are kept for reproducibility but are no longer the
+# recommended production VAE. `load_autoencoder` emits a UserWarning on load.
+_DISCOURAGED_VARIANTS: frozenset[str] = frozenset({
+    "vae_pixnorm_s4_raw",
+    "vae_pixnorm_s4_sft",
+    "vae_pixnorm_s8_raw",
+    "vae_pixnorm_s8_sft",
+})
 
 
 @dataclass(frozen=True)
@@ -73,20 +81,36 @@ class VariantSpec:
 VARIANT_REGISTRY: dict[str, VariantSpec] = {
     "vae_groupnorm_legacy": VariantSpec(
         name="vae_groupnorm_legacy",
-        path=os.path.join(
-            _REPO_ROOT, "savedmodels/pore/production/converted_vaenet.ckpt"
-        ),
+        path=os.path.join(_VAE_DIR, "converted_vaenet.ckpt"),
         description=(
             "Legacy GroupNorm VAENet (z_dim=4, ch_mult=[1,2,4,4], 8x "
             "downsample). The historical production decoder."
         ),
     ),
+    "vae_groupnorm_sft_v1": VariantSpec(
+        name="vae_groupnorm_sft_v1",
+        path=os.path.join(_VAE_DIR, "converted_vaenet_groupnorm_sft_v1.ckpt"),
+        description=(
+            "GroupNorm VAE after decoder-only SFT (longrun_groupnorm, "
+            "10000 steps). Best val z-MAE 0.1154 at step 8000. Same "
+            "architecture as vae_groupnorm_legacy; regressor stripped at "
+            "conversion time so the bare-VAE loader picks it up."
+        ),
+    ),
+    "vae_groupnorm_sft_v2": VariantSpec(
+        name="vae_groupnorm_sft_v2",
+        path=os.path.join(_VAE_DIR, "converted_vaenet_groupnorm_sft_v2.ckpt"),
+        description=(
+            "GroupNorm VAE after encoder+decoder SFT (run05_gn_warmstart_"
+            "unfreeze, warm-started from sft_v1; encoder unfrozen at "
+            "lr=1e-6, 5000 steps). Best val z-MAE 0.1131 at step 1000. "
+            "Production recommendation as of 2026-05-25: wins 17/24 "
+            "(stone, metric) cells in the 3-way SFT comparison."
+        ),
+    ),
     "vae_pixnorm_s4_raw": VariantSpec(
         name="vae_pixnorm_s4_raw",
-        path=os.path.join(
-            _REPO_ROOT,
-            "savedmodels/pore/production/converted_vaenet_s4_pixnorm.ckpt",
-        ),
+        path=os.path.join(_VAE_DIR, "converted_vaenet_s4_pixnorm.ckpt"),
         description=(
             "PixelNorm VAENet (z_dim=2, ch_mult=[1,2,4], 4x downsample). "
             "Pretrained PixelNorm decoder, no SFT."
@@ -94,10 +118,7 @@ VARIANT_REGISTRY: dict[str, VariantSpec] = {
     ),
     "vae_pixnorm_s4_sft": VariantSpec(
         name="vae_pixnorm_s4_sft",
-        path=os.path.join(
-            _REPO_ROOT,
-            "savedmodels/pore/production/converted_vaenet_s4_pixnorm_sft.ckpt"
-        ),
+        path=os.path.join(_VAE_DIR, "converted_vaenet_s4_pixnorm_sft.ckpt"),
         description=(
             "PixelNorm-s4 VAE after run03 supervised fine-tuning with "
             "the PoreRegressor reward. K_abs |bias| 0.092 % pooled at "
@@ -106,10 +127,7 @@ VARIANT_REGISTRY: dict[str, VariantSpec] = {
     ),
     "vae_pixnorm_s8_raw": VariantSpec(
         name="vae_pixnorm_s8_raw",
-        path=os.path.join(
-            _REPO_ROOT,
-            "savedmodels/pore/production/converted_vaenet_s8_pixnorm.ckpt"
-        ),
+        path=os.path.join(_VAE_DIR, "converted_vaenet_s8_pixnorm.ckpt"),
         description=(
             "VAENetMP approach_b (z_dim=4, ch_mult=[1,2,4,4], 8x "
             "downsample, bare convs). Pretrained, no SFT."
@@ -117,11 +135,7 @@ VARIANT_REGISTRY: dict[str, VariantSpec] = {
     ),
     "vae_pixnorm_s8_sft": VariantSpec(
         name="vae_pixnorm_s8_sft",
-        path=os.path.join(
-            _REPO_ROOT,
-            # "savedmodels/pore/production/converted_vaenet_s8_pixnorm_sft.ckpt"
-            "notebooks/exploratory/dfnai/scripts/vaeporesft/checkpoints/run04_pixnorm_s8/best-step4400-z0.1302.ckpt"
-        ),
+        path=os.path.join(_VAE_DIR, "converted_vaenet_s8_pixnorm_sft.ckpt"),
         description=(
             "VAENetMP after run04 supervised fine-tuning. Same 8x "
             "compression as the legacy GroupNorm decoder but with "
@@ -263,6 +277,16 @@ def load_autoencoder(
     state = blob.get("state_dict", blob)
 
     detected = _sniff_format(state)
+    if detected in _DISCOURAGED_VARIANTS:
+        warnings.warn(
+            f"VAE variant {detected!r} is a PixelNorm checkpoint and is "
+            "no longer the recommended production VAE. The 3-way SFT "
+            "comparison (eval_sft_comparison/, 2026-05-25) showed "
+            "GroupNorm + Conv backbone wins 17/24 (stone, metric) cells. "
+            "Prefer 'vae_groupnorm_sft_v2'.",
+            UserWarning,
+            stacklevel=2,
+        )
     builder = _BUILDERS[detected]
     model = builder(state)
 
