@@ -1,7 +1,7 @@
 
 import torch
 
-import diffsci.models
+import diffsci2.models
 
 
 def test():

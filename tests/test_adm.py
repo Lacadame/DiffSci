@@ -1,6 +1,6 @@
 import torch
 
-import diffsci.models.nets.adm
+import diffsci2.nets.adm
 
 
 def test():

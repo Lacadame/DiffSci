@@ -1,0 +1,1273 @@
+import math
+
+import torch
+import einops
+# The following import is done for not breaking any code importing
+# attention layers from commonlayers.py
+from .attention import (NDimensionalAttention,  # noqa: F401
+                        TwoDimensionalAttention,  # noqa: F401
+                        ThreeDimensionalAttention)  # noqa: F401
+from . import normedlayers
+
+
+def _chunked_upsample(upsampler, x, threshold_ratio=0.8):
+    """
+    Upsample with automatic chunking along the channel dimension to avoid
+    PyTorch's INT_MAX element limit in upsample_nearest{2,3}d.
+
+    Only activates chunking when the output tensor would exceed
+    threshold_ratio * INT_MAX elements; otherwise delegates directly.
+    """
+    INT_MAX = 2**31 - 1
+    threshold = threshold_ratio * INT_MAX
+
+    ndim_spatial = x.ndim - 2
+    scale = upsampler.scale_factor
+    out_numel = x.numel() * (scale ** ndim_spatial)
+
+    if out_numel <= threshold:
+        return upsampler(x)
+
+    C = x.shape[1]
+    per_channel_elements = out_numel / C
+    max_channels_per_chunk = max(1, int(threshold // per_channel_elements))
+    num_chunks = -(-C // max_channels_per_chunk)  # ceiling division
+
+    parts = x.chunk(num_chunks, dim=1)
+    return torch.cat([upsampler(p) for p in parts], dim=1)
+
+
+class SwiGLU(torch.nn.Module):
+    def __init__(self, in_dims: int,
+                 out_dims: int):
+        super().__init__()
+        self.act = torch.nn.SiLU()
+        self.linear1 = torch.nn.Linear(in_dims, out_dims)
+        self.linear2 = torch.nn.Linear(in_dims, out_dims)
+
+    def forward(self, x):
+        return self.linear1(x) * self.act(self.linear2(x))
+
+
+class DownSampler(torch.nn.Module):
+
+    def __init__(self,
+                 input_channels,
+                 output_channels,
+                 dimension=2,
+                 scale_factor=2,
+                 kernel_size=3,
+                 bias=True,
+                 convolution_type="default"):
+
+        """
+        Parameters
+        ----------
+        input_channels : int
+            The number of input channels
+        output_channels : int
+            The number of output channels
+        dimension : int
+            The dimension of the input
+        """
+
+        super().__init__()
+        self.dimension = dimension
+        self.convolution_type = convolution_type
+        self.bias = bias
+        conv_fn = self.get_convolution_function()
+
+        self.conv = conv_fn(
+            input_channels,
+            output_channels,
+            kernel_size=kernel_size,
+            padding='same',  # type: ignore
+            bias=bias)
+
+        if dimension == 2:
+            self.downsampler = torch.nn.MaxPool2d(scale_factor)
+        elif dimension == 3:
+            self.downsampler = torch.nn.MaxPool3d(scale_factor)
+        else:
+            raise ValueError(f"Invalid dimension {dimension}")
+
+    def forward(self, x):
+
+        """
+        Parameters
+        ----------
+        x : torch.Tensor of shape (B, input_channels, H, W)
+
+        Returns
+        -------
+        torch.Tensor of shape (B, output_channels, H//2, W//2)
+        """
+
+        # x : (B, C_in, H, W)
+        # returns : (B, C_out, H//2, W//2)
+        return self.conv(self.downsampler(x))
+
+    def get_convolution_function(self):
+        if self.convolution_type == "default":
+            return torch.nn.Conv2d if self.dimension == 2 else torch.nn.Conv3d
+        elif self.convolution_type == "circular":
+            return CircularConv2d if self.dimension == 2 else CircularConv3d
+        elif self.convolution_type == "mp":
+            return (normedlayers.MagnitudePreservingConv2d
+                    if self.dimension == 2
+                    else normedlayers.MagnitudePreservingConv3d)
+        else:
+            raise ValueError(
+                f"Invalid convolution type: {self.convolution_type}")
+
+
+class UpSampler(torch.nn.Module):
+
+    def __init__(self,
+                 input_channels,
+                 output_channels,
+                 dimension=2,
+                 scale_factor=2,
+                 kernel_size=3,
+                 bias=True,
+                 convolution_type="default"):
+
+        """
+        Parameters
+        ----------
+        input_channels : int
+            The number of input channels
+        output_channels : int
+            The number of output channels
+        """
+
+        super().__init__()
+        self.dimension = dimension
+        self.convolution_type = convolution_type
+        self.bias = bias
+        conv_fn = self.get_convolution_function()
+
+        self.conv = conv_fn(
+            input_channels,
+            output_channels,
+            kernel_size=kernel_size,
+            padding='same',
+            bias=bias)
+        self.upsampler = torch.nn.Upsample(scale_factor=scale_factor)
+
+    def forward(self, x):
+
+        """
+        Parameters
+        ----------
+        x : torch.Tensor of shape (B, input_channels, H, W)
+
+        Returns
+        -------
+        torch.Tensor of shape (B, output_channels, H*2, W*2)
+        """
+
+        # x : (B, C_in, H, W)
+        # returns : (B, C_out, H*2, W*2)
+        return self.conv(_chunked_upsample(self.upsampler, x))
+
+    def get_convolution_function(self):
+        if self.convolution_type == "default":
+            return torch.nn.Conv2d if self.dimension == 2 else torch.nn.Conv3d
+        elif self.convolution_type == "circular":
+            return CircularConv2d if self.dimension == 2 else CircularConv3d
+        elif self.convolution_type == "mp":
+            return (normedlayers.MagnitudePreservingConv2d
+                    if self.dimension == 2
+                    else normedlayers.MagnitudePreservingConv3d)
+        else:
+            raise ValueError(
+                f"Invalid convolution type: {self.convolution_type}")
+
+
+class GaussianFourierProjection(torch.nn.Module):
+    def __init__(self, embed_dim, scale=30.0):
+        """
+        Parameters
+        ----------
+        embed_dim : int
+            The dimension of the embedding
+        scale : float
+            The scale of the gaussian distribution
+        """
+        super().__init__()
+        self.register_buffer('W',
+                             torch.randn(embed_dim//2)*scale)
+
+    def forward(self, x):
+        """
+        Parameters
+        ----------
+        x : torch.Tensor of shape (...)
+
+        Returns
+        -------
+        x_proj : torch.Tensor of shape (..., embed_dim)
+        """
+        x = x[..., None]  # (..., 1)
+        x_proj = 2*math.pi*x*self.W  # (..., embed_dim//2)
+        x_proj = torch.cat(
+            [torch.sin(x_proj), torch.cos(x_proj)], dim=-1
+        )  # (..., embed_dim)
+        return x_proj
+
+
+class GeneralizedFourierProjection(torch.nn.Module):
+    def __init__(self, embed_dim, sample_distribution, scale=30.0):
+        """
+        Parameters
+        ----------
+        embed_dim : int
+            The dimension of the embedding
+        sample_distribution : torch.distributions.Distribution
+            The distribution to sample from
+        scale : float
+            The scale of the distribution
+        """
+        super().__init__()
+        self.register_buffer(
+            'W',
+            sample_distribution.sample([embed_dim // 2])*scale
+        )
+
+    def forward(self, x):
+        """
+        Parameters
+        ----------
+        x : torch.Tensor of shape (...)
+
+        Returns
+        -------
+        x_proj : torch.Tensor of shape (..., embed_dim)
+        """
+        x = x[..., None]  # (..., 1)
+        x_proj = 2*math.pi*x*self.W  # (..., embed_dim//2)
+        x_proj = torch.cat(
+            [torch.sin(x_proj), torch.cos(x_proj)], dim=-1
+        )  # (..., embed_dim)
+        return x_proj
+
+
+class ConvolutionalFourierProjection(torch.nn.Module):
+    def __init__(self,
+                 input_dim,
+                 embed_dim,
+                 scale=30.0,
+                 bias=True):
+        super().__init__()
+        self.input_dim = input_dim
+        self.embed_dim = embed_dim
+        self.scale = scale
+        wshape = [input_dim, embed_dim//2]
+        self.register_buffer('W',
+                             torch.randn(wshape)*scale)
+        if bias:
+            self.register_buffer('bias',
+                                 torch.randn(embed_dim//2)*scale)
+
+    def forward(self, x):
+        # x : (B, C, H, W)
+        # returns : (B, embed_dim, H, W)
+        xc = torch.einsum('bc...,cd->bd...', x, 2*math.pi*self.W)
+        # xc : (B, embed_dim//2, H, W)
+        if hasattr(self, 'bias'):
+            bias_shape = self.embed_dim + [1]*(x.dim()-2)
+            xc = xc + self.bias.view(*bias_shape)
+        xc = torch.cat([torch.sin(xc), torch.cos(xc)], dim=1)
+        return xc
+
+
+class GaussianFourierProjectionVector(torch.nn.Module):
+    def __init__(self, input_dim, embed_dim, scale=30.0):
+        """
+        Parameters
+        ----------
+        input_dim : int
+            The dimension of the input
+        embed_dim : int
+            The dimension of the embedding
+        scale : float
+            The scale of the gaussian distribution
+        """
+        super().__init__()
+        self.input_dim = input_dim
+        self.embed_dim = embed_dim
+        W = torch.randn((input_dim, embed_dim//2))*scale
+        self.register_buffer('W',
+                             W)
+
+    def forward(self, x):
+        """
+        Parameters
+        ----------
+        x : torch.Tensor of shape (..., input_dim)
+
+        Returns
+        -------
+        x_proj : torch.Tensor of shape (..., embed_dim)
+        """
+        x_proj = 2*math.pi*x@self.W  # (..., embed_dim//2)
+        x_proj = torch.cat(
+            [torch.sin(x_proj), torch.cos(x_proj)], dim=-1
+        )  # (..., embed_dim)
+        return x_proj
+
+
+class GeneralizedFourierProjectionVector(torch.nn.Module):
+    def __init__(self, input_dim, embed_dim, sample_distribution, scale=30.0):
+        """
+        Parameters
+        ----------
+        input_dim : int
+            The dimension of the input
+        embed_dim : int
+            The dimension of the embedding
+        sample_distribution : torch.distributions.Distribution
+            The distribution to sample from
+        scale : float
+            The scale of the distribution
+        """
+        super().__init__()
+        self.input_dim = input_dim
+        self.embed_dim = embed_dim
+        W = sample_distribution.sample([input_dim, embed_dim//2])*scale
+        self.register_buffer('W',
+                             W)
+
+    def forward(self, x):
+        """
+        Parameters
+        ----------
+        x : torch.Tensor of shape (..., input_dim)
+
+        Returns
+        -------
+        x_proj : torch.Tensor of shape (..., embed_dim)
+        """
+        x_proj = 2*math.pi*x@self.W  # (..., embed_dim//2)
+        x_proj = torch.cat(
+            [torch.sin(x_proj), torch.cos(x_proj)], dim=-1
+        )  # (..., embed_dim)
+        return x_proj
+
+
+class GroupRMSNorm(torch.nn.Module):
+    def __init__(self,
+                 num_groups,
+                 num_channels,
+                 eps=1e-5,
+                 affine=True):
+        """
+        Group RMS normalization layer. This layer divides the channels into
+        groups and normalizes along the (C//G, *) dimensions.
+
+        Parameters
+        ----------
+        num_groups : int
+            The number of groups to divide the channels
+        num_channels : int
+            The number of channels expected in the input
+        eps : float
+            The epsilon value to avoid division by zero
+        affine : bool
+            Whether to apply an affine transformation to the input
+        """
+        super().__init__()
+        self.num_groups = num_groups
+        self.num_channels = num_channels
+        self.eps = eps
+        self.affine = affine
+        if self.affine:
+            self.weight = torch.nn.Parameter(torch.ones(num_channels))
+            self.bias = torch.nn.Parameter(torch.zeros(num_channels))
+
+    def forward(self, x):
+        """
+        Parameters
+        ----------
+        x : torch.Tensor of shape (B, C, *)
+
+        Returns
+        -------
+        x : torch.Tensor of shape (B, C, *)
+        """
+        B, C = x.shape[:2]
+        G = self.num_groups
+        x = x.view(B, G, C//G, *x.shape[2:])
+        normalize_dims = tuple(range(2, x.dim()))
+
+        x = x / (torch.sqrt(x.pow(2).mean(dim=normalize_dims, keepdim=True)
+                            + self.eps))
+        x = x.view(B, C, *x.shape[3:])
+        if self.affine:
+            w = self.weight.view(1, C, *([1]*(x.dim()-2)))
+            b = self.bias.view(1, C, *([1]*(x.dim()-2)))
+            x = x*w + b
+        return x
+
+
+class GroupPixNorm(torch.nn.Module):
+    def __init__(self,
+                 num_groups,
+                 num_channels,
+                 eps=1e-5,
+                 affine=True):
+        """
+        Group Pix normalization layer. This layer divides the channels into
+        groups and normalizes along the [C//G] dimensions.
+
+        Parameters
+        ----------
+        num_groups : int
+            The number of groups to divide the channels
+        num_channels : int
+            The number of channels expected in the input
+        eps : float
+            The epsilon value to avoid division by zero
+        affine : bool
+            Whether to apply an affine transformation to the input
+        """
+        super().__init__()
+        self.num_groups = num_groups
+        self.num_channels = num_channels
+        self.eps = eps
+        self.affine = affine
+        if self.affine:
+            self.weight = torch.nn.Parameter(torch.ones(num_channels))
+            self.bias = torch.nn.Parameter(torch.zeros(num_channels))
+
+    def forward(self, x):
+        """
+        Parameters
+        ----------
+        x : torch.Tensor of shape (B, C, *)
+
+        Returns
+        -------
+        x : torch.Tensor of shape (B, C, *)
+        """
+        B, C = x.shape[:2]
+        G = self.num_groups
+        x = x.view(B, G, C//G, *x.shape[2:])
+        normalize_dims = [2]
+        x = x / (torch.sqrt(x.pow(2).mean(dim=normalize_dims, keepdim=True)
+                            + self.eps))
+        x = x.view(B, C, *x.shape[3:])
+        if self.affine:
+            w = self.weight.view(1, C, *([1]*(x.dim()-2)))
+            b = self.bias.view(1, C, *([1]*(x.dim()-2)))
+            x = x*w + b
+        return x
+
+
+class GroupLNorm(torch.nn.Module):
+    def __init__(self,
+                 num_groups,
+                 num_channels,
+                 eps=1e-5,
+                 affine=True):
+        """
+        Group Layer normalization layer. This layer divides the channels into
+        groups and normalizes along the (C//G, *) dimensions.
+
+        Parameters
+        ----------
+        num_groups : int
+            The number of groups to divide the channels
+        num_channels : int
+            The number of channels expected in the input
+        eps : float
+            The epsilon value to avoid division by zero
+        affine : bool
+            Whether to apply an affine transformation to the input
+        """
+        super().__init__()
+        self.num_groups = num_groups
+        self.num_channels = num_channels
+        self.eps = eps
+        self.affine = affine
+        if self.affine:
+            self.weight = torch.nn.Parameter(torch.ones(num_channels))
+            self.bias = torch.nn.Parameter(torch.zeros(num_channels))
+
+    def forward(self, x):
+        """
+        Parameters
+        ----------
+        x : torch.Tensor of shape (B, C, *)
+
+        Returns
+        -------
+        x : torch.Tensor of shape (B, C, *)
+        """
+        B, C = x.shape[:2]
+        G = self.num_groups
+        x = x.view(B, G, C//G, *x.shape[2:])
+        normalize_dims = tuple(range(2, x.dim()))
+        x = x - x.mean(dim=normalize_dims, keepdim=True)
+        x = x / (torch.sqrt(x.pow(2).mean(dim=normalize_dims, keepdim=True)
+                            + self.eps))
+        x = x.view(B, C, *x.shape[3:])
+        if self.affine:
+            w = self.weight.view(1, C, *([1]*(x.dim()-2)))
+            b = self.bias.view(1, C, *([1]*(x.dim()-2)))
+            x = x*w + b
+        return x
+
+
+class ResnetTimeBlock(torch.nn.Module):
+    def __init__(self,
+                 embed_channels,
+                 ouput_channels,
+                 dimension=2,
+                 magnitude_preserving=False):
+        """
+        Parameters
+        ----------
+        embed_channels : int
+            The number of channels in the embedding
+        ouput_channels : int
+            The number of channels in the output
+        """
+        super().__init__()
+        self.dimension = dimension
+        if not magnitude_preserving:
+            linear_fn = torch.nn.Linear
+        else:
+            linear_fn = normedlayers.MagnitudePreservingLinear
+        self.net = torch.nn.Sequential(
+            linear_fn(embed_channels, 4*embed_channels),
+            torch.nn.SiLU(),
+            linear_fn(4*embed_channels, 4*embed_channels),
+            torch.nn.SiLU(),
+            linear_fn(4*embed_channels, ouput_channels)
+        )
+
+    def forward(self, te):
+        """
+        Parameters
+        ----------
+        te : torch.Tensor of shape (nbatch, embed_channels)
+
+        Returns
+        -------
+        torch.Tensor of shape (nbatch, output_channels, 1, 1, 1)
+        """
+        # te : (nbatch, embed_channels) or (nbatch, embed_channels, *shape_dims)
+        # returns : (nbatch, output_channels, 1, 1, 1)
+        if te.ndim - 2 == self.dimension:
+            # Special case, it began as (nbatch, embed_channels, *shape_dims)
+            # It will end as (nbatch * shape_dims, embed_channels)
+            shape_strings = ' '.join([f's{dim}' for dim in range(2, te.ndim)])
+            kwargs = {f's{dim}': te.shape[dim] for dim in range(2, te.ndim)}
+            pattern = f'nbatch embed {shape_strings} -> (nbatch {shape_strings}) embed'
+            te = einops.rearrange(te, pattern, **kwargs)
+            yt = self.net(te)
+            pattern = f'(nbatch {shape_strings}) embed -> nbatch embed {shape_strings}'
+            yt = einops.rearrange(yt, pattern, **kwargs)
+        elif te.ndim - 2 == 0:
+            yt = self.net(te)
+            newdim = yt.shape + (1,) * self.dimension
+            yt = yt.view(*newdim)
+        return yt
+
+
+class ResnetBlock(torch.nn.Module):
+    def __init__(self, input_channels,
+                 time_embed_dim,
+                 output_channels=None,
+                 dimension=2,
+                 kernel_size=3,
+                 dropout=0.0):
+
+        """
+        Parameters
+        ----------
+        input_channels : int
+            The number of input channels
+        time_embed_dim : int
+            The dimension of the time embedding
+        output_channels : int | None
+            The number of output channels. If None,
+            then output_channels = input_channels
+        kernel_size : int
+            Size of convolutional kernel.
+        dropout : float
+            The dropout value
+        """
+
+        super().__init__()
+        kernel_size = kernel_size
+        if output_channels is None:
+            output_channels = input_channels
+            self.has_residual_connection = True
+        else:
+            self.has_residual_connection = False
+        self.act = torch.nn.SiLU()
+        self.gnorm1 = torch.nn.GroupNorm(input_channels, input_channels)
+        convfunc = torch.nn.Conv2d if dimension == 2 else torch.nn.Conv3d
+        self.conv1 = convfunc(
+            input_channels,
+            output_channels,
+            kernel_size,
+            padding="same"
+        )
+
+        self.gnorm2 = torch.nn.GroupNorm(output_channels, output_channels)
+        self.dropout = torch.nn.Dropout(p=dropout)
+        self.conv2 = convfunc(
+            output_channels,
+            output_channels,
+            kernel_size,
+            padding="same"
+        )
+
+        self.timeblock = ResnetTimeBlock(time_embed_dim,
+                                         output_channels,
+                                         dimension=dimension)
+
+    def forward(self, x, te):
+
+        """
+        Parameters
+        ----------
+        x : torch.Tensor of shape (B, input_channels, H, W)
+        te : torch.Tensor of shape (B, time_embed_dim)
+
+        Returns
+        -------
+        torch.Tensor of shape (B, output_channels, H, W)
+        """
+
+        # x : (B, C_in, H, W)
+        # te : (B, C_embed)
+        y = self.conv1(self.act(self.gnorm1(x)))  # (B, C_out, H, W)
+        yt = self.timeblock(te)
+        y = y + yt  # (B, C_out, H, W)
+        y = self.conv2(
+            self.dropout(self.act(self.gnorm2(x)))
+        )  # (B, C_out, H, W)
+        if self.has_residual_connection:
+            y = y + x
+        return y
+
+
+class ResnetBlockB(torch.nn.Module):
+    def __init__(self, input_channels,
+                 time_embed_dim,
+                 output_channels=None,
+                 dimension=2,
+                 kernel_size=3,
+                 dropout=0.0):
+        """
+        Parameters
+        ----------
+        input_channels : int
+            The number of input channels
+        time_embed_dim : int
+            The dimension of the time embedding
+        output_channels : int | None
+            The number of output channels. If None,
+            then output_channels = input_channels
+        kernel_size : int
+            Size of convolutional kernel.
+        dropout : float
+            The dropout value
+        """
+        super().__init__()
+        kernel_size = kernel_size
+        if output_channels is None:
+            output_channels = input_channels
+            self.has_residual_connection = True
+        else:
+            self.has_residual_connection = False
+        self.act = torch.nn.SiLU()
+        self.gnorm1 = torch.nn.GroupNorm(input_channels, input_channels)
+        convfunc = torch.nn.Conv2d if dimension == 2 else torch.nn.Conv3d
+        self.conv1 = convfunc(
+            input_channels,
+            output_channels,
+            kernel_size,
+            padding="same"
+        )
+
+        self.gnorm2 = torch.nn.GroupNorm(output_channels, output_channels)
+        self.dropout = torch.nn.Dropout(p=dropout)
+        self.conv2 = convfunc(
+            output_channels,
+            output_channels,
+            kernel_size,
+            padding="same"
+        )
+
+        self.timeblock = ResnetTimeBlock(time_embed_dim,
+                                         output_channels,
+                                         dimension=dimension)
+
+    def forward(self, x, te):
+        """
+        Parameters
+        ----------
+        x : torch.Tensor of shape (B, input_channels, D, H, W)
+        te : torch.Tensor of shape (B, time_embed_dim)
+
+        Returns
+        -------
+        torch.Tensor of shape (B, output_channels, D, H, W)
+        """
+        # x : (B, C_in, D, H, W)
+        # te : (B, C_embed)
+        y = self.conv1(self.act(self.gnorm1(x)))  # (B, C_out, D, H, W)
+        yt = self.timeblock(te)
+        y = y + yt  # (B, C_out, D, H, W)
+        y = self.conv2(
+            self.dropout(self.act(self.gnorm2(y)))
+        )  # (B, C_out, D, H, W)
+        if self.has_residual_connection:
+            y = y + x
+        return y
+
+
+class ResnetBlockC(torch.nn.Module):
+    def __init__(self, input_channels,
+                 time_embed_dim,
+                 output_channels=None,
+                 dimension=2,
+                 kernel_size=3,
+                 dropout=0.0,
+                 first_norm="GroupLN",
+                 second_norm="GroupRMS",
+                 affine_norm=True,
+                 convolution_type="default",
+                 bias=True,
+                 extra_residual: None | torch.nn.Module = None):
+        """
+        Parameters
+        ----------
+        input_channels : int
+            The number of input channels
+        time_embed_dim : int | None
+            The dimension of the time embedding. If None,
+            then no time embedding is used.
+        output_channels : int | None
+            The number of output channels. If None,
+            then output_channels = input_channels
+        kernel_size : int
+            Size of convolutional kernel.
+        dropout : float
+            The dropout value
+        first_norm : str
+            The normalization layer to use after the first convolution.
+            Default: "GroupLN"
+        second_norm : str
+            The normalization layer to use after the second convolution.
+            Default: "GroupRMS"
+        affine_norm : bool
+            Whether to apply an learnable affine transformation
+            to the normalization
+        convolution_type : str
+            The type of convolution to use. Default: "default"
+        extra_residual:
+
+        """
+        super().__init__()
+        kernel_size = kernel_size
+        if output_channels is None:
+            output_channels = input_channels
+            self.has_residual_connection = True
+        else:
+            self.has_residual_connection = False
+        self.act = torch.nn.SiLU()
+        self.dimension = dimension
+        self.convolution_type = convolution_type
+        self.first_norm = first_norm
+        self.second_norm = second_norm
+
+        self.has_time_embed = time_embed_dim is not None
+
+        gnorm1_fn, gnorm2_fn = self.get_normalization_functions()
+
+        self.gnorm1 = gnorm1_fn(input_channels,
+                                input_channels,
+                                affine=affine_norm)
+
+        self.gnorm2 = gnorm2_fn(output_channels,
+                                output_channels,
+                                affine=affine_norm)
+
+        convfunc = self.get_convolution_function()
+        self.conv1 = convfunc(
+            input_channels,
+            output_channels,
+            kernel_size,
+            padding="same",
+            bias=bias
+        )
+        self.conv2 = convfunc(
+            output_channels,
+            output_channels,
+            kernel_size,
+            padding="same",
+            bias=bias
+        )
+
+        self.dropout = torch.nn.Dropout(p=dropout)
+
+        if convolution_type == "mp":
+            magnitude_preserving = True
+        else:
+            magnitude_preserving = False
+
+        if self.has_time_embed:
+            self.timeblock = ResnetTimeBlock(
+                time_embed_dim,
+                output_channels,
+                dimension=dimension,
+                magnitude_preserving=magnitude_preserving
+            )
+
+        self.extra_residual = extra_residual
+
+    def forward(self, x, te=None):
+        """
+        Parameters
+        ----------
+        x : torch.Tensor of shape (B, input_channels, D, H, W)
+        te : torch.Tensor of shape (B, time_embed_dim)
+
+        Returns
+        -------
+        torch.Tensor of shape (B, output_channels, D, H, W)
+        """
+        # x : (B, C_in, D, H, W)
+        # te : (B, C_embed)
+        if te is None:
+            assert not self.has_time_embed
+        y = self.conv1(self.act(self.gnorm1(x)))  # (B, C_out, D, H, W)
+        if self.has_time_embed:
+            yt = self.timeblock(te)
+            yt = self.rescale_yt(yt, y)
+            y = y + yt  # (B, C_out, D, H, W)
+        y = self.conv2(
+            self.dropout(self.act((self.gnorm2(y))))
+        )  # (B, C_out, D, H, W)
+        if self.has_residual_connection:
+            y = y + x
+        if self.extra_residual is not None:
+            y = y + self.extra_residual(x)
+        return y
+
+    def rescale_yt(self, yt, y):  # noqa: C901
+        yt_dims = tuple(yt.shape[2:])
+        y_dims = tuple(y.shape[2:])
+        if yt_dims == (1,) * self.dimension:
+            return yt
+        elif yt_dims == y_dims:
+            return yt
+        else:
+            shape_factor = yt_dims[0] / y_dims[0]
+            if shape_factor > 1:  # Downscale
+                shape_factor = int(shape_factor)
+                for dy, dyt in zip(y_dims, yt_dims):
+                    if dy * shape_factor != dyt:
+                        raise ValueError(f"yt_dims {yt_dims} and y_dims {y_dims} are not compatible")
+                if self.dimension == 1:
+                    downscaler = CornerPool1d(shape_factor)
+                elif self.dimension == 2:
+                    downscaler = CornerPool2d(shape_factor)
+                elif self.dimension == 3:
+                    downscaler = CornerPool3d(shape_factor)
+                else:
+                    raise ValueError(f"Invalid dimension {self.dimension}")
+                return downscaler(yt)
+            elif shape_factor < 1:  # Upscale
+                shape_factor = int(1 / shape_factor)
+                for dy, dyt in zip(y_dims, yt_dims):
+                    if dyt * shape_factor != dy:
+                        raise ValueError(f"yt_dims {yt_dims} and y_dims {y_dims} are not compatible")
+                upscaler = torch.nn.Upsample(shape_factor, mode='nearest')
+                return upscaler(yt)
+            else:
+                return yt
+
+    def get_convolution_function(self):
+        if self.convolution_type == "default":
+            return torch.nn.Conv2d if self.dimension == 2 else torch.nn.Conv3d
+        elif self.convolution_type == "circular":
+            return CircularConv2d if self.dimension == 2 else CircularConv3d
+        elif self.convolution_type == "mp":
+            return (normedlayers.MagnitudePreservingConv2d
+                    if self.dimension == 2
+                    else normedlayers.MagnitudePreservingConv3d)
+        else:
+            raise ValueError(
+                f"Invalid convolution type: {self.convolution_type}")
+
+    def get_normalization_functions(self):
+        if self.first_norm == "GroupLN":
+            gnorm1 = torch.nn.GroupNorm
+        elif self.first_norm == "GroupRMS":
+            gnorm1 = GroupRMSNorm
+        elif self.first_norm == "GroupPix":
+            gnorm1 = GroupPixNorm
+        else:
+            gnorm1 = torch.nn.Identity
+        if self.second_norm == "GroupLN":
+            gnorm2 = torch.nn.GroupNorm
+        elif self.second_norm == "GroupRMS":
+            gnorm2 = GroupRMSNorm
+        elif self.second_norm == "GroupPix":
+            gnorm2 = GroupPixNorm
+        else:
+            gnorm2 = torch.nn.Identity
+        return gnorm1, gnorm2
+
+
+class BatchDropout(torch.nn.Module):
+    def __init__(self, p=0.5):
+        super().__init__()
+        self.p = p
+
+    def forward(self, x):
+        if self.training:
+            mask = torch.rand(x.size(0), device=x.device) > self.p
+            xshape = x.size()
+            mask = mask.view(x.size(0), *([1]*(len(xshape)-1)))
+            x = x*mask
+        return x
+
+
+class CircularConv2d(torch.nn.Module):
+    def __init__(self,
+                 in_channels,
+                 out_channels,
+                 kernel_size,
+                 circular_dims: list[int] | None = None,
+                 *args, **kwargs):
+        """
+        2D convolution with circular (periodic) padding.
+
+        Args:
+            in_channels: Number of input channels
+            out_channels: Number of output channels
+            kernel_size: Size of the convolutional kernel (must be odd)
+            circular_dims: List of spatial dimension indices to use circular padding.
+                          For [B, C, H, W]: [0] = H, [1] = W
+                          [0, 1] or None = both circular (default)
+                          Empty list = all zero padding
+        """
+        super().__init__()
+        assert (kernel_size % 2 == 1)
+        self.kernel_size = kernel_size
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.padding = kernel_size // 2
+        if circular_dims is None:
+            circular_dims = [0, 1]
+        self.circular_dims = set(circular_dims)
+
+        kwargs['padding'] = 0
+        self.conv = torch.nn.Conv2d(in_channels,
+                                    out_channels,
+                                    kernel_size,
+                                    *args,
+                                    **kwargs)
+
+    def forward(self, x):
+        p = self.padding
+        # F.pad format for 2D: (W_left, W_right, H_top, H_bottom)
+        # Pad each dimension separately to control mode per dimension
+
+        # Pad W (dim 1 in spatial, index -1)
+        if 1 in self.circular_dims:
+            x = torch.nn.functional.pad(x, (p, p, 0, 0), mode='circular')
+        else:
+            x = torch.nn.functional.pad(x, (p, p, 0, 0), mode='constant', value=0)
+
+        # Pad H (dim 0 in spatial, index -2)
+        if 0 in self.circular_dims:
+            x = torch.nn.functional.pad(x, (0, 0, p, p), mode='circular')
+        else:
+            x = torch.nn.functional.pad(x, (0, 0, p, p), mode='constant', value=0)
+
+        return self.conv(x)
+
+
+class CircularConv3d(torch.nn.Module):
+    def __init__(self,
+                 in_channels,
+                 out_channels,
+                 kernel_size,
+                 circular_dims: list[int] | None = None,
+                 *args, **kwargs):
+        """
+        3D convolution with circular (periodic) padding.
+
+        Args:
+            in_channels: Number of input channels
+            out_channels: Number of output channels
+            kernel_size: Size of the convolutional kernel (must be odd)
+            circular_dims: List of spatial dimension indices to use circular padding.
+                          For [B, C, D, H, W]: [0] = D, [1] = H, [2] = W
+                          [0, 1] = D and H circular, W zero-padded
+                          [0, 1, 2] or None = all circular (default)
+                          Empty list = all zero padding
+        """
+        super().__init__()
+        assert (kernel_size % 2 == 1)
+        self.kernel_size = kernel_size
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.padding = kernel_size // 2
+        if circular_dims is None:
+            circular_dims = [0, 1, 2]
+        self.circular_dims = set(circular_dims)
+
+        kwargs['padding'] = 0
+        self.conv = torch.nn.Conv3d(in_channels,
+                                    out_channels,
+                                    kernel_size,
+                                    *args, **kwargs)
+
+    def forward(self, x):
+        p = self.padding
+        # F.pad format for 3D: (W_left, W_right, H_top, H_bottom, D_front, D_back)
+
+        # Pad W (dim 2 in spatial, index -1)
+        if 2 in self.circular_dims:
+            x = torch.nn.functional.pad(x, (p, p, 0, 0, 0, 0), mode='circular')
+        else:
+            x = torch.nn.functional.pad(x, (p, p, 0, 0, 0, 0), mode='constant', value=0)
+
+        # Pad H (dim 1 in spatial, index -2)
+        if 1 in self.circular_dims:
+            x = torch.nn.functional.pad(x, (0, 0, p, p, 0, 0), mode='circular')
+        else:
+            x = torch.nn.functional.pad(x, (0, 0, p, p, 0, 0), mode='constant', value=0)
+
+        # Pad D (dim 0 in spatial, index -3)
+        if 0 in self.circular_dims:
+            x = torch.nn.functional.pad(x, (0, 0, 0, 0, p, p), mode='circular')
+        else:
+            x = torch.nn.functional.pad(x, (0, 0, 0, 0, p, p), mode='constant', value=0)
+
+        return self.conv(x)
+
+
+class ReflectConv2d(torch.nn.Module):
+    def __init__(self,
+                 in_channels,
+                 out_channels,
+                 kernel_size,
+                 reflect_dims: list[int] | None = None,
+                 *args, **kwargs):
+        """
+        2D convolution with reflection padding.
+
+        Args:
+            in_channels: Number of input channels
+            out_channels: Number of output channels
+            kernel_size: Size of the convolutional kernel (must be odd)
+            reflect_dims: List of spatial dimension indices to use reflect padding.
+                          For [B, C, H, W]: [0] = H, [1] = W
+                          [0, 1] or None = both reflect (default)
+                          Empty list = all zero padding
+        """
+        super().__init__()
+        assert (kernel_size % 2 == 1)
+        self.kernel_size = kernel_size
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.padding = kernel_size // 2
+        if reflect_dims is None:
+            reflect_dims = [0, 1]
+        self.reflect_dims = set(reflect_dims)
+
+        kwargs['padding'] = 0
+        self.conv = torch.nn.Conv2d(in_channels,
+                                    out_channels,
+                                    kernel_size,
+                                    *args,
+                                    **kwargs)
+
+    def forward(self, x):
+        p = self.padding
+        # F.pad format for 2D: (W_left, W_right, H_top, H_bottom)
+
+        # Pad W (dim 1 in spatial, index -1)
+        if 1 in self.reflect_dims:
+            x = torch.nn.functional.pad(x, (p, p, 0, 0), mode='reflect')
+        else:
+            x = torch.nn.functional.pad(x, (p, p, 0, 0), mode='constant', value=0)
+
+        # Pad H (dim 0 in spatial, index -2)
+        if 0 in self.reflect_dims:
+            x = torch.nn.functional.pad(x, (0, 0, p, p), mode='reflect')
+        else:
+            x = torch.nn.functional.pad(x, (0, 0, p, p), mode='constant', value=0)
+
+        return self.conv(x)
+
+
+class ReflectConv3d(torch.nn.Module):
+    def __init__(self,
+                 in_channels,
+                 out_channels,
+                 kernel_size,
+                 reflect_dims: list[int] | None = None,
+                 *args, **kwargs):
+        """
+        3D convolution with reflection padding.
+
+        Args:
+            in_channels: Number of input channels
+            out_channels: Number of output channels
+            kernel_size: Size of the convolutional kernel (must be odd)
+            reflect_dims: List of spatial dimension indices to use reflect padding.
+                          For [B, C, D, H, W]: [0] = D, [1] = H, [2] = W
+                          [0, 1] = D and H reflect, W zero-padded
+                          [0, 1, 2] or None = all reflect (default)
+                          Empty list = all zero padding
+        """
+        super().__init__()
+        assert (kernel_size % 2 == 1)
+        self.kernel_size = kernel_size
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.padding = kernel_size // 2
+        if reflect_dims is None:
+            reflect_dims = [0, 1, 2]
+        self.reflect_dims = set(reflect_dims)
+
+        kwargs['padding'] = 0
+        self.conv = torch.nn.Conv3d(in_channels,
+                                    out_channels,
+                                    kernel_size,
+                                    *args, **kwargs)
+
+    def forward(self, x):
+        p = self.padding
+        # F.pad format for 3D: (W_left, W_right, H_top, H_bottom, D_front, D_back)
+        # torch.nn.functional.pad with mode='reflect' only supports padding one
+        # dimension at a time in 3D for some versions; we pad each axis separately
+        # to keep behavior identical to the circular counterpart.
+
+        # Pad W (dim 2 in spatial, index -1)
+        if 2 in self.reflect_dims:
+            x = torch.nn.functional.pad(x, (p, p, 0, 0, 0, 0), mode='reflect')
+        else:
+            x = torch.nn.functional.pad(x, (p, p, 0, 0, 0, 0), mode='constant', value=0)
+
+        # Pad H (dim 1 in spatial, index -2)
+        if 1 in self.reflect_dims:
+            x = torch.nn.functional.pad(x, (0, 0, p, p, 0, 0), mode='reflect')
+        else:
+            x = torch.nn.functional.pad(x, (0, 0, p, p, 0, 0), mode='constant', value=0)
+
+        # Pad D (dim 0 in spatial, index -3)
+        if 0 in self.reflect_dims:
+            x = torch.nn.functional.pad(x, (0, 0, 0, 0, p, p), mode='reflect')
+        else:
+            x = torch.nn.functional.pad(x, (0, 0, 0, 0, p, p), mode='constant', value=0)
+
+        return self.conv(x)
+
+
+class CornerPool1d(torch.nn.Module):
+    """Subsampling that picks the first element of each pooling window."""
+
+    def __init__(self, kernel_size, stride=None, padding=0, dilation=1):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.stride = stride if stride is not None else kernel_size
+        self.padding = padding
+        self.dilation = dilation
+
+    def forward(self, x):
+        # x: (N, C, L)
+        if self.padding > 0:
+            x = torch.nn.functional.pad(x, (self.padding, self.padding))
+        # Just slice with the stride - first element of each window
+        return x[..., ::self.stride]
+
+    def extra_repr(self):
+        return f'kernel_size={self.kernel_size}, stride={self.stride}, padding={self.padding}'
+
+
+class CornerPool2d(torch.nn.Module):
+    """Subsampling that picks the top-left corner of each pooling window."""
+
+    def __init__(self, kernel_size, stride=None, padding=0, dilation=1):
+        super().__init__()
+        self.kernel_size = kernel_size if isinstance(kernel_size, tuple) else (kernel_size, kernel_size)
+        self.stride = stride if stride is not None else self.kernel_size
+        self.stride = self.stride if isinstance(self.stride, tuple) else (self.stride, self.stride)
+        self.padding = padding if isinstance(padding, tuple) else (padding, padding)
+        self.dilation = dilation
+
+    def forward(self, x):
+        # x: (N, C, H, W)
+        if self.padding[0] > 0 or self.padding[1] > 0:
+            x = torch.nn.functional.pad(x, (self.padding[1], self.padding[1], self.padding[0], self.padding[0]))
+        return x[..., ::self.stride[0], ::self.stride[1]]
+
+    def extra_repr(self):
+        return f'kernel_size={self.kernel_size}, stride={self.stride}, padding={self.padding}'
+
+
+class CornerPool3d(torch.nn.Module):
+    """Subsampling that picks the corner element of each pooling window."""
+
+    def __init__(self, kernel_size, stride=None, padding=0, dilation=1):
+        super().__init__()
+        self.kernel_size = kernel_size if isinstance(kernel_size, tuple) else (kernel_size,) * 3
+        self.stride = stride if stride is not None else self.kernel_size
+        self.stride = self.stride if isinstance(self.stride, tuple) else (self.stride,) * 3
+        self.padding = padding if isinstance(padding, tuple) else (padding,) * 3
+        self.dilation = dilation
+
+    def forward(self, x):
+        # x: (N, C, D, H, W)
+        if any(p > 0 for p in self.padding):
+            x = torch.nn.functional.pad(x, (self.padding[2], self.padding[2],
+                                        self.padding[1], self.padding[1],
+                                        self.padding[0], self.padding[0]))
+        return x[..., ::self.stride[0], ::self.stride[1], ::self.stride[2]]
+
+    def extra_repr(self):
+        return f'kernel_size={self.kernel_size}, stride={self.stride}, padding={self.padding}'
+
+
+class ConditionDrop(torch.nn.Module):
+    def __init__(self, p: float, hidden_dim: int, null_is_learnable: bool = True):
+        """
+        Args:
+            p (float): Probability of dropping the condition (0 to 1).
+            hidden_dim (int): Dimension of the embedding.
+            null_is_learnable (bool): If True, learns a 'null' embedding.
+                                      If False, uses zeros.
+        """
+        super().__init__()
+        self.p = p
+        if null_is_learnable:
+            self.null_embedding = torch.nn.Parameter(torch.randn(1, hidden_dim))
+        else:
+            self.register_buffer('null_embedding', torch.zeros(1, hidden_dim))
+
+    def forward(self, x):
+        """
+        x: (Batch_Size, Hidden_Dim) or (Batch_Size, Sequence_Length, Hidden_Dim)
+        """
+        if not self.training or self.p == 0.0:
+            return x
+
+        batch_size = x.shape[0]
+        mask_shape = (batch_size, ) + (1,) * (x.ndim - 1)
+        mask = torch.bernoulli(torch.full(mask_shape, 1 - self.p, device=x.device))
+
+        return torch.where(mask == 1, x, self.null_embedding)
