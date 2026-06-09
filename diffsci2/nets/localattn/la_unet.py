@@ -175,7 +175,8 @@ class LAUNet(nn.Module):
         t: torch.Tensor,
         y: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        del y  # unconditional
+        if y is not None:
+            raise ValueError("y is not supported for LAUNet yet")
         cond = self.time_mlp(t)
         h = self.stem(x)
 

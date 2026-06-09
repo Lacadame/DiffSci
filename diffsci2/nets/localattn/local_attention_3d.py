@@ -128,7 +128,13 @@ class LocalSelfAttention3D(nn.Module):
 def modulate3d(
     x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor,
 ) -> torch.Tensor:
-    """``x * (1 + scale) + shift`` broadcast over D, H, W."""
+    """``x * (1 + scale) + shift`` broadcast over D, H, W.
+
+    This is feature-wise linear modulation (FiLM; Perez et al. 2018,
+    "FiLM: Visual Reasoning with a General Conditioning Layer", AAAI),
+    whose style-transfer ancestor is AdaIN (Huang & Belongie 2017) /
+    StyleGAN (Karras et al. 2019).
+    """
     return (
         x * (1.0 + scale[:, :, None, None, None])
         + shift[:, :, None, None, None]
@@ -136,12 +142,37 @@ def modulate3d(
 
 
 class AdaLN3D(nn.Module):
-    """3D analog of :class:`local_attention_2d.AdaLN`."""
+    """adaLN-Zero conditioning block — 3D analog of
+    :class:`local_attention_2d.AdaLN`.
+
+    Lineage:
+
+    - **Modulation** (shift + scale regressed from a conditioning
+      vector) is FiLM / AdaIN — see :func:`modulate3d`.
+    - The full **adaLN-Zero** recipe — regress *three* quantities
+      ``(shift, scale, gate)`` from the conditioning embedding and
+      zero-initialise the projection so the whole block is the identity
+      at step 0 — is from **DiT** (Peebles & Xie 2023, "Scalable
+      Diffusion Models with Transformers", ICCV, Sec. 3 / Fig. 3). The
+      ``gate`` (DiT's ``alpha``) scales the *residual-branch output*
+      (see :class:`LocalAttentionBlock3D`), not the input.
+    - The zero-initialised residual gate itself predates DiT: ReZero
+      (Bachlechner et al. 2020) and the "zero-init the last scale"
+      trick (Goyal et al. 2017). DiT fuses these with FiLM modulation.
+
+    Note: ``elementwise_affine=False`` — the LayerNorm carries no learned
+    gamma/beta because the affine is supplied by ``(shift, scale)``. The
+    norm runs over the channel axis, i.e. per-voxel across channels.
+    """
 
     def __init__(self, dim: int, cond_dim: int):
         super().__init__()
         self.norm = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         self.proj = nn.Linear(cond_dim, 3 * dim)
+        # adaLN-Zero: zero-init weight AND bias so proj(cond) == 0 for any
+        # cond at step 0 -> shift=scale=gate=0 -> the block is the identity
+        # (the attention/MLP branch is gated off; the residual passes
+        # through untouched). Training lifts the gate off zero.
         nn.init.zeros_(self.proj.weight)
         nn.init.zeros_(self.proj.bias)
 
@@ -172,7 +203,14 @@ class MLP3D(nn.Module):
 
 
 class LocalAttentionBlock3D(nn.Module):
-    """3D transformer block: adaLN-Zero, local-attn, adaLN-Zero, MLP."""
+    """3D transformer block: adaLN-Zero, local-attn, adaLN-Zero, MLP.
+
+    DiT block (Peebles & Xie 2023), conv-free 3D port. Each sub-layer is
+    ``x = x + gate * sublayer(modulate(norm(x), shift, scale))``. With the
+    adaLN-Zero init (see :class:`AdaLN3D`) ``gate == 0`` at step 0, so the
+    prior is literally "nothing happens" — the residual stream is the
+    identity and the network learns each branch's contribution from there.
+    """
 
     def __init__(
         self,
@@ -197,6 +235,9 @@ class LocalAttentionBlock3D(nn.Module):
         self.mlp = MLP3D(dim, mlp_ratio=mlp_ratio)
 
     def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        # h is modulate(norm(x)): at init shift=scale=0 so h == norm(x)
+        # (NOT zero) — the branch is silenced by the gate below, not by
+        # the modulation. gate==0 at init => x unchanged.
         h, gate_a = self.norm_attn(x, cond)
         x = x + gate_a[:, :, None, None, None] * self.attn(h)
         h, gate_m = self.norm_mlp(x, cond)

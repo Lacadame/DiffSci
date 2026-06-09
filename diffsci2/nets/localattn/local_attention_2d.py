@@ -301,6 +301,10 @@ def modulate(
     """``x * (1 + scale) + shift`` broadcast over the spatial axes.
 
     ``x``: [B, C, H, W]; ``shift``, ``scale``: [B, C].
+
+    Feature-wise linear modulation (FiLM; Perez et al. 2018), with
+    AdaIN (Huang & Belongie 2017) / StyleGAN (Karras et al. 2019) as its
+    style-transfer ancestor.
     """
     return x * (1.0 + scale[:, :, None, None]) + shift[:, :, None, None]
 
@@ -311,7 +315,14 @@ class AdaLN(nn.Module):
     LayerNorm over the channel axis of a [B, C, H, W] tensor, followed
     by a (shift, scale, gate) triple computed from a 1D conditioning
     embedding. The projection is zero-initialised so the block is the
-    identity at step zero (DiT recipe).
+    identity at step zero.
+
+    adaLN-Zero from DiT (Peebles & Xie 2023, "Scalable Diffusion Models
+    with Transformers", ICCV, Sec. 3 / Fig. 3): FiLM-style modulation
+    (shift, scale) plus a residual GATE, with the whole cond projection
+    zero-initialised. The zero-init residual gate predates DiT (ReZero,
+    Bachlechner et al. 2020; Goyal et al. 2017). See the 3D twin
+    :class:`local_attention_3d.AdaLN3D` for the fuller note.
     """
 
     def __init__(self, dim: int, cond_dim: int):

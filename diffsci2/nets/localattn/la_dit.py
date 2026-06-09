@@ -70,7 +70,8 @@ class LADit(nn.Module):
         t: torch.Tensor,
         y: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        del y
+        if y is not None:
+            raise ValueError("y is not supported for LADit yet")
         cond = self.time_mlp(t)
         h = self.stem(x)
         for blk in self.blocks:
