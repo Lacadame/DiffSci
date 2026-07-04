@@ -1,38 +1,13 @@
-"""
-FID colormap (Langevin-interval grid sweep) for CIFAR-10 unconditional diffusion
-using the NVIDIA EDM checkpoint via DiffSci.
-
-This script mirrors the structure of
-``scripts/testing/test-diffusion-mnist-colormap.py`` (which sweeps a grid of
-(s_min, s_max) Langevin intervals and stores the resulting FID values in a
-2-D colormap), but performs inference / FID computation in the same way as
-``scripts/testing/test-diffusion-cifar10-karras.py``:
-
-- CIFAR-10 (train + val) used as the real distribution
-- NVIDIA EDM 32x32 unconditional checkpoint loaded via a pickle URL
-- ``NullPreconditioner`` (the NVIDIA network already implements EDM preconditioning)
-- Model outputs in [-1, 1] are denormalised to [0, 1] before FID
-"""
-
 import os
-import sys
 import itertools
-import pickle
 import torch
 import numpy as np
 import torchvision
 import torchvision.transforms as transforms
-from torch import nn
 from torchmetrics.image import FrechetInceptionDistance
-from tqdm import tqdm
-
-# EDM repo for NVIDIA checkpoint loading (must be before importing diffsci if edm is needed)
-_EDM_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "external_repos", "edm")
-if os.path.isdir(_EDM_DIR):
-    sys.path.insert(0, os.path.abspath(_EDM_DIR))
-
-import diffsci.models
 from diffsci.models.karras.integrators import EulerIntegrator, EulerMaruyamaIntegrator
+import diffsci.models
+from tqdm import tqdm
 
 
 def custom_spacing(min_val, max_val, N, alpha):
@@ -47,89 +22,23 @@ def custom_spacing(min_val, max_val, N, alpha):
     return lin_space ** (1 / alpha)
 
 
-def _extract_edm_net_from_pickle(loaded_obj):
-    """Extract a torch.nn.Module from common EDM pickle formats."""
-    if isinstance(loaded_obj, nn.Module):
-        return loaded_obj
-
-    if isinstance(loaded_obj, dict):
-        # NVIDIA/EDM snapshots commonly store the model under "ema".
-        for key in ("ema", "net", "model", "G_ema"):
-            maybe_net = loaded_obj.get(key, None)
-            if isinstance(maybe_net, nn.Module):
-                return maybe_net
-
-    return None
-
-
-def load_nvidia_edm_cifar10(network_url_or_path, device):
-    """Load EDM CIFAR-10 network from URL/path and return torch module on device."""
-    import dnnlib
-
-    with dnnlib.util.open_url(network_url_or_path) as f:
-        loaded_obj = pickle.load(f)
-    net = _extract_edm_net_from_pickle(loaded_obj)
-    if net is not None:
-        return net.to(device)
-
-    # Optional local fallback: EDM training-state dumps (.pt/.pth) can store "net".
-    if os.path.isfile(network_url_or_path) and network_url_or_path.endswith((".pt", ".pth")):
-        loaded_obj = torch.load(network_url_or_path, map_location="cpu")
-        net = _extract_edm_net_from_pickle(loaded_obj)
-        if net is not None:
-            return net.to(device)
-
-    raise ValueError(
-        "Unsupported checkpoint format. Expected an EDM/NVIDIA pickle with a model "
-        "under one of keys {ema, net, model, G_ema}, or a raw torch.nn.Module."
-    )
-
-
-class NVIDIAWrapper(nn.Module):
-    """Wrap NVIDIA EDM net so DiffSci can call it with (x, sigma) and NullPreconditioner."""
-
-    def __init__(self, net):
-        super().__init__()
-        self.net = net
-
-    def forward(self, x, cond_noise, class_labels=None):
-        batch_size = x.shape[0]
-        if class_labels is None and getattr(self.net, "label_dim", 0) > 0:
-            class_labels = torch.zeros((batch_size, self.net.label_dim), device=x.device, dtype=x.dtype)
-        return self.net(x, cond_noise, class_labels)
-
-
-def denormalize_for_fid(img_tensor):
-    """Map model output [-1, 1] to [0, 1] for FID (then to uint8 in prepare_for_fid)."""
-    img = (img_tensor + 1) / 2
-    return img.clamp(0, 1)
-
-
-def prepare_for_fid(images_tensor):
-    """Convert [0, 1] float tensor (B, C, H, W) to uint8 for FrechetInceptionDistance."""
-    if images_tensor.shape[1] == 1:
-        images_tensor = images_tensor.repeat(1, 3, 1, 1)
-    return (images_tensor.clamp(0, 1) * 255).to(dtype=torch.uint8)
-
-
-def main(
-    output_dir,
-    n_samples=10000,
-    device_id=7,
-    batch_size=500,
-    gamma=1.0,
-    seed=42,
-    model_name='nvidia-edm-cifar10',
-    nsteps=200,
-    max_scale=80,
-    initial_time=1.0,
-    tmin=1e-3,
-    ngrid=10,
-    alpha=0.1,
-    interval_grid=None,
-    image_size=32,
-    network_url="https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-cifar10-32x32-uncond-vp.pkl",
-):
+def main(checkpoint_path,
+         model_channels,
+         n_samples=10000,
+         device_id=7,
+         batch_size=1000,
+         gamma=1.0,
+         seed=42,
+         only_validation=False,
+         model_name='model',
+         nsteps=200,
+         max_scale=80,
+         initial_time=1.0,
+         tmin=1e-3,
+         ngrid=10,
+         alpha=0.1,
+         interval_grid=None,
+         save_samples=True):
     # 0. Setup Device
     device = f"cuda:{device_id}" if torch.cuda.is_available() else "cpu"
     print(f"Running on {device} with {n_samples} samples (Batch size: {batch_size})")
@@ -137,13 +46,22 @@ def main(
     torch.manual_seed(seed)
     np.random.seed(seed)
 
-    # 1. Load NVIDIA EDM and build DiffSci module
-    print("Loading NVIDIA EDM CIFAR-10 model...")
-    net = load_nvidia_edm_cifar10(network_url, device)
-    adapter = NVIDIAWrapper(net)
+    # 1. Load Real Data (Validation or All)
+    transform = transforms.Compose([transforms.ToTensor()])
+    val_dataset = torchvision.datasets.MNIST(root='./data', train=False, download=True, transform=transform)
+    if not only_validation:
+        train_dataset = torchvision.datasets.MNIST(root='./data', train=True, download=True, transform=transform)
+        val_dataset = torch.utils.data.ConcatDataset([val_dataset, train_dataset])
+
+    real_loader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
+
+    # 2. Setup Model
+    modelconfig = diffsci.models.PUNetGConfig(model_channels=model_channels)
+    model = diffsci.models.PUNetG(modelconfig)
     moduleconfig = diffsci.models.KarrasModuleConfig.from_edm()
-    moduleconfig.preconditioner = diffsci.models.karras.preconditioners.NullPreconditioner()
-    module = diffsci.models.KarrasModule(adapter, moduleconfig, conditional=False)
+
+    module = diffsci.models.KarrasModule.load_from_checkpoint(
+        checkpoint_path, model=model, config=moduleconfig, conditional=False, map_location=device)
     module = module.to(device)
     module.eval()
 
@@ -151,15 +69,11 @@ def main(
     module.config.noisescheduler.maximum_scale = max_scale
     print(module.config.noisescheduler.maximum_scale)
 
-    # 2. Load Real Data (CIFAR-10 train + val)
-    transform = transforms.Compose([transforms.ToTensor()])
-    train_dataset = torchvision.datasets.CIFAR10(root="./data", train=True, download=True, transform=transform)
-    val_dataset = torchvision.datasets.CIFAR10(root="./data", train=False, download=True, transform=transform)
-    full_dataset = torch.utils.data.ConcatDataset([train_dataset, val_dataset])
-    real_loader = torch.utils.data.DataLoader(full_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
-
-    shape = [3, image_size, image_size]
-    num_batches = (n_samples + batch_size - 1) // batch_size
+    # Helper: Prepare for FID
+    def prepare_for_fid(images_tensor):
+        if images_tensor.shape[1] == 1:
+            images_tensor = images_tensor.repeat(1, 3, 1, 1)
+        return (images_tensor.clamp(0, 1) * 255).to(dtype=torch.uint8)
 
     # Initialize Metrics
     fid_ode = FrechetInceptionDistance(normalize=False).to(device)
@@ -180,18 +94,20 @@ def main(
     ode_integrator = EulerIntegrator()
     ode_samples_all = []
 
+    num_batches = (n_samples + batch_size - 1) // batch_size
+
     with torch.no_grad():
         for i in tqdm(range(num_batches)):
             curr_batch = min(batch_size, n_samples - (i * batch_size))
             gen_batch = module.sample(
                 nsamples=curr_batch,
-                shape=shape,
+                shape=[1, 28, 28],
                 nsteps=nsteps,
                 integrator=ode_integrator,
             )
-            gen_batch = denormalize_for_fid(gen_batch)
             fid_ode.update(prepare_for_fid(gen_batch), real=False)
-            ode_samples_all.append(gen_batch.cpu().numpy())
+            if save_samples:
+                ode_samples_all.append(gen_batch.cpu().numpy())
 
     fid_score_ode = fid_ode.compute().item()
     print(f"ODE FID: {fid_score_ode}")
@@ -250,11 +166,10 @@ def main(
                 curr_batch = min(batch_size, n_samples - (i * batch_size))
                 gen_batch = module.sample(
                     nsamples=curr_batch,
-                    shape=shape,
+                    shape=[1, 28, 28],
                     nsteps=nsteps,
                     integrator=sde_integrator,
                 )
-                gen_batch = denormalize_for_fid(gen_batch)
                 fid_sde.update(prepare_for_fid(gen_batch), real=False)
 
         score = fid_sde.compute().item()
@@ -264,14 +179,17 @@ def main(
     fid_grid = fid_values.reshape(ngrid, ngrid)
 
     # --- STEP 6: Save ---
+    checkpoint_dir = os.path.dirname(checkpoint_path)
+    checkpoint_dir = os.path.dirname(checkpoint_dir)
     output_dir = os.path.join(
-        output_dir,
-        f"fid_colormap_{n_samples}_samples_seed_{seed}_{model_name}_g={gamma}")
+        checkpoint_dir,
+        f"stats/fid_colormap_{n_samples}_samples_seed_{seed}_{model_name}_g={gamma}")
     os.makedirs(output_dir, exist_ok=True)
 
-    np.save(os.path.join(output_dir, "real_samples.npy"), real_samples_concat[:10])
-    np.save(os.path.join(output_dir, "gen_ode_samples.npy"),
-            np.concatenate(ode_samples_all, axis=0)[:10])
+    if save_samples:
+        np.save(os.path.join(output_dir, "real_samples.npy"), real_samples_concat[:10])
+        np.save(os.path.join(output_dir, "gen_ode_samples.npy"),
+                np.concatenate(ode_samples_all, axis=0)[:10])
 
     filename = (
         f"fid_grid-g={gamma}.pt")
@@ -290,7 +208,6 @@ def main(
         "max_scale": max_scale,
         "n_samples": n_samples,
         "seed": seed,
-        "network_url": network_url,
     }
     save_path = os.path.join(output_dir, filename)
     torch.save(save_obj, save_path)
@@ -300,7 +217,6 @@ def main(
         f.write(f"FID Score (ODE): {fid_score_ode}\n")
         f.write(f"gamma: {gamma}\n")
         f.write(f"initial_time: {initial_time}, tmin: {tmin}, ngrid: {ngrid}, alpha: {alpha}\n")
-        f.write(f"network_url: {network_url}\n")
         f.write("FID grid (ngrid x ngrid, rows=smin, cols=smax, NaN where smin >= smax):\n")
         f.write(f"{fid_grid}\n")
 
@@ -308,20 +224,19 @@ def main(
 
 
 if __name__ == "__main__":
-    main(
-        output_dir="/home/ubuntu/repos/DiffSci/notebooks/exploratory/bps/karras_cifar10_vp_stats",
-        n_samples=10000,
-        nsteps=1000,
-        device_id=6,
-        batch_size=500,
-        gamma=5.0,
-        seed=45,
-        max_scale=80,
-        initial_time=1.0,
-        tmin=1e-3,
-        ngrid=10,
-        alpha=0.1,
-        model_name='nvidia-vp-nsteps=1000-manual_grid',
-        interval_grid=[0.001, 0.003, 0.01, 0.03, 0.1, 0.3, 1.0, 3.0, 10.0, 30.0],
-        network_url="https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/baseline/baseline-cifar10-32x32-uncond-vp.pkl",
-    )
+    main(checkpoint_path="/home/ubuntu/repos/DiffSci/savedmodels/production/20260318-bps-mnist-128ch/checkpoints/model-epoch=019-val_loss=0.044191.ckpt",
+         model_channels=128,
+         n_samples=10000,
+         nsteps=500,
+         device_id=1,
+         batch_size=500,
+         gamma=1.0,
+         seed=45,
+         max_scale=80,
+         initial_time=1.0,
+         tmin=1e-3,
+         ngrid=10,
+         alpha=0.1,
+         save_samples=False,
+         model_name='nsteps=500-epoch=19-manual_grid',
+         interval_grid=[0.001, 0.003, 0.01, 0.03, 0.1, 0.3, 1.0, 3.0, 10.0, 30.0])

@@ -1,0 +1,39 @@
+Epoch 99
+Checkpoint: /home/ubuntu/repos/DiffSci/savedmodels/experimental/20260611-bps-mnist-128ch-120samples/checkpoints/model-epoch=099-val_loss=0.076399.ckpt
+FID Score (ODE): 107.901237
+FID Score (SDE, gamma=0.01): 114.846802
+FID Score (SDE, gamma=0.1): 119.273598
+FID Score (SDE, gamma=0.3): 127.360443
+FID Score (SDE, gamma=0.5): 118.853920
+FID Score (SDE, gamma=1.0): 80.079941
+FID Score (SDE, gamma=2.0): 52.179813
+FID Score (SDE, gamma=3.0): 44.694283
+FID Score (SDE, gamma=5.0): 44.630146
+FID Score (SDE, gamma=8.0): 46.869427
+
+Epoch 199
+Checkpoint: /home/ubuntu/repos/DiffSci/savedmodels/experimental/20260611-bps-mnist-128ch-120samples/checkpoints/model-epoch=199-val_loss=0.092190.ckpt
+FID Score (ODE): 46.355637
+FID Score (SDE, gamma=0.01): 47.785191
+FID Score (SDE, gamma=0.1): 52.429699
+FID Score (SDE, gamma=0.3): 63.919327
+FID Score (SDE, gamma=0.5): 64.534744
+FID Score (SDE, gamma=1.0): 59.512592
+FID Score (SDE, gamma=2.0): 66.875351
+FID Score (SDE, gamma=3.0): 72.189339
+FID Score (SDE, gamma=5.0): 87.426582
+FID Score (SDE, gamma=8.0): 111.182007
+
+Epoch 499
+Checkpoint: /home/ubuntu/repos/DiffSci/savedmodels/experimental/20260611-bps-mnist-128ch-120samples/checkpoints/model-epoch=499-val_loss=0.155855.ckpt
+FID Score (ODE): 60.378769
+FID Score (SDE, gamma=0.01): 57.425529
+FID Score (SDE, gamma=0.1): 61.938126
+FID Score (SDE, gamma=0.3): 62.907539
+FID Score (SDE, gamma=0.5): 55.209339
+FID Score (SDE, gamma=1.0): 40.171307
+FID Score (SDE, gamma=2.0): 45.101017
+FID Score (SDE, gamma=3.0): 46.217751
+FID Score (SDE, gamma=5.0): 48.767895
+FID Score (SDE, gamma=8.0): 56.141731
+

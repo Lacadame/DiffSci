@@ -37,7 +37,8 @@ def main(checkpoint_path,
          tmin=1e-3,
          ngrid=10,
          alpha=0.1,
-         interval_grid=None):
+         interval_grid=None,
+         save_samples=True):
     # 0. Setup Device
     device = f"cuda:{device_id}" if torch.cuda.is_available() else "cpu"
     print(f"Running on {device} with {n_samples} samples (Batch size: {batch_size})")
@@ -59,7 +60,8 @@ def main(checkpoint_path,
     model = diffsci.models.PUNetG(modelconfig)
     moduleconfig = diffsci.models.KarrasModuleConfig.from_edm()
 
-    module = diffsci.models.KarrasModule.load_from_checkpoint(checkpoint_path, model=model, config=moduleconfig, conditional=False)
+    module = diffsci.models.KarrasModule.load_from_checkpoint(
+        checkpoint_path, model=model, config=moduleconfig, conditional=False, map_location=device)
     module = module.to(device)
     module.eval()
 
@@ -104,7 +106,8 @@ def main(checkpoint_path,
                 integrator=ode_integrator,
             )
             fid_ode.update(prepare_for_fid(gen_batch), real=False)
-            ode_samples_all.append(gen_batch.cpu().numpy())
+            if save_samples:
+                ode_samples_all.append(gen_batch.cpu().numpy())
 
     fid_score_ode = fid_ode.compute().item()
     print(f"ODE FID: {fid_score_ode}")
@@ -183,9 +186,10 @@ def main(checkpoint_path,
         f"stats/fid_colormap_{n_samples}_samples_seed_{seed}_{model_name}_g={gamma}")
     os.makedirs(output_dir, exist_ok=True)
 
-    np.save(os.path.join(output_dir, "real_samples.npy"), real_samples_concat[:10])
-    np.save(os.path.join(output_dir, "gen_ode_samples.npy"),
-            np.concatenate(ode_samples_all, axis=0)[:10])
+    if save_samples:
+        np.save(os.path.join(output_dir, "real_samples.npy"), real_samples_concat[:10])
+        np.save(os.path.join(output_dir, "gen_ode_samples.npy"),
+                np.concatenate(ode_samples_all, axis=0)[:10])
 
     filename = (
         f"fid_grid-g={gamma}.pt")
@@ -224,14 +228,15 @@ if __name__ == "__main__":
          model_channels=128,
          n_samples=10000,
          nsteps=500,
-         device_id=6,
+         device_id=5,
          batch_size=500,
-         gamma=5.0,
+         gamma=1.0,
          seed=45,
          max_scale=80,
          initial_time=1.0,
          tmin=1e-3,
          ngrid=10,
          alpha=0.1,
+         save_samples=False,
          model_name='nsteps=500-epoch=39-manual_grid',
          interval_grid=[0.001, 0.003, 0.01, 0.03, 0.1, 0.3, 1.0, 3.0, 10.0, 30.0])

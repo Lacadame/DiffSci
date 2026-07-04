@@ -28,14 +28,14 @@ def main():
     np.random.seed(0)
 
     # Set parameters
-    device_id = 7
+    device_id = 1
     batch_size = 32
     model_channels = 128
     n_epochs = 500
     every_n_epochs = 100
     learning_rate = 1e-4
-    n_tsamples = 20  # Number of training samples to use; set to None to use the full dataset
-    checkpoint_dir = f"/home/ubuntu/repos/DiffSci/savedmodels/experimental/20260428-bps-mnist-128ch-20samples"
+    n_tsamples = None  # Number of training samples to use; set to None to use the full dataset
+    checkpoint_dir = f"/home/ubuntu/repos/DiffSci/savedmodels/experimental/20260428-bps-mnist-128ch"
 
     # Load MNIST datasets
     transform = transforms.Compose([transforms.ToTensor()])

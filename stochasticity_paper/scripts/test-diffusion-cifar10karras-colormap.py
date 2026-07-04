@@ -1,14 +1,22 @@
 """
-FID computation for CIFAR-10 unconditional diffusion (NVIDIA EDM via DiffSci).
+FID colormap (Langevin-interval grid sweep) for CIFAR-10 unconditional diffusion
+using the NVIDIA EDM checkpoint via DiffSci.
 
-Structure mirrors scripts/testing/test-diffusion-mnist.py but uses:
-- CIFAR-10 validation set and NVIDIA EDM 32x32 unconditional checkpoint
-- Batched generation and FID updates to control memory
-- ODE and SDE (multiple gamma) FID scores
+This script mirrors the structure of
+``scripts/testing/test-diffusion-mnist-colormap.py`` (which sweeps a grid of
+(s_min, s_max) Langevin intervals and stores the resulting FID values in a
+2-D colormap), but performs inference / FID computation in the same way as
+``scripts/testing/test-diffusion-cifar10-karras.py``:
+
+- CIFAR-10 (train + val) used as the real distribution
+- NVIDIA EDM 32x32 unconditional checkpoint loaded via a pickle URL
+- ``NullPreconditioner`` (the NVIDIA network already implements EDM preconditioning)
+- Model outputs in [-1, 1] are denormalised to [0, 1] before FID
 """
 
 import os
 import sys
+import itertools
 import pickle
 import torch
 import numpy as np
@@ -25,6 +33,18 @@ if os.path.isdir(_EDM_DIR):
 
 import diffsci.models
 from diffsci.models.karras.integrators import EulerIntegrator, EulerMaruyamaIntegrator
+
+
+def custom_spacing(min_val, max_val, N, alpha):
+    """Power-law spaced points between ``min_val`` and ``max_val``.
+
+    Mirrors the helper used in
+    ``notebooks/exploratory/bps/046-bps-entropy_paper-investigating_scores.ipynb``.
+    """
+    min_alpha = min_val ** alpha
+    max_alpha = max_val ** alpha
+    lin_space = torch.linspace(min_alpha, max_alpha, N)
+    return lin_space ** (1 / alpha)
 
 
 def _extract_edm_net_from_pickle(loaded_obj):
@@ -46,7 +66,6 @@ def load_nvidia_edm_cifar10(network_url_or_path, device):
     """Load EDM CIFAR-10 network from URL/path and return torch module on device."""
     import dnnlib
 
-    # Primary path: .pkl snapshots (NVIDIA public checkpoints and EDM training snapshots).
     with dnnlib.util.open_url(network_url_or_path) as f:
         loaded_obj = pickle.load(f)
     net = _extract_edm_net_from_pickle(loaded_obj)
@@ -88,23 +107,32 @@ def denormalize_for_fid(img_tensor):
 
 def prepare_for_fid(images_tensor):
     """Convert [0, 1] float tensor (B, C, H, W) to uint8 for FrechetInceptionDistance."""
+    if images_tensor.shape[1] == 1:
+        images_tensor = images_tensor.repeat(1, 3, 1, 1)
     return (images_tensor.clamp(0, 1) * 255).to(dtype=torch.uint8)
 
 
 def main(
-    n_samples=1000,
+    output_dir,
+    n_samples=10000,
     device_id=7,
-    batch_size=100,
-    gamma_list=(0.3, 1.0, 2.0, 5.0),
+    batch_size=500,
+    gamma=1.0,
     seed=42,
-    nsteps=256,
+    model_name='nvidia-edm-cifar10',
+    nsteps=200,
+    max_scale=80,
+    initial_time=1.0,
+    tmin=1e-3,
+    ngrid=10,
+    alpha=0.1,
+    interval_grid=None,
     image_size=32,
     network_url="https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-cifar10-32x32-uncond-vp.pkl",
-    output_dir=None,
-    epoch=None,
 ):
+    # 0. Setup Device
     device = f"cuda:{device_id}" if torch.cuda.is_available() else "cpu"
-    print(f"Running on {device} with {n_samples} samples (batch_size={batch_size}, nsteps={nsteps})")
+    print(f"Running on {device} with {n_samples} samples (Batch size: {batch_size})")
 
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -119,7 +147,11 @@ def main(
     module = module.to(device)
     module.eval()
 
-    # 2. Load real data (CIFAR-10 all images)
+    print(module.config.noisescheduler.maximum_scale)
+    module.config.noisescheduler.maximum_scale = max_scale
+    print(module.config.noisescheduler.maximum_scale)
+
+    # 2. Load Real Data (CIFAR-10 train + val)
     transform = transforms.Compose([transforms.ToTensor()])
     train_dataset = torchvision.datasets.CIFAR10(root="./data", train=True, download=True, transform=transform)
     val_dataset = torchvision.datasets.CIFAR10(root="./data", train=False, download=True, transform=transform)
@@ -129,23 +161,28 @@ def main(
     shape = [3, image_size, image_size]
     num_batches = (n_samples + batch_size - 1) // batch_size
 
-    # 3. Process real images and update FID
+    # Initialize Metrics
     fid_ode = FrechetInceptionDistance(normalize=False).to(device)
-    real_samples_all = []
+
+    # --- STEP 3: Process REAL Images in Batches ---
     print("Processing real images...")
+    real_samples_all = []  # Keep light CPU copy for re-feeding FID per interval
+
     for batch, _ in tqdm(real_loader):
         batch = batch.to(device)
         fid_ode.update(prepare_for_fid(batch), real=True)
         real_samples_all.append(batch.cpu().numpy())
+
     real_samples_concat = np.concatenate(real_samples_all, axis=0)
 
-    # 4. Generate ODE samples in batches
+    # --- STEP 4: Generate & Process ODE Samples (used as diagonal of FID grid) ---
+    print("Generating ODE samples...")
     ode_integrator = EulerIntegrator()
     ode_samples_all = []
-    print("Generating ODE samples...")
+
     with torch.no_grad():
         for i in tqdm(range(num_batches)):
-            curr_batch = min(batch_size, n_samples - i * batch_size)
+            curr_batch = min(batch_size, n_samples - (i * batch_size))
             gen_batch = module.sample(
                 nsamples=curr_batch,
                 shape=shape,
@@ -155,24 +192,62 @@ def main(
             gen_batch = denormalize_for_fid(gen_batch)
             fid_ode.update(prepare_for_fid(gen_batch), real=False)
             ode_samples_all.append(gen_batch.cpu().numpy())
-    fid_score_ode = fid_ode.compute().item()
-    print(f"ODE FID: {fid_score_ode:.4f}")
 
-    # 5. SDE loop (per gamma)
+    fid_score_ode = fid_ode.compute().item()
+    print(f"ODE FID: {fid_score_ode}")
+
+    # --- STEP 5: Build interval grid and compute SDE FID per interval ---
+    if interval_grid is None:
+        S_values = custom_spacing(tmin, initial_time, ngrid, alpha=alpha)
+        S_values_list = [float(v) for v in S_values]
+        interval_grid = list(itertools.product(S_values_list, S_values_list))
+        manual_grid = False
+    elif len(interval_grid) == ngrid:
+        # User supplied a 1D discretization of the time interval; expand it to
+        # the (S_min, S_max) product version.
+        S_values = torch.as_tensor([float(v) for v in interval_grid])
+        S_values_list = S_values.tolist()
+        interval_grid = list(itertools.product(S_values_list, S_values_list))
+        manual_grid = True
+    elif len(interval_grid) == ngrid * ngrid:
+        # User supplied the full product grid directly.
+        S_values = None
+        manual_grid = True
+        interval_grid = [(float(a), float(b)) for a, b in interval_grid]
+    else:
+        raise ValueError(
+            f"interval_grid has {len(interval_grid)} entries, expected either "
+            f"{ngrid} (1D discretization) or {ngrid * ngrid} (full product grid)")
+
+    print(f"Interval grid built with {len(interval_grid)} entries (ngrid={ngrid}, "
+          f"manual={manual_grid})")
+
     sde_integrator = EulerMaruyamaIntegrator()
-    sde_results = []
-    for gamma in gamma_list:
-        print(f"Processing SDE (gamma={gamma})...")
-        module.config.noisescheduler.langevin_const = gamma
+    module.config.noisescheduler.langevin_const = gamma
+
+    fid_values = torch.full((ngrid * ngrid,), float('nan'), dtype=torch.float64)
+
+    for idx, (smin, smax) in enumerate(interval_grid):
+        if smin >= smax:
+            # Lower-triangle / diagonal entries are not run; left as NaN.
+            # The plotting helper replaces the diagonal NaNs with the ODE FID.
+            continue
+
+        print(f"[{idx + 1}/{len(interval_grid)}] interval=[{smin:.5f}, {smax:.5f}]")
+        module.config.noisescheduler.langevin_interval = [smin, smax]
+
+        # New FID instance for this interval
         fid_sde = FrechetInceptionDistance(normalize=False).to(device)
+
+        # Re-feed real stats from cached numpy array
         for i in range(0, len(real_samples_concat), batch_size):
             batch_real_np = real_samples_concat[i:i + batch_size]
             batch_real_torch = torch.from_numpy(batch_real_np).to(device)
             fid_sde.update(prepare_for_fid(batch_real_torch), real=True)
-        sde_samples_this_gamma = []
+
         with torch.no_grad():
             for i in tqdm(range(num_batches), leave=False):
-                curr_batch = min(batch_size, n_samples - i * batch_size)
+                curr_batch = min(batch_size, n_samples - (i * batch_size))
                 gen_batch = module.sample(
                     nsamples=curr_batch,
                     shape=shape,
@@ -181,33 +256,72 @@ def main(
                 )
                 gen_batch = denormalize_for_fid(gen_batch)
                 fid_sde.update(prepare_for_fid(gen_batch), real=False)
-                sde_samples_this_gamma.append(gen_batch.cpu().numpy())
-        score = fid_sde.compute().item()
-        sde_results.append((gamma, score, np.concatenate(sde_samples_this_gamma, axis=0)))
-        print(f"SDE (gamma={gamma}) FID: {score:.4f}")
 
-    # 6. Save 10 samples from each configuration
-    if output_dir is None:
-        output_dir = f"/home/ubuntu/repos/DiffSci/savedmodels/experimental/20260323-bps-karras-cifar10/stats/fid_results_{n_samples}_samples_seed_{seed}_nsteps_{nsteps}_epoch_{epoch}"
+        score = fid_sde.compute().item()
+        fid_values[idx] = score
+        print(f"  -> SDE FID = {score:.4f}")
+
+    fid_grid = fid_values.reshape(ngrid, ngrid)
+
+    # --- STEP 6: Save ---
+    output_dir = os.path.join(
+        output_dir,
+        f"fid_colormap_{n_samples}_samples_seed_{seed}_{model_name}_g={gamma}")
     os.makedirs(output_dir, exist_ok=True)
+
     np.save(os.path.join(output_dir, "real_samples.npy"), real_samples_concat[:10])
-    np.save(os.path.join(output_dir, "gen_ode_samples.npy"), np.concatenate(ode_samples_all, axis=0)[:10])
+    np.save(os.path.join(output_dir, "gen_ode_samples.npy"),
+            np.concatenate(ode_samples_all, axis=0)[:10])
+
+    filename = (
+        f"fid_grid-g={gamma}.pt")
+    save_obj = {
+        "fid_grid": fid_grid,
+        "fid_ode": fid_score_ode,
+        "interval_grid": interval_grid,
+        "manual_grid": manual_grid,
+        "S_values": S_values,  # None if interval_grid was passed in manually
+        "gamma": gamma,
+        "initial_time": initial_time,
+        "tmin": tmin,
+        "ngrid": ngrid,
+        "alpha": alpha,
+        "nsteps": nsteps,
+        "max_scale": max_scale,
+        "n_samples": n_samples,
+        "seed": seed,
+        "network_url": network_url,
+    }
+    save_path = os.path.join(output_dir, filename)
+    torch.save(save_obj, save_path)
+    print(f"Saved FID grid to {save_path}")
+
     with open(os.path.join(output_dir, "fid_scores.txt"), "w") as f:
-        f.write(f"FID Score (ODE): {fid_score_ode:.4f}\n")
-        for gamma, score, samples in sde_results:
-            np.save(os.path.join(output_dir, f"gen_sde_samples_gamma_{gamma}.npy"), samples[:10])
-            f.write(f"FID Score (SDE, γ={gamma}): {score:.4f}\n")
-    print(f"Results saved to {output_dir}")
+        f.write(f"FID Score (ODE): {fid_score_ode}\n")
+        f.write(f"gamma: {gamma}\n")
+        f.write(f"initial_time: {initial_time}, tmin: {tmin}, ngrid: {ngrid}, alpha: {alpha}\n")
+        f.write(f"network_url: {network_url}\n")
+        f.write("FID grid (ngrid x ngrid, rows=smin, cols=smax, NaN where smin >= smax):\n")
+        f.write(f"{fid_grid}\n")
+
+    return fid_grid, fid_score_ode
 
 
 if __name__ == "__main__":
     main(
+        output_dir="/home/ubuntu/repos/DiffSci/notebooks/exploratory/bps/karras_cifar10_edm_stats",
         n_samples=10000,
-        device_id=7,
+        nsteps=1000,
+        device_id=6,
         batch_size=500,
-        gamma_list=[0.05, 0.2, 0.5, 1.0, 2.0, 5.0],
-        seed=42,
-        nsteps=256,
-        network_url="/home/ubuntu/repos/DiffSci/savedmodels/experimental/20260323-bps-karras-cifar10/checkpoints/network-snapshot-008000.pkl",
-        epoch=8
+        gamma=5.0,
+        seed=45,
+        max_scale=80,
+        initial_time=1.0,
+        tmin=1e-3,
+        ngrid=10,
+        alpha=0.1,
+        model_name='nvidia-edm-nsteps=1000-manual_grid',
+        interval_grid=[0.001, 0.003, 0.01, 0.03, 0.1, 0.3, 1.0, 3.0, 10.0, 30.0],
+        network_url="https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-cifar10-32x32-uncond-vp.pkl",
     )
