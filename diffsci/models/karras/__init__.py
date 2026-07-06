@@ -31,3 +31,4 @@ from .callbacks import (ScheduleFreeCallback,
 from .flowfield import (SIModule,
                         SIModuleConfig)
 from .autoregressivesample import (LatentSpaceAutoregressive)
+from .ema import (ModelEMA)

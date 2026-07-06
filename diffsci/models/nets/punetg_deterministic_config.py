@@ -4,12 +4,12 @@ import pathlib
 import yaml
 
 
-class PUNetGForecastConfig(object):
+class PUNetGDeterministicConfig(object):
     """
-    Configuration class for the forecast version of PUNetG.
+    Configuration class for the deterministic version of PUNetG.
     
     This config is identical to PUNetGConfig but removes the time_projection_scale parameter
-    since time embeddings are not used in the forecast model (no diffusion process).
+    since time embeddings are not used in the deterministic model (no diffusion process).
     """
     def __init__(self,
                  input_channels: int = 1,

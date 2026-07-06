@@ -89,6 +89,7 @@ saveddata/processed/*
 saveddata/raw/*
 saveddata/savedsamples/*
 saveddata/MNIST/*
+scripts/testing/data/*
 
 # output data
 outputdata/*

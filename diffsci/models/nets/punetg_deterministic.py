@@ -4,24 +4,24 @@ import torch
 
 from . import commonlayers
 from . import normedlayers
-from .punetg_forecast_config import PUNetGForecastConfig
+from .punetg_deterministic_config import PUNetGDeterministicConfig
 
 
-class PUNetGForecast(torch.nn.Module):
+class PUNetGDeterministic(torch.nn.Module):
 
     """
-    PUNetGForecast is a UNet-style model for deterministic ocean forecasting tasks.
+    PUNetGDeterministic is a UNet-style model for ocean prediction tasks.
 
     This model uses convolutional layers, downward and upward UNet blocks for feature extraction
     and reconstruction. Unlike the diffusion-based PUNetG, this version does not use time embeddings
-    and is designed for direct prediction tasks in ocean forecasting.
+    and is designed for direct prediction tasks in ocean prediction.
     
     It includes attention-based blocks at the bottleneck for enhanced modeling capacity and can
     optionally use conditional embeddings for guided predictions.
 
     Parameters
     ----------
-    config : PUNetGForecastConfig
+    config : PUNetGDeterministicConfig
         Configuration object that contains hyperparameters and settings for the model,
         including the number of model channels, dropout rates, etc.
 
@@ -33,7 +33,7 @@ class PUNetGForecast(torch.nn.Module):
 
     Attributes
     ----------
-    config : PUNetGForecastConfig
+    config : PUNetGDeterministicConfig
         Stores the configuration object used to initialize the model.
 
     conditional_embedding : torch.nn.Module or None
@@ -76,7 +76,7 @@ class PUNetGForecast(torch.nn.Module):
 
     """
     def __init__(self,
-                 config: PUNetGForecastConfig,
+                 config: PUNetGDeterministicConfig,
                  conditional_embedding: torch.nn.Module | None = None,
                  extra_residual: torch.nn.Module | None = None):
 
@@ -446,10 +446,10 @@ class PUNetGForecast(torch.nn.Module):
 
     def forward(self, x, y=None):
         """
-        Forward pass of the forecast model.
+        Forward pass of the deterministic model.
         
         Unlike the diffusion-based version, this model does not take a time parameter 't'.
-        It is designed for direct deterministic forecasting.
+        It is designed for direct deterministic prediction.
         
         Parameters
         ----------
@@ -510,7 +510,7 @@ class PUNetGForecast(torch.nn.Module):
 
     def calculate_receptive_field(self) -> dict:
         """
-        Calculate the theoretical receptive field (RF) of the PUNetGForecast model.
+        Calculate the theoretical receptive field (RF) of the PUNetGDeterministic model.
 
         The receptive field is the region of input space that influences a single
         output pixel. For UNet architectures, we must trace through all conv operations
@@ -680,18 +680,18 @@ class PUNetGForecast(torch.nn.Module):
         }
 
 
-class PUNetGForecastCond(PUNetGForecast):
+class PUNetGDeterministicCond(PUNetGDeterministic):
 
     """
-    PUNetGForecastCond is a UNet-style model for conditional ocean forecasting tasks.
+    PUNetGDeterministicCond is a UNet-style model for conditional ocean prediction tasks.
 
-    This model extends PUNetGForecast by adding support for channel-wise conditional inputs.
-    Like the base forecast model, it does not use time embeddings and is designed for direct
+    This model extends PUNetGDeterministic by adding support for channel-wise conditional inputs.
+    Like the base deterministic model, it does not use time embeddings and is designed for direct
     deterministic prediction with additional conditional channels.
 
     Parameters
     ----------
-    config : PUNetGForecastConfig
+    config : PUNetGDeterministicConfig
         Configuration object that contains hyperparameters and settings for the model,
         including the number of model channels, dropout rates, etc.
 
@@ -714,7 +714,7 @@ class PUNetGForecastCond(PUNetGForecast):
         that should be added as input channels.
     """
     def __init__(self,
-                 config: PUNetGForecastConfig,
+                 config: PUNetGDeterministicConfig,
                  conditional_embedding: torch.nn.Module | None = None,
                  channel_conditional_items: list[str] | None = False,
                  extra_residual: torch.nn.Module | None = None):
@@ -728,7 +728,7 @@ class PUNetGForecastCond(PUNetGForecast):
 
     def forward(self, x, y=None):
         """
-        Forward pass of the conditional forecast model.
+        Forward pass of the conditional deterministic model.
         
         Parameters
         ----------

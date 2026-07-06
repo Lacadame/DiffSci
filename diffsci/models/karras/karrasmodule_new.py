@@ -1,3 +1,6 @@
+import math
+from contextlib import contextmanager
+from fnmatch import fnmatchcase
 from typing import Callable, Any
 
 import torch
@@ -18,6 +21,8 @@ from . import schedulers
 from . import edmbatchnorm
 from . import integrators
 from .autoregressivesample import LatentSpaceAutoregressive
+from .autoregressiveloss import AutoregressiveLossMixin
+from .ema import ModelEMA
 
 Scaler = Callable[[Float[Tensor, '*shape']],  # noqa: F821
                   Float[Tensor, '*shape']]  # noqa: F821
@@ -37,6 +42,29 @@ class EnsembleKarrasModuleConfig(object):
                  ensemble_size_train: int = 1,
                  ensemble_size_val: int = 1,
                  ensemble_size_test: int = 1,
+                 autoregressive_loss_steps: int = 1,
+                 autoregressive_loss_diffusion_steps: int = 100,
+                 autoregressive_loss_guidance: float = 1.0,
+                 autoregressive_loss_weights: None | list[float] = None,
+                 autoregressive_loss_maximum_batch_size: None | int = None,
+                 autoregressive_loss_integrator: None | str | integrators.Integrator = None,
+                 ema_enabled: bool = False,
+                 ema_type: str = "traditional",
+                 ema_decay: float = 0.999,
+                 ema_halflife_steps: None | float = None,
+                 ema_rampup_ratio: None | float = None,
+                 ema_power_function_stds: None | list[float] = None,
+                 ema_use_for_validation: bool = True,
+                 ema_use_for_sampling: bool = True,
+                 ema_device: None | str = None,
+                 ema_profile_index: int = 0,
+                 freeze_layer_patterns: None | str | list[str] = None,
+                 freeze_layer_strict: bool = True,
+                 replay_enabled: bool = False,
+                 replay_loss_weight: float = 0.1,
+                 replay_loss_schedule: None | dict[str, Any] = None,
+                 replay_validation_enabled: bool = False,
+                 pretrained_weight_regularization: None | dict[str, Any] = None,
                  # Legacy parameters for backward compatibility
                  spatial_shape: tuple = None,
                  focus_radius: float = None):
@@ -56,6 +84,43 @@ class EnsembleKarrasModuleConfig(object):
             ensemble_size_train: Ensemble size for training
             ensemble_size_val: Ensemble size for validation
             ensemble_size_test: Ensemble size for testing
+            autoregressive_loss_steps: Number of successive forecast targets
+                to train on. Values > 1 enable autoregressive loss.
+            autoregressive_loss_diffusion_steps: Diffusion steps used when
+                generating intermediate autoregressive conditioning samples.
+            autoregressive_loss_guidance: Guidance used for intermediate
+                autoregressive samples.
+            autoregressive_loss_weights: Optional per-step loss weights.
+            autoregressive_loss_maximum_batch_size: Optional sampling minibatch
+                size for intermediate autoregressive samples.
+            autoregressive_loss_integrator: Optional sampling integrator for
+                intermediate autoregressive samples.
+            ema_enabled: Enables EMA shadow weights during training.
+            ema_type: "traditional" or "power". "power" follows the EDM2
+                power-function EMA profile.
+            ema_decay: Traditional EMA decay when ema_halflife_steps is None.
+            ema_halflife_steps: Optional traditional EMA half-life in optimizer
+                updates.
+            ema_rampup_ratio: Optional traditional EMA half-life ramp-up ratio.
+            ema_power_function_stds: Relative std profile(s) for power EMA.
+            ema_use_for_validation: Temporarily validate with EMA weights.
+            ema_use_for_sampling: Use EMA weights for eval-time sampling.
+            ema_device: Optional device for EMA tensors, e.g. "cpu".
+            ema_profile_index: Which tracked EMA profile to apply.
+            freeze_layer_patterns: Optional glob-style patterns matching
+                `model.named_modules()` or `model.named_parameters()` entries
+                to freeze before the optimizer is created. A module match
+                freezes all parameters below that module.
+            freeze_layer_strict: Raise an error when any freeze pattern has no
+                matches.
+            replay_enabled: Enables loss replay from a secondary dataloader.
+            replay_loss_weight: Weight applied to the replay loss.
+            replay_loss_schedule: Optional schedule overriding replay_loss_weight
+                during training.
+            replay_validation_enabled: Enables separate replay validation logging
+                when the trainer provides a replay validation dataloader.
+            pretrained_weight_regularization: Optional L2-SP regularization
+                config against the initial pretrained weights.
             spatial_shape: Legacy parameter for weighted_gaussian loss
             focus_radius: Legacy parameter for weighted_gaussian loss
         """
@@ -71,10 +136,103 @@ class EnsembleKarrasModuleConfig(object):
         self.ensemble_size_train = ensemble_size_train
         self.ensemble_size_val = ensemble_size_val
         self.ensemble_size_test = ensemble_size_test
+        self.autoregressive_loss_steps = autoregressive_loss_steps
+        self.autoregressive_loss_diffusion_steps = autoregressive_loss_diffusion_steps
+        self.autoregressive_loss_guidance = autoregressive_loss_guidance
+        self.autoregressive_loss_weights = autoregressive_loss_weights
+        self.autoregressive_loss_maximum_batch_size = autoregressive_loss_maximum_batch_size
+        self.autoregressive_loss_integrator = autoregressive_loss_integrator
+        self.ema_enabled = ema_enabled
+        self.ema_type = ema_type
+        self.ema_decay = ema_decay
+        self.ema_halflife_steps = ema_halflife_steps
+        self.ema_rampup_ratio = ema_rampup_ratio
+        self.ema_power_function_stds = ema_power_function_stds
+        self.ema_use_for_validation = ema_use_for_validation
+        self.ema_use_for_sampling = ema_use_for_sampling
+        self.ema_device = ema_device
+        self.ema_profile_index = ema_profile_index
+        self.freeze_layer_patterns = freeze_layer_patterns
+        self.freeze_layer_strict = freeze_layer_strict
+        self.replay_enabled = replay_enabled
+        self.replay_loss_weight = float(replay_loss_weight)
+        self.replay_loss_schedule = replay_loss_schedule
+        self.replay_validation_enabled = replay_validation_enabled
+        self.pretrained_weight_regularization = pretrained_weight_regularization
         if extra_args is None:
             self.extra_args = dict()
         else:
             self.extra_args = extra_args
+
+    @staticmethod
+    def ema_config_keys() -> set[str]:
+        return {
+            "ema_enabled",
+            "ema_type",
+            "ema_decay",
+            "ema_halflife_steps",
+            "ema_rampup_ratio",
+            "ema_power_function_stds",
+            "ema_use_for_validation",
+            "ema_use_for_sampling",
+            "ema_device",
+            "ema_profile_index",
+        }
+
+    @staticmethod
+    def freeze_config_keys() -> set[str]:
+        return {
+            "freeze_layer_patterns",
+            "freeze_layer_strict",
+        }
+
+    @staticmethod
+    def replay_config_keys() -> set[str]:
+        return {
+            "replay_enabled",
+            "replay_loss_weight",
+            "replay_loss_schedule",
+            "replay_validation_enabled",
+        }
+
+    @staticmethod
+    def pretrained_regularization_config_keys() -> set[str]:
+        return {
+            "pretrained_weight_regularization",
+        }
+
+    @classmethod
+    def _normalize_ema_kwargs(cls, kwargs: dict[str, Any]) -> dict[str, Any]:
+        unknown = set(kwargs) - cls.ema_config_keys()
+        if unknown:
+            raise TypeError(
+                f"Unexpected EMA config key(s): {', '.join(sorted(unknown))}"
+            )
+        return kwargs
+
+    def _current_ema_extra_args(self) -> dict[str, Any]:
+        return {
+            key: getattr(self, key)
+            for key in self.ema_config_keys()
+        }
+
+    def _current_freeze_extra_args(self) -> dict[str, Any]:
+        return {
+            key: getattr(self, key)
+            for key in self.freeze_config_keys()
+        }
+
+    def _current_replay_extra_args(self) -> dict[str, Any]:
+        return {
+            key: getattr(self, key)
+            for key in self.replay_config_keys()
+        }
+
+    def _current_pretrained_regularization_extra_args(self) -> dict[str, Any]:
+        return {
+            key: getattr(self, key)
+            for key in self.pretrained_regularization_config_keys()
+        }
 
     @classmethod
     def from_edm(cls,
@@ -84,8 +242,22 @@ class EnsembleKarrasModuleConfig(object):
                  has_edm_batch_norm: bool = False,
                  dynamic_loss_weight: int | None = None,
                  loss_metric: Union[str, Dict[str, Any]] = "huber",
+                 autoregressive_loss_steps: int = 1,
+                 autoregressive_loss_diffusion_steps: int = 100,
+                 autoregressive_loss_guidance: float = 1.0,
+                 autoregressive_loss_weights: None | list[float] = None,
+                 autoregressive_loss_maximum_batch_size: None | int = None,
+                 autoregressive_loss_integrator: None | str | integrators.Integrator = None,
+                 freeze_layer_patterns: None | str | list[str] = None,
+                 freeze_layer_strict: bool = True,
+                 replay_enabled: bool = False,
+                 replay_loss_weight: float = 0.1,
+                 replay_loss_schedule: None | dict[str, Any] = None,
+                 replay_validation_enabled: bool = False,
+                 pretrained_weight_regularization: None | dict[str, Any] = None,
                  spatial_shape: tuple = None,
-                 focus_radius: float = None):
+                 focus_radius: float = None,
+                 **ema_kwargs):
         """
         Create EDM configuration with flexible loss support.
         
@@ -96,9 +268,30 @@ class EnsembleKarrasModuleConfig(object):
             has_edm_batch_norm: Whether to use EDM batch norm
             dynamic_loss_weight: Dynamic loss weight
             loss_metric: Loss configuration (new flexible format)
+            autoregressive_loss_steps: Number of successive forecast targets
+                to train on. Values > 1 enable autoregressive loss.
+            autoregressive_loss_diffusion_steps: Diffusion steps used when
+                generating intermediate autoregressive conditioning samples.
+            autoregressive_loss_guidance: Guidance used for intermediate
+                autoregressive samples.
+            autoregressive_loss_weights: Optional per-step loss weights.
+            autoregressive_loss_maximum_batch_size: Optional sampling minibatch
+                size for intermediate autoregressive samples.
+            autoregressive_loss_integrator: Optional sampling integrator for
+                intermediate autoregressive samples.
+            freeze_layer_patterns: Optional glob-style layer/parameter
+                patterns to freeze before optimizer creation.
+            freeze_layer_strict: Raise an error when any freeze pattern has no
+                matches.
+            replay_enabled: Enables loss replay from a secondary dataloader.
+            replay_loss_weight: Weight applied to the replay loss.
+            replay_loss_schedule: Optional schedule overriding replay_loss_weight.
+            replay_validation_enabled: Enables separate replay validation logging.
+            pretrained_weight_regularization: Optional L2-SP config.
             spatial_shape: For weighted_gaussian loss (legacy)
             focus_radius: For weighted_gaussian loss (legacy)
         """
+        ema_kwargs = cls._normalize_ema_kwargs(ema_kwargs)
         preconditioner = preconditioners.EDMPreconditioner(
                             sigma_data=sigma_data
                         )
@@ -114,8 +307,22 @@ class EnsembleKarrasModuleConfig(object):
             "prior_mean": prior_mean,
             "prior_std": prior_std,
             "loss_metric": loss_metric,
+            "autoregressive_loss_steps": autoregressive_loss_steps,
+            "autoregressive_loss_diffusion_steps": autoregressive_loss_diffusion_steps,
+            "autoregressive_loss_guidance": autoregressive_loss_guidance,
+            "autoregressive_loss_weights": autoregressive_loss_weights,
+            "autoregressive_loss_maximum_batch_size": autoregressive_loss_maximum_batch_size,
+            "autoregressive_loss_integrator": autoregressive_loss_integrator,
+            "freeze_layer_patterns": freeze_layer_patterns,
+            "freeze_layer_strict": freeze_layer_strict,
+            "replay_enabled": replay_enabled,
+            "replay_loss_weight": replay_loss_weight,
+            "replay_loss_schedule": replay_loss_schedule,
+            "replay_validation_enabled": replay_validation_enabled,
+            "pretrained_weight_regularization": pretrained_weight_regularization,
             "spatial_shape": spatial_shape,
-            "focus_radius": focus_radius
+            "focus_radius": focus_radius,
+            **ema_kwargs
         }
         return cls(preconditioner=preconditioner,
                    noisesampler=noisesampler,
@@ -124,9 +331,23 @@ class EnsembleKarrasModuleConfig(object):
                    tag=tag,
                    has_edm_batch_norm=has_edm_batch_norm,
                    dynamic_loss_weight=dynamic_loss_weight,
+                   autoregressive_loss_steps=autoregressive_loss_steps,
+                   autoregressive_loss_diffusion_steps=autoregressive_loss_diffusion_steps,
+                   autoregressive_loss_guidance=autoregressive_loss_guidance,
+                   autoregressive_loss_weights=autoregressive_loss_weights,
+                   autoregressive_loss_maximum_batch_size=autoregressive_loss_maximum_batch_size,
+                   autoregressive_loss_integrator=autoregressive_loss_integrator,
+                   freeze_layer_patterns=freeze_layer_patterns,
+                   freeze_layer_strict=freeze_layer_strict,
+                   replay_enabled=replay_enabled,
+                   replay_loss_weight=replay_loss_weight,
+                   replay_loss_schedule=replay_loss_schedule,
+                   replay_validation_enabled=replay_validation_enabled,
+                   pretrained_weight_regularization=pretrained_weight_regularization,
                    extra_args=extra_args,
                    spatial_shape=spatial_shape,
-                   focus_radius=focus_radius)
+                   focus_radius=focus_radius,
+                   **ema_kwargs)
 
     @classmethod
     def from_vp(cls,
@@ -136,11 +357,26 @@ class EnsembleKarrasModuleConfig(object):
                 epsilon_sampler: float = 1e-5,
                 M: int = 1000,
                 loss_metric: Union[str, Dict[str, Any]] = "huber",
+                autoregressive_loss_steps: int = 1,
+                autoregressive_loss_diffusion_steps: int = 100,
+                autoregressive_loss_guidance: float = 1.0,
+                autoregressive_loss_weights: None | list[float] = None,
+                autoregressive_loss_maximum_batch_size: None | int = None,
+                autoregressive_loss_integrator: None | str | integrators.Integrator = None,
+                freeze_layer_patterns: None | str | list[str] = None,
+                freeze_layer_strict: bool = True,
+                replay_enabled: bool = False,
+                replay_loss_weight: float = 0.1,
+                replay_loss_schedule: None | dict[str, Any] = None,
+                replay_validation_enabled: bool = False,
+                pretrained_weight_regularization: None | dict[str, Any] = None,
                 spatial_shape: tuple = None,
-                focus_radius: float = None):
+                focus_radius: float = None,
+                **ema_kwargs):
         """
         Create VP configuration with flexible loss support.
         """
+        ema_kwargs = cls._normalize_ema_kwargs(ema_kwargs)
         noisescheduler = schedulers.VPScheduler(epsilon_min=epsilon_min,
                                                 beta_data=beta_data,
                                                 beta_min=beta_min)
@@ -160,28 +396,71 @@ class EnsembleKarrasModuleConfig(object):
             "epsilon_sampler": epsilon_sampler,
             "M": M,
             "loss_metric": loss_metric,
+            "autoregressive_loss_steps": autoregressive_loss_steps,
+            "autoregressive_loss_diffusion_steps": autoregressive_loss_diffusion_steps,
+            "autoregressive_loss_guidance": autoregressive_loss_guidance,
+            "autoregressive_loss_weights": autoregressive_loss_weights,
+            "autoregressive_loss_maximum_batch_size": autoregressive_loss_maximum_batch_size,
+            "autoregressive_loss_integrator": autoregressive_loss_integrator,
+            "freeze_layer_patterns": freeze_layer_patterns,
+            "freeze_layer_strict": freeze_layer_strict,
+            "replay_enabled": replay_enabled,
+            "replay_loss_weight": replay_loss_weight,
+            "replay_loss_schedule": replay_loss_schedule,
+            "replay_validation_enabled": replay_validation_enabled,
+            "pretrained_weight_regularization": pretrained_weight_regularization,
             "spatial_shape": spatial_shape,
-            "focus_radius": focus_radius
+            "focus_radius": focus_radius,
+            **ema_kwargs
         }
         return cls(preconditioner=preconditioner,
                    noisesampler=noisesampler,
                    noisescheduler=noisescheduler,
                    loss_metric=loss_metric,
+                   autoregressive_loss_steps=autoregressive_loss_steps,
+                   autoregressive_loss_diffusion_steps=autoregressive_loss_diffusion_steps,
+                   autoregressive_loss_guidance=autoregressive_loss_guidance,
+                   autoregressive_loss_weights=autoregressive_loss_weights,
+                   autoregressive_loss_maximum_batch_size=autoregressive_loss_maximum_batch_size,
+                   autoregressive_loss_integrator=autoregressive_loss_integrator,
+                   freeze_layer_patterns=freeze_layer_patterns,
+                   freeze_layer_strict=freeze_layer_strict,
+                   replay_enabled=replay_enabled,
+                   replay_loss_weight=replay_loss_weight,
+                   replay_loss_schedule=replay_loss_schedule,
+                   replay_validation_enabled=replay_validation_enabled,
+                   pretrained_weight_regularization=pretrained_weight_regularization,
                    tag=tag,
                    extra_args=extra_args,
                    spatial_shape=spatial_shape,
-                   focus_radius=focus_radius)
+                   focus_radius=focus_radius,
+                   **ema_kwargs)
 
     @classmethod
     def from_ve(cls,
                 sigma_min: float = 0.02,
                 sigma_max: float = 100,
                 loss_metric: Union[str, Dict[str, Any]] = "huber",
+                autoregressive_loss_steps: int = 1,
+                autoregressive_loss_diffusion_steps: int = 100,
+                autoregressive_loss_guidance: float = 1.0,
+                autoregressive_loss_weights: None | list[float] = None,
+                autoregressive_loss_maximum_batch_size: None | int = None,
+                autoregressive_loss_integrator: None | str | integrators.Integrator = None,
+                freeze_layer_patterns: None | str | list[str] = None,
+                freeze_layer_strict: bool = True,
+                replay_enabled: bool = False,
+                replay_loss_weight: float = 0.1,
+                replay_loss_schedule: None | dict[str, Any] = None,
+                replay_validation_enabled: bool = False,
+                pretrained_weight_regularization: None | dict[str, Any] = None,
                 spatial_shape: tuple = None,
-                focus_radius: float = None):
+                focus_radius: float = None,
+                **ema_kwargs):
         """
         Create VE configuration with flexible loss support.
         """
+        ema_kwargs = cls._normalize_ema_kwargs(ema_kwargs)
         noisescheduler = schedulers.VEScheduler(sigma_min=sigma_min,
                                                 sigma_max=sigma_max)
         preconditioner = preconditioners.VEPreconditioner()
@@ -194,28 +473,71 @@ class EnsembleKarrasModuleConfig(object):
             "sigma_min": sigma_min,
             "sigma_max": sigma_max,
             "loss_metric": loss_metric,
+            "autoregressive_loss_steps": autoregressive_loss_steps,
+            "autoregressive_loss_diffusion_steps": autoregressive_loss_diffusion_steps,
+            "autoregressive_loss_guidance": autoregressive_loss_guidance,
+            "autoregressive_loss_weights": autoregressive_loss_weights,
+            "autoregressive_loss_maximum_batch_size": autoregressive_loss_maximum_batch_size,
+            "autoregressive_loss_integrator": autoregressive_loss_integrator,
+            "freeze_layer_patterns": freeze_layer_patterns,
+            "freeze_layer_strict": freeze_layer_strict,
+            "replay_enabled": replay_enabled,
+            "replay_loss_weight": replay_loss_weight,
+            "replay_loss_schedule": replay_loss_schedule,
+            "replay_validation_enabled": replay_validation_enabled,
+            "pretrained_weight_regularization": pretrained_weight_regularization,
             "spatial_shape": spatial_shape,
-            "focus_radius": focus_radius
+            "focus_radius": focus_radius,
+            **ema_kwargs
         }
         return cls(preconditioner=preconditioner,
                    noisesampler=noisesampler,
                    noisescheduler=noisescheduler,
                    loss_metric=loss_metric,
+                   autoregressive_loss_steps=autoregressive_loss_steps,
+                   autoregressive_loss_diffusion_steps=autoregressive_loss_diffusion_steps,
+                   autoregressive_loss_guidance=autoregressive_loss_guidance,
+                   autoregressive_loss_weights=autoregressive_loss_weights,
+                   autoregressive_loss_maximum_batch_size=autoregressive_loss_maximum_batch_size,
+                   autoregressive_loss_integrator=autoregressive_loss_integrator,
+                   freeze_layer_patterns=freeze_layer_patterns,
+                   freeze_layer_strict=freeze_layer_strict,
+                   replay_enabled=replay_enabled,
+                   replay_loss_weight=replay_loss_weight,
+                   replay_loss_schedule=replay_loss_schedule,
+                   replay_validation_enabled=replay_validation_enabled,
+                   pretrained_weight_regularization=pretrained_weight_regularization,
                    tag=tag,
                    extra_args=extra_args,
                    spatial_shape=spatial_shape,
-                   focus_radius=focus_radius)
+                   focus_radius=focus_radius,
+                   **ema_kwargs)
 
     @classmethod
     def conditionalSR3(cls,
                        sigma_min: float = 0.02,
                        sigma_max: float = 100,
                        loss_metric: Union[str, Dict[str, Any]] = "huber",
+                       autoregressive_loss_steps: int = 1,
+                       autoregressive_loss_diffusion_steps: int = 100,
+                       autoregressive_loss_guidance: float = 1.0,
+                       autoregressive_loss_weights: None | list[float] = None,
+                       autoregressive_loss_maximum_batch_size: None | int = None,
+                       autoregressive_loss_integrator: None | str | integrators.Integrator = None,
+                       freeze_layer_patterns: None | str | list[str] = None,
+                       freeze_layer_strict: bool = True,
+                       replay_enabled: bool = False,
+                       replay_loss_weight: float = 0.1,
+                       replay_loss_schedule: None | dict[str, Any] = None,
+                       replay_validation_enabled: bool = False,
+                       pretrained_weight_regularization: None | dict[str, Any] = None,
                        spatial_shape: tuple = None,
-                       focus_radius: float = None):
+                       focus_radius: float = None,
+                       **ema_kwargs):
         """
         Create conditional SR3 configuration with flexible loss support.
         """
+        ema_kwargs = cls._normalize_ema_kwargs(ema_kwargs)
         noisescheduler = schedulers.EDMScheduler(sigma_min=sigma_min,
                                                  sigma_max=sigma_max)
         preconditioner = preconditioners.SR3Preconditioner()
@@ -228,22 +550,55 @@ class EnsembleKarrasModuleConfig(object):
             "sigma_min": sigma_min,
             "sigma_max": sigma_max,
             "loss_metric": loss_metric,
+            "autoregressive_loss_steps": autoregressive_loss_steps,
+            "autoregressive_loss_diffusion_steps": autoregressive_loss_diffusion_steps,
+            "autoregressive_loss_guidance": autoregressive_loss_guidance,
+            "autoregressive_loss_weights": autoregressive_loss_weights,
+            "autoregressive_loss_maximum_batch_size": autoregressive_loss_maximum_batch_size,
+            "autoregressive_loss_integrator": autoregressive_loss_integrator,
+            "freeze_layer_patterns": freeze_layer_patterns,
+            "freeze_layer_strict": freeze_layer_strict,
+            "replay_enabled": replay_enabled,
+            "replay_loss_weight": replay_loss_weight,
+            "replay_loss_schedule": replay_loss_schedule,
+            "replay_validation_enabled": replay_validation_enabled,
+            "pretrained_weight_regularization": pretrained_weight_regularization,
             "spatial_shape": spatial_shape,
-            "focus_radius": focus_radius
+            "focus_radius": focus_radius,
+            **ema_kwargs
         }
         return cls(preconditioner=preconditioner,
                    noisesampler=noisesampler,
                    noisescheduler=noisescheduler,
                    loss_metric=loss_metric,
+                   autoregressive_loss_steps=autoregressive_loss_steps,
+                   autoregressive_loss_diffusion_steps=autoregressive_loss_diffusion_steps,
+                   autoregressive_loss_guidance=autoregressive_loss_guidance,
+                   autoregressive_loss_weights=autoregressive_loss_weights,
+                   autoregressive_loss_maximum_batch_size=autoregressive_loss_maximum_batch_size,
+                   autoregressive_loss_integrator=autoregressive_loss_integrator,
+                   freeze_layer_patterns=freeze_layer_patterns,
+                   freeze_layer_strict=freeze_layer_strict,
+                   replay_enabled=replay_enabled,
+                   replay_loss_weight=replay_loss_weight,
+                   replay_loss_schedule=replay_loss_schedule,
+                   replay_validation_enabled=replay_validation_enabled,
+                   pretrained_weight_regularization=pretrained_weight_regularization,
                    tag=tag,
                    extra_args=extra_args,
                    spatial_shape=spatial_shape,
-                   focus_radius=focus_radius)
+                   focus_radius=focus_radius,
+                   **ema_kwargs)
 
     def export_description(self) -> dict[str, Any]:
         """Export configuration for saving/loading."""
+        extra_args = dict(self.extra_args)
+        extra_args.update(self._current_ema_extra_args())
+        extra_args.update(self._current_freeze_extra_args())
+        extra_args.update(self._current_replay_extra_args())
+        extra_args.update(self._current_pretrained_regularization_extra_args())
         return dict(tag=self.tag,
-                    extra_args=self.extra_args)
+                    extra_args=extra_args)
 
     @classmethod
     def load_from_description_with_tag(cls,
@@ -302,7 +657,9 @@ class EnsembleKarrasModuleConfig(object):
 
 
 
-class EnsembleKarrasModule(lightning.LightningModule):
+class EnsembleKarrasModule(AutoregressiveLossMixin,
+                           LatentSpaceAutoregressive,
+                           lightning.LightningModule):
     """Updated KarrasModule with multi-space loss support"""
     
     def __init__(self,
@@ -325,16 +682,100 @@ class EnsembleKarrasModule(lightning.LightningModule):
         self.autoencoder_conditional = autoencoder_conditional
         self.encode_y = encode_y
         self.decode_original_y = decode_original_y
+        self.apply_freeze_layer_patterns()
         self.set_optimizer_and_scheduler()
         self.set_loss_metric()
         self.start_edm_batch_norm()
         self.start_dynamic_loss_weight()
+        self.start_ema()
         self.norm = 1.0
+        self._ema_scope_depth = 0
+        self._ema_validation_backup = None
+        self._ema_loaded_from_checkpoint = False
+        self._pretrained_regularization_reference: dict[str, torch.Tensor] | None = None
+        self._pretrained_regularization_parameter_names: list[str] = []
 
     def freeze_autoencoder(self):
         """Freezes the autoencoder to prevent its weights from being updated during training."""
         for param in self.autoencoder.parameters():
             param.requires_grad = False
+
+    @staticmethod
+    def _normalize_freeze_layer_patterns(
+            patterns: None | str | list[str]) -> list[str]:
+        if patterns is None:
+            return []
+        if isinstance(patterns, str):
+            return [patterns]
+        return list(patterns)
+
+    @staticmethod
+    def _canonical_freeze_pattern(pattern: str) -> str:
+        pattern = str(pattern).strip()
+        if pattern.startswith("model."):
+            pattern = pattern[len("model."):]
+        return pattern
+
+    @staticmethod
+    def _freeze_pattern_matches(pattern: str, name: str) -> bool:
+        return (
+            name == pattern or
+            name.startswith(f"{pattern}.") or
+            fnmatchcase(name, pattern)
+        )
+
+    def apply_freeze_layer_patterns(self) -> None:
+        """Freeze selected parameters from the denoising model by name pattern."""
+        patterns = self._normalize_freeze_layer_patterns(
+            getattr(self.config, "freeze_layer_patterns", None)
+        )
+        self.frozen_layer_matches: dict[str, list[str]] = {}
+        self.frozen_parameter_names: list[str] = []
+        self.frozen_parameter_count = 0
+
+        if len(patterns) == 0:
+            return
+
+        named_modules = dict(self.model.named_modules())
+        named_parameters = dict(self.model.named_parameters())
+        matched_parameter_names: set[str] = set()
+
+        for raw_pattern in patterns:
+            pattern = self._canonical_freeze_pattern(raw_pattern)
+            pattern_matches: set[str] = set()
+
+            for module_name, module in named_modules.items():
+                if module_name and self._freeze_pattern_matches(pattern, module_name):
+                    pattern_matches.add(module_name)
+                    for parameter_name, _ in module.named_parameters(recurse=True):
+                        full_name = f"{module_name}.{parameter_name}"
+                        matched_parameter_names.add(full_name)
+
+            for parameter_name in named_parameters:
+                if self._freeze_pattern_matches(pattern, parameter_name):
+                    pattern_matches.add(parameter_name)
+                    matched_parameter_names.add(parameter_name)
+
+            self.frozen_layer_matches[raw_pattern] = sorted(pattern_matches)
+
+        unmatched_patterns = [
+            pattern for pattern, matches in self.frozen_layer_matches.items()
+            if len(matches) == 0
+        ]
+        if unmatched_patterns and getattr(self.config, "freeze_layer_strict", True):
+            raise ValueError(
+                "The following freeze_layer_patterns did not match any model "
+                f"module or parameter: {unmatched_patterns}"
+            )
+
+        for parameter_name, parameter in named_parameters.items():
+            if parameter_name in matched_parameter_names:
+                parameter.requires_grad = False
+                self.frozen_parameter_names.append(parameter_name)
+                self.frozen_parameter_count += parameter.numel()
+
+    def trainable_parameters(self) -> list[torch.nn.Parameter]:
+        return [param for param in self.parameters() if param.requires_grad]
 
     def export_description(self) -> dict[str, Any]:
         config_description = self.config.export_description()
@@ -371,7 +812,10 @@ class EnsembleKarrasModule(lightning.LightningModule):
         if optimizer is not None:
             self.optimizer = optimizer
         else:
-            self.optimizer = torch.optim.AdamW(self.parameters(),
+            trainable_parameters = self.trainable_parameters()
+            if len(trainable_parameters) == 0:
+                raise ValueError("No trainable parameters remain after freezing.")
+            self.optimizer = torch.optim.AdamW(trainable_parameters,
                                                lr=1e-3,
                                                betas=(0.9, 0.999),
                                                weight_decay=1e-4)
@@ -802,6 +1246,15 @@ class EnsembleKarrasModule(lightning.LightningModule):
             # If that fails, call without mask parameter
             return self.loss_metric(pred, target)
 
+    def _loss_fn_for_autoregressive_step(
+            self,
+            x: torch.Tensor,
+            sigma: torch.Tensor,
+            y: Optional[Any],
+            mask: Optional[torch.Tensor],
+            n_ensemble: int = 1) -> torch.Tensor:
+        return self.loss_fn(x, sigma, y, mask, n_ensemble=n_ensemble)
+
     def get_denoiser(
             self,
             x: Float[Tensor, "batch *shape"],  # noqa: F821
@@ -943,8 +1396,28 @@ class EnsembleKarrasModule(lightning.LightningModule):
             move_to_cpu: bool = False,
             is_latent_shape: bool = False,
             squeeze_memory_efficiency: bool = False,
-            return_in_latent_space: bool = False
+            return_in_latent_space: bool = False,
+            use_ema: Optional[bool] = None
             ) -> Float[Tensor, "..."]:  # TODO: Put the actual shape
+        if use_ema is None:
+            use_ema = self._should_use_ema_for_sampling()
+        if use_ema:
+            with self.ema_scope(enabled=True):
+                return self.sample(
+                    nsamples=nsamples,
+                    shape=shape,
+                    y=y,
+                    guidance=guidance,
+                    nsteps=nsteps,
+                    record_history=record_history,
+                    maximum_batch_size=maximum_batch_size,
+                    integrator=integrator,
+                    move_to_cpu=move_to_cpu,
+                    is_latent_shape=is_latent_shape,
+                    squeeze_memory_efficiency=squeeze_memory_efficiency,
+                    return_in_latent_space=return_in_latent_space,
+                    use_ema=False,
+                )
         with torch.inference_mode():
             if maximum_batch_size is not None:
                 batch_sizes = get_minibatch_sizes(nsamples, maximum_batch_size)
@@ -961,7 +1434,8 @@ class EnsembleKarrasModule(lightning.LightningModule):
                                               move_to_cpu=move_to_cpu,
                                               is_latent_shape=is_latent_shape,
                                               squeeze_memory_efficiency=squeeze_memory_efficiency,
-                                              return_in_latent_space=return_in_latent_space))
+                                              return_in_latent_space=return_in_latent_space,
+                                              use_ema=False))
                 catdim = 1 if record_history else 0
                 result = torch.cat(result, dim=catdim)
                 return result
@@ -1275,20 +1749,296 @@ class EnsembleKarrasModule(lightning.LightningModule):
                             record_history=record_history)
         return x_interp
 
-    def training_step(self, batch, batch_idx):
+    @property
+    def has_replay_loss(self) -> bool:
+        return bool(getattr(self.config, "replay_enabled", False))
+
+    @property
+    def has_pretrained_weight_regularization(self) -> bool:
+        config = self._pretrained_weight_regularization_config()
+        if config is None:
+            return False
+        return float(config.get("weight", 0.0)) > 0.0
+
+    def _pretrained_weight_regularization_config(self) -> dict[str, Any] | None:
+        config = getattr(self.config, "pretrained_weight_regularization", None)
+        if config is True:
+            config = {"enabled": True}
+        if not isinstance(config, dict):
+            return None
+        if not bool(config.get("enabled", False)):
+            return None
+        return config
+
+    @staticmethod
+    def _pattern_list_matches(
+            patterns: None | str | list[str],
+            name: str,
+            default: bool = False) -> bool:
+        normalized_patterns = EnsembleKarrasModule._normalize_freeze_layer_patterns(
+            patterns
+        )
+        if len(normalized_patterns) == 0:
+            return default
+        for raw_pattern in normalized_patterns:
+            pattern = EnsembleKarrasModule._canonical_freeze_pattern(raw_pattern)
+            if EnsembleKarrasModule._freeze_pattern_matches(pattern, name):
+                return True
+        return False
+
+    def _selected_pretrained_regularization_parameters(
+            self,
+            config: dict[str, Any]) -> list[tuple[str, torch.nn.Parameter]]:
+        include_patterns = config.get("include_patterns", ["*"])
+        exclude_patterns = config.get("exclude_patterns", [])
+        selected_parameters = []
+        for name, parameter in self.model.named_parameters():
+            if not self._pattern_list_matches(include_patterns, name):
+                continue
+            if self._pattern_list_matches(exclude_patterns, name):
+                continue
+            selected_parameters.append((name, parameter))
+        if (
+            len(selected_parameters) == 0 and
+            bool(config.get("strict", True))
+        ):
+            raise ValueError(
+                "pretrained_weight_regularization did not match any model "
+                "parameters. Check include_patterns/exclude_patterns."
+            )
+        return selected_parameters
+
+    def initialize_pretrained_weight_regularization_reference(self) -> None:
+        if self._pretrained_regularization_reference is not None:
+            return
+        config = self._pretrained_weight_regularization_config()
+        if config is None:
+            return
+        device = config.get("device", None)
+        reference = {}
+        for name, parameter in self._selected_pretrained_regularization_parameters(
+                config):
+            reference_parameter = parameter.detach().clone()
+            if device is not None:
+                reference_parameter = reference_parameter.to(device)
+            reference[name] = reference_parameter
+        self._pretrained_regularization_reference = reference
+        self._pretrained_regularization_parameter_names = sorted(reference)
+
+    def pretrained_weight_regularization_loss(self) -> torch.Tensor:
+        config = self._pretrained_weight_regularization_config()
+        if config is None:
+            return next(self.model.parameters()).new_tensor(0.0)
+
+        weight = float(config.get("weight", 0.0))
+        if weight <= 0.0:
+            return next(self.model.parameters()).new_tensor(0.0)
+
+        self.initialize_pretrained_weight_regularization_reference()
+        reference = self._pretrained_regularization_reference or {}
+        named_parameters = dict(self.model.named_parameters())
+        regularization = next(self.model.parameters()).new_tensor(0.0)
+        parameter_count = 0
+
+        for name in self._pretrained_regularization_parameter_names:
+            parameter = named_parameters[name]
+            if not parameter.requires_grad:
+                continue
+            reference_parameter = reference[name].to(parameter.device)
+            regularization = regularization + (
+                parameter - reference_parameter
+            ).pow(2).sum()
+            parameter_count += parameter.numel()
+
+        if parameter_count == 0:
+            return regularization
+        if bool(config.get("normalize", True)):
+            regularization = regularization / parameter_count
+        return weight * regularization
+
+    @staticmethod
+    def _scheduled_replay_loss_weight(
+            schedule: dict[str, Any],
+            default_weight: float,
+            position: float) -> float:
+        if not bool(schedule.get("enabled", False)):
+            return float(default_weight)
+
+        start_weight = float(schedule.get("start_weight", default_weight))
+        end_weight = float(schedule.get("end_weight", default_weight))
+        duration = float(schedule.get("num_steps",
+                                      schedule.get("num_epochs", 1)))
+        if duration <= 0:
+            progress = 1.0
+        else:
+            progress = min(max(float(position) / duration, 0.0), 1.0)
+
+        schedule_type = str(schedule.get("type", "linear")).lower()
+        if schedule_type == "constant":
+            return start_weight
+        if schedule_type == "linear":
+            return start_weight + progress * (end_weight - start_weight)
+        if schedule_type == "cosine":
+            cosine_progress = 0.5 - 0.5 * math.cos(math.pi * progress)
+            return start_weight + cosine_progress * (end_weight - start_weight)
+        raise ValueError(f"Unknown replay_loss_schedule type: {schedule_type}")
+
+    def current_replay_loss_weight(self) -> float:
+        default_weight = float(getattr(self.config, "replay_loss_weight", 0.1))
+        schedule = getattr(self.config, "replay_loss_schedule", None)
+        if not isinstance(schedule, dict):
+            return default_weight
+        if "num_steps" in schedule:
+            position = float(getattr(self, "global_step", 0))
+        else:
+            position = float(getattr(self, "current_epoch", 0))
+        return self._scheduled_replay_loss_weight(
+            schedule,
+            default_weight,
+            position
+        )
+
+    def _add_pretrained_regularization_to_loss(
+            self,
+            loss: torch.Tensor) -> torch.Tensor:
+        if not self.has_pretrained_weight_regularization:
+            return loss
+        regularization_loss = self.pretrained_weight_regularization_loss()
+        self.log("train_pretrained_l2_loss", regularization_loss,
+                 prog_bar=False, sync_dist=True)
+        return loss + regularization_loss
+
+    def _unwrap_replay_batch(self, batch: Any) -> Any:
+        if (
+            isinstance(batch, (list, tuple)) and
+            len(batch) > 0 and
+            self._is_replay_batch(batch[0])
+        ):
+            return batch[0]
+        return batch
+
+    def _is_replay_batch(self, batch: Any) -> bool:
+        return isinstance(batch, dict) and {"finetune", "replay"} <= set(batch)
+
+    def _require_replay_batch(self, batch: Any) -> dict[str, Any]:
+        batch = self._unwrap_replay_batch(batch)
+        if not self._is_replay_batch(batch):
+            raise ValueError(
+                "Replay is enabled, so training_step expects a dict batch with "
+                "keys 'finetune' and 'replay'. Check the replay dataloader "
+                "wrapper in the trainer."
+            )
+        return batch
+
+    def _training_loss_from_batch(
+            self,
+            batch: Any,
+            n_ensemble: int,
+            autoregressive_log_prefix: Optional[str] = None) -> torch.Tensor:
         x, y, mask = self.select_batch(batch)
-        sigma = self.config.noisesampler.sample(x.shape[0]).to(x)  # ← Different!
-        loss = self.loss_fn(x, sigma, y, mask, n_ensemble=self.config.ensemble_size_train)
+        if self.has_autoregressive_loss():
+            loss = self.autoregressive_loss_fn(
+                x,
+                y,
+                mask,
+                n_ensemble=n_ensemble
+            )
+            if autoregressive_log_prefix is not None:
+                self.log_autoregressive_step_losses(autoregressive_log_prefix)
+        else:
+            sigma = self.config.noisesampler.sample(x.shape[0]).to(x)
+            loss = self.loss_fn(
+                x,
+                sigma,
+                y,
+                mask,
+                n_ensemble=n_ensemble
+            )
+        return loss
+
+    def training_step(self, batch, batch_idx):
+        if self.has_replay_loss:
+            batch = self._require_replay_batch(batch)
+            finetune_loss = self._training_loss_from_batch(
+                batch["finetune"],
+                n_ensemble=self.config.ensemble_size_train,
+                autoregressive_log_prefix="train_finetune"
+            )
+            replay_loss = self._training_loss_from_batch(
+                batch["replay"],
+                n_ensemble=self.config.ensemble_size_train,
+                autoregressive_log_prefix="train_replay"
+            )
+            replay_weight = self.current_replay_loss_weight()
+            loss = finetune_loss + replay_weight * replay_loss
+            loss = self._add_pretrained_regularization_to_loss(loss)
+            self.log("train_loss_finetune", finetune_loss,
+                     prog_bar=False, sync_dist=True)
+            self.log("train_loss_replay", replay_loss,
+                     prog_bar=False, sync_dist=True)
+            self.log("train_replay_loss_weight",
+                     torch.as_tensor(replay_weight, device=loss.device),
+                     prog_bar=False,
+                     sync_dist=True)
+            self.log("train_loss", loss, prog_bar=True, sync_dist=True)
+            return loss
+
+        if self._is_replay_batch(self._unwrap_replay_batch(batch)):
+            raise ValueError(
+                "Received a replay-style batch, but config.replay_enabled is "
+                "False. Disable the replay dataloader wrapper or enable replay."
+            )
+
+        loss = self._training_loss_from_batch(
+            batch,
+            n_ensemble=self.config.ensemble_size_train,
+            autoregressive_log_prefix="train"
+        )
+        loss = self._add_pretrained_regularization_to_loss(loss)
         self.log("train_loss", loss, prog_bar=True, sync_dist=True)
 
         return loss
     
-    def validation_step(self, batch, batch_idx):
-        x, y, mask = self.select_batch(batch)
-        sigma = self.config.noisesampler.sample(x.shape[0]).to(x)  # ← Different!
-        loss = self.loss_fn(x, sigma, y, mask, n_ensemble=self.config.ensemble_size_val)
-        self.log("valid_loss", loss, prog_bar=True, sync_dist=True)
-        self.log("val_loss", loss, prog_bar=True, sync_dist=True)  # For compat
+    def _validation_dataloader_name(self, dataloader_idx: int) -> str:
+        names = getattr(self, "validation_dataloader_names", None)
+        if names is None:
+            names = ("finetune", "replay")
+        if dataloader_idx < len(names):
+            return str(names[dataloader_idx])
+        return f"dataloader_{dataloader_idx}"
+
+    def validation_step(self, batch, batch_idx, dataloader_idx: int = 0):
+        dataloader_name = self._validation_dataloader_name(dataloader_idx)
+        has_multiple_validation_loaders = (
+            len(getattr(self, "validation_dataloader_names", ("finetune",))) > 1
+        )
+        primary_validation = dataloader_idx == 0
+        validation_prefix = (
+            f"valid_{dataloader_name}"
+            if has_multiple_validation_loaders
+            else "valid"
+        )
+
+        loss = self._training_loss_from_batch(
+            batch,
+            n_ensemble=self.config.ensemble_size_val,
+            autoregressive_log_prefix=None
+        )
+
+        if self.has_autoregressive_loss():
+            self.log_autoregressive_step_losses(validation_prefix)
+            if primary_validation and validation_prefix != "valid":
+                self.log_autoregressive_step_losses("valid")
+
+        if has_multiple_validation_loaders:
+            self.log(f"valid_loss_{dataloader_name}", loss,
+                     prog_bar=False, sync_dist=True)
+            self.log(f"val_loss_{dataloader_name}", loss,
+                     prog_bar=False, sync_dist=True)
+
+        if primary_validation:
+            self.log("valid_loss", loss, prog_bar=True, sync_dist=True)
+            self.log("val_loss", loss, prog_bar=True, sync_dist=True)  # For compat
         return loss
 
 
@@ -1373,6 +2123,108 @@ class EnsembleKarrasModule(lightning.LightningModule):
             )
         else:
             self.dynamic_loss_weight = None
+
+    def start_ema(self):
+        if not getattr(self.config, "ema_enabled", False):
+            self.ema_tracker = None
+            return
+        self.ema_tracker = ModelEMA(
+            self.model,
+            ema_type=getattr(self.config, "ema_type", "traditional"),
+            decay=getattr(self.config, "ema_decay", 0.999),
+            halflife_steps=getattr(self.config, "ema_halflife_steps", None),
+            rampup_ratio=getattr(self.config, "ema_rampup_ratio", None),
+            power_function_stds=getattr(
+                self.config,
+                "ema_power_function_stds",
+                None,
+            ),
+            device=getattr(self.config, "ema_device", None),
+            profile_index=getattr(self.config, "ema_profile_index", 0),
+        )
+
+    @property
+    def has_ema(self):
+        return self.ema_tracker is not None
+
+    def on_fit_start(self):
+        if self.has_ema and not self._ema_loaded_from_checkpoint:
+            self.ema_tracker.reset(self.model)
+        self.initialize_pretrained_weight_regularization_reference()
+
+    def on_before_zero_grad(self, optimizer):
+        if self.has_ema:
+            self.ema_tracker.update(self.model)
+
+    def on_save_checkpoint(self, checkpoint):
+        if self.has_ema:
+            checkpoint["model_ema"] = self.ema_tracker.state_dict()
+        config = self._pretrained_weight_regularization_config()
+        if (
+            config is not None and
+            bool(config.get("save_reference_in_checkpoint", True)) and
+            self._pretrained_regularization_reference is not None
+        ):
+            checkpoint["pretrained_weight_regularization_reference"] = {
+                name: parameter.detach().cpu()
+                for name, parameter
+                in self._pretrained_regularization_reference.items()
+            }
+            checkpoint["pretrained_weight_regularization_parameter_names"] = list(
+                self._pretrained_regularization_parameter_names
+            )
+
+    def on_load_checkpoint(self, checkpoint):
+        if self.has_ema and "model_ema" in checkpoint:
+            self.ema_tracker.load_state_dict(checkpoint["model_ema"])
+            self._ema_loaded_from_checkpoint = True
+        if "pretrained_weight_regularization_reference" in checkpoint:
+            self._pretrained_regularization_reference = checkpoint[
+                "pretrained_weight_regularization_reference"
+            ]
+            self._pretrained_regularization_parameter_names = checkpoint.get(
+                "pretrained_weight_regularization_parameter_names",
+                sorted(self._pretrained_regularization_reference)
+            )
+
+    def on_validation_epoch_start(self):
+        if self._should_use_ema_for_validation():
+            self._ema_validation_backup = self.ema_tracker.apply_to(self.model)
+            self._ema_scope_depth += 1
+
+    def on_validation_epoch_end(self):
+        if self._ema_validation_backup is not None:
+            self.ema_tracker.restore(self.model, self._ema_validation_backup)
+            self._ema_validation_backup = None
+            self._ema_scope_depth = max(self._ema_scope_depth - 1, 0)
+
+    def _should_use_ema_for_validation(self):
+        return (
+            self.has_ema and
+            getattr(self.config, "ema_use_for_validation", True) and
+            self._ema_scope_depth == 0
+        )
+
+    def _should_use_ema_for_sampling(self):
+        return (
+            self.has_ema and
+            getattr(self.config, "ema_use_for_sampling", True) and
+            not self.training and
+            self._ema_scope_depth == 0
+        )
+
+    @contextmanager
+    def ema_scope(self, enabled: bool = True):
+        if not enabled or not self.has_ema or self._ema_scope_depth > 0:
+            yield
+            return
+        backup = self.ema_tracker.apply_to(self.model)
+        self._ema_scope_depth += 1
+        try:
+            yield
+        finally:
+            self.ema_tracker.restore(self.model, backup)
+            self._ema_scope_depth = max(self._ema_scope_depth - 1, 0)
 
     @property
     def latent_model(self):

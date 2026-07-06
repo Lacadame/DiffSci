@@ -17,6 +17,8 @@ from . import noisesamplers
 from . import schedulers
 from . import edmbatchnorm
 from . import integrators
+from .autoregressiveloss import AutoregressiveLossMixin
+from .autoregressivesample import LatentSpaceAutoregressive
 
 
 Scaler = Callable[[Float[Tensor, '*shape']],  # noqa: F821
@@ -34,6 +36,12 @@ class KarrasModuleConfig(object):
                  has_edm_batch_norm: bool = False,
                  dynamic_loss_weight: int | None = None,
                  extra_args: None | dict[str, Any] = None,
+                 autoregressive_loss_steps: int = 1,
+                 autoregressive_loss_diffusion_steps: int = 100,
+                 autoregressive_loss_guidance: float = 1.0,
+                 autoregressive_loss_weights: None | list[float] = None,
+                 autoregressive_loss_maximum_batch_size: None | int = None,
+                 autoregressive_loss_integrator: None | str | integrators.Integrator = None,
                  # Legacy parameters for backward compatibility
                  spatial_shape: tuple = None,
                  focus_radius: float = None):
@@ -50,6 +58,17 @@ class KarrasModuleConfig(object):
             has_edm_batch_norm: Whether to use EDM batch norm
             dynamic_loss_weight: Dynamic loss weight configuration
             extra_args: Extra arguments for reconstruction
+            autoregressive_loss_steps: Number of successive forecast targets
+                to train on. Values > 1 enable autoregressive loss.
+            autoregressive_loss_diffusion_steps: Diffusion steps used when
+                generating intermediate autoregressive conditioning samples.
+            autoregressive_loss_guidance: Guidance used for intermediate
+                autoregressive samples.
+            autoregressive_loss_weights: Optional per-step loss weights.
+            autoregressive_loss_maximum_batch_size: Optional sampling minibatch
+                size for intermediate autoregressive samples.
+            autoregressive_loss_integrator: Optional sampling integrator for
+                intermediate autoregressive samples.
             spatial_shape: Legacy parameter for weighted_gaussian loss
             focus_radius: Legacy parameter for weighted_gaussian loss
         """
@@ -60,6 +79,12 @@ class KarrasModuleConfig(object):
         self.tag = tag
         self.has_edm_batch_norm = has_edm_batch_norm
         self.dynamic_loss_weight = dynamic_loss_weight
+        self.autoregressive_loss_steps = autoregressive_loss_steps
+        self.autoregressive_loss_diffusion_steps = autoregressive_loss_diffusion_steps
+        self.autoregressive_loss_guidance = autoregressive_loss_guidance
+        self.autoregressive_loss_weights = autoregressive_loss_weights
+        self.autoregressive_loss_maximum_batch_size = autoregressive_loss_maximum_batch_size
+        self.autoregressive_loss_integrator = autoregressive_loss_integrator
         self.spatial_shape = spatial_shape
         self.focus_radius = focus_radius
         
@@ -76,6 +101,12 @@ class KarrasModuleConfig(object):
                  has_edm_batch_norm: bool = False,
                  dynamic_loss_weight: int | None = None,
                  loss_metric: Union[str, Dict[str, Any]] = "huber",
+                 autoregressive_loss_steps: int = 1,
+                 autoregressive_loss_diffusion_steps: int = 100,
+                 autoregressive_loss_guidance: float = 1.0,
+                 autoregressive_loss_weights: None | list[float] = None,
+                 autoregressive_loss_maximum_batch_size: None | int = None,
+                 autoregressive_loss_integrator: None | str | integrators.Integrator = None,
                  spatial_shape: tuple = None,
                  focus_radius: float = None):
         """
@@ -88,6 +119,17 @@ class KarrasModuleConfig(object):
             has_edm_batch_norm: Whether to use EDM batch norm
             dynamic_loss_weight: Dynamic loss weight
             loss_metric: Loss configuration (new flexible format)
+            autoregressive_loss_steps: Number of successive forecast targets
+                to train on. Values > 1 enable autoregressive loss.
+            autoregressive_loss_diffusion_steps: Diffusion steps used when
+                generating intermediate autoregressive conditioning samples.
+            autoregressive_loss_guidance: Guidance used for intermediate
+                autoregressive samples.
+            autoregressive_loss_weights: Optional per-step loss weights.
+            autoregressive_loss_maximum_batch_size: Optional sampling minibatch
+                size for intermediate autoregressive samples.
+            autoregressive_loss_integrator: Optional sampling integrator for
+                intermediate autoregressive samples.
             spatial_shape: For weighted_gaussian loss (legacy)
             focus_radius: For weighted_gaussian loss (legacy)
         """
@@ -106,6 +148,12 @@ class KarrasModuleConfig(object):
             "prior_mean": prior_mean,
             "prior_std": prior_std,
             "loss_metric": loss_metric,
+            "autoregressive_loss_steps": autoregressive_loss_steps,
+            "autoregressive_loss_diffusion_steps": autoregressive_loss_diffusion_steps,
+            "autoregressive_loss_guidance": autoregressive_loss_guidance,
+            "autoregressive_loss_weights": autoregressive_loss_weights,
+            "autoregressive_loss_maximum_batch_size": autoregressive_loss_maximum_batch_size,
+            "autoregressive_loss_integrator": autoregressive_loss_integrator,
             "spatial_shape": spatial_shape,
             "focus_radius": focus_radius
         }
@@ -116,6 +164,12 @@ class KarrasModuleConfig(object):
                    tag=tag,
                    has_edm_batch_norm=has_edm_batch_norm,
                    dynamic_loss_weight=dynamic_loss_weight,
+                   autoregressive_loss_steps=autoregressive_loss_steps,
+                   autoregressive_loss_diffusion_steps=autoregressive_loss_diffusion_steps,
+                   autoregressive_loss_guidance=autoregressive_loss_guidance,
+                   autoregressive_loss_weights=autoregressive_loss_weights,
+                   autoregressive_loss_maximum_batch_size=autoregressive_loss_maximum_batch_size,
+                   autoregressive_loss_integrator=autoregressive_loss_integrator,
                    extra_args=extra_args,
                    spatial_shape=spatial_shape,
                    focus_radius=focus_radius)
@@ -128,6 +182,12 @@ class KarrasModuleConfig(object):
                 epsilon_sampler: float = 1e-5,
                 M: int = 1000,
                 loss_metric: Union[str, Dict[str, Any]] = "huber",
+                autoregressive_loss_steps: int = 1,
+                autoregressive_loss_diffusion_steps: int = 100,
+                autoregressive_loss_guidance: float = 1.0,
+                autoregressive_loss_weights: None | list[float] = None,
+                autoregressive_loss_maximum_batch_size: None | int = None,
+                autoregressive_loss_integrator: None | str | integrators.Integrator = None,
                 spatial_shape: tuple = None,
                 focus_radius: float = None):
         """
@@ -152,6 +212,12 @@ class KarrasModuleConfig(object):
             "epsilon_sampler": epsilon_sampler,
             "M": M,
             "loss_metric": loss_metric,
+            "autoregressive_loss_steps": autoregressive_loss_steps,
+            "autoregressive_loss_diffusion_steps": autoregressive_loss_diffusion_steps,
+            "autoregressive_loss_guidance": autoregressive_loss_guidance,
+            "autoregressive_loss_weights": autoregressive_loss_weights,
+            "autoregressive_loss_maximum_batch_size": autoregressive_loss_maximum_batch_size,
+            "autoregressive_loss_integrator": autoregressive_loss_integrator,
             "spatial_shape": spatial_shape,
             "focus_radius": focus_radius
         }
@@ -159,6 +225,12 @@ class KarrasModuleConfig(object):
                    noisesampler=noisesampler,
                    noisescheduler=noisescheduler,
                    loss_metric=loss_metric,
+                   autoregressive_loss_steps=autoregressive_loss_steps,
+                   autoregressive_loss_diffusion_steps=autoregressive_loss_diffusion_steps,
+                   autoregressive_loss_guidance=autoregressive_loss_guidance,
+                   autoregressive_loss_weights=autoregressive_loss_weights,
+                   autoregressive_loss_maximum_batch_size=autoregressive_loss_maximum_batch_size,
+                   autoregressive_loss_integrator=autoregressive_loss_integrator,
                    tag=tag,
                    extra_args=extra_args,
                    spatial_shape=spatial_shape,
@@ -169,6 +241,12 @@ class KarrasModuleConfig(object):
                 sigma_min: float = 0.02,
                 sigma_max: float = 100,
                 loss_metric: Union[str, Dict[str, Any]] = "huber",
+                autoregressive_loss_steps: int = 1,
+                autoregressive_loss_diffusion_steps: int = 100,
+                autoregressive_loss_guidance: float = 1.0,
+                autoregressive_loss_weights: None | list[float] = None,
+                autoregressive_loss_maximum_batch_size: None | int = None,
+                autoregressive_loss_integrator: None | str | integrators.Integrator = None,
                 spatial_shape: tuple = None,
                 focus_radius: float = None):
         """
@@ -186,6 +264,12 @@ class KarrasModuleConfig(object):
             "sigma_min": sigma_min,
             "sigma_max": sigma_max,
             "loss_metric": loss_metric,
+            "autoregressive_loss_steps": autoregressive_loss_steps,
+            "autoregressive_loss_diffusion_steps": autoregressive_loss_diffusion_steps,
+            "autoregressive_loss_guidance": autoregressive_loss_guidance,
+            "autoregressive_loss_weights": autoregressive_loss_weights,
+            "autoregressive_loss_maximum_batch_size": autoregressive_loss_maximum_batch_size,
+            "autoregressive_loss_integrator": autoregressive_loss_integrator,
             "spatial_shape": spatial_shape,
             "focus_radius": focus_radius
         }
@@ -193,6 +277,12 @@ class KarrasModuleConfig(object):
                    noisesampler=noisesampler,
                    noisescheduler=noisescheduler,
                    loss_metric=loss_metric,
+                   autoregressive_loss_steps=autoregressive_loss_steps,
+                   autoregressive_loss_diffusion_steps=autoregressive_loss_diffusion_steps,
+                   autoregressive_loss_guidance=autoregressive_loss_guidance,
+                   autoregressive_loss_weights=autoregressive_loss_weights,
+                   autoregressive_loss_maximum_batch_size=autoregressive_loss_maximum_batch_size,
+                   autoregressive_loss_integrator=autoregressive_loss_integrator,
                    tag=tag,
                    extra_args=extra_args,
                    spatial_shape=spatial_shape,
@@ -203,6 +293,12 @@ class KarrasModuleConfig(object):
                        sigma_min: float = 0.02,
                        sigma_max: float = 100,
                        loss_metric: Union[str, Dict[str, Any]] = "huber",
+                       autoregressive_loss_steps: int = 1,
+                       autoregressive_loss_diffusion_steps: int = 100,
+                       autoregressive_loss_guidance: float = 1.0,
+                       autoregressive_loss_weights: None | list[float] = None,
+                       autoregressive_loss_maximum_batch_size: None | int = None,
+                       autoregressive_loss_integrator: None | str | integrators.Integrator = None,
                        spatial_shape: tuple = None,
                        focus_radius: float = None):
         """
@@ -220,6 +316,12 @@ class KarrasModuleConfig(object):
             "sigma_min": sigma_min,
             "sigma_max": sigma_max,
             "loss_metric": loss_metric,
+            "autoregressive_loss_steps": autoregressive_loss_steps,
+            "autoregressive_loss_diffusion_steps": autoregressive_loss_diffusion_steps,
+            "autoregressive_loss_guidance": autoregressive_loss_guidance,
+            "autoregressive_loss_weights": autoregressive_loss_weights,
+            "autoregressive_loss_maximum_batch_size": autoregressive_loss_maximum_batch_size,
+            "autoregressive_loss_integrator": autoregressive_loss_integrator,
             "spatial_shape": spatial_shape,
             "focus_radius": focus_radius
         }
@@ -227,6 +329,12 @@ class KarrasModuleConfig(object):
                    noisesampler=noisesampler,
                    noisescheduler=noisescheduler,
                    loss_metric=loss_metric,
+                   autoregressive_loss_steps=autoregressive_loss_steps,
+                   autoregressive_loss_diffusion_steps=autoregressive_loss_diffusion_steps,
+                   autoregressive_loss_guidance=autoregressive_loss_guidance,
+                   autoregressive_loss_weights=autoregressive_loss_weights,
+                   autoregressive_loss_maximum_batch_size=autoregressive_loss_maximum_batch_size,
+                   autoregressive_loss_integrator=autoregressive_loss_integrator,
                    tag=tag,
                    extra_args=extra_args,
                    spatial_shape=spatial_shape,
@@ -294,7 +402,9 @@ class KarrasModuleConfig(object):
 
 
 
-class KarrasModule(lightning.LightningModule):
+class KarrasModule(AutoregressiveLossMixin,
+                   LatentSpaceAutoregressive,
+                   lightning.LightningModule):
     """Updated KarrasModule with multi-space loss support"""
 
     @classmethod
@@ -550,6 +660,15 @@ class KarrasModule(lightning.LightningModule):
         except TypeError:
             # If that fails, call without mask parameter
             return self.loss_metric(pred, target)
+
+    def _loss_fn_for_autoregressive_step(
+            self,
+            x: torch.Tensor,
+            sigma: torch.Tensor,
+            y: Optional[Any],
+            mask: Optional[torch.Tensor],
+            n_ensemble: int = 1) -> torch.Tensor:
+        return self.loss_fn(x, sigma, y, mask)
 
     def get_denoiser(
             self,
@@ -1026,15 +1145,23 @@ class KarrasModule(lightning.LightningModule):
 
     def training_step(self, batch, batch_idx):
         x, y, mask = self.select_batch(batch)
-        sigma = self.config.noisesampler.sample(x.shape[0]).to(x)  # [nbatch]
-        loss = self.loss_fn(x, sigma, y, mask)
+        if self.has_autoregressive_loss():
+            loss = self.autoregressive_loss_fn(x, y, mask)
+            self.log_autoregressive_step_losses("train")
+        else:
+            sigma = self.config.noisesampler.sample(x.shape[0]).to(x)  # [nbatch]
+            loss = self.loss_fn(x, sigma, y, mask)
         self.log("train_loss", loss, prog_bar=True, sync_dist=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
         x, y, mask = self.select_batch(batch)
-        sigma = self.config.noisesampler.sample(x.shape[0]).to(x)  # [nbatch]
-        loss = self.loss_fn(x, sigma, y, mask)
+        if self.has_autoregressive_loss():
+            loss = self.autoregressive_loss_fn(x, y, mask)
+            self.log_autoregressive_step_losses("valid")
+        else:
+            sigma = self.config.noisesampler.sample(x.shape[0]).to(x)  # [nbatch]
+            loss = self.loss_fn(x, sigma, y, mask)
         self.log("valid_loss", loss, prog_bar=True, sync_dist=True)
         self.log("val_loss", loss, prog_bar=True, sync_dist=True)  # For compat
         return loss
