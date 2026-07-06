@@ -1,0 +1,39 @@
+Epoch 99
+Checkpoint: /home/ubuntu/repos/DiffSci/savedmodels/experimental/20260611-bps-mnist-128ch-120samples/checkpoints/model-epoch=099-val_loss=0.076399.ckpt
+FLD Score (ODE): 92.583922
+FLD Score (SDE, gamma=0.01): 90.949681
+FLD Score (SDE, gamma=0.1): 89.962220
+FLD Score (SDE, gamma=0.3): 94.360062
+FLD Score (SDE, gamma=0.5): 90.838724
+FLD Score (SDE, gamma=1.0): 93.463668
+FLD Score (SDE, gamma=2.0): 89.121372
+FLD Score (SDE, gamma=3.0): 87.184516
+FLD Score (SDE, gamma=5.0): 90.604872
+FLD Score (SDE, gamma=8.0): 86.313802
+
+Epoch 199
+Checkpoint: /home/ubuntu/repos/DiffSci/savedmodels/experimental/20260611-bps-mnist-128ch-120samples/checkpoints/model-epoch=199-val_loss=0.092190.ckpt
+FLD Score (ODE): 84.519637
+FLD Score (SDE, gamma=0.01): 84.251156
+FLD Score (SDE, gamma=0.1): 82.181504
+FLD Score (SDE, gamma=0.3): 82.718322
+FLD Score (SDE, gamma=0.5): 82.825172
+FLD Score (SDE, gamma=1.0): 82.937849
+FLD Score (SDE, gamma=2.0): 82.701090
+FLD Score (SDE, gamma=3.0): 81.178230
+FLD Score (SDE, gamma=5.0): 83.416671
+FLD Score (SDE, gamma=8.0): 84.276080
+
+Epoch 499
+Checkpoint: /home/ubuntu/repos/DiffSci/savedmodels/experimental/20260611-bps-mnist-128ch-120samples/checkpoints/model-epoch=499-val_loss=0.155855.ckpt
+FLD Score (ODE): 82.041445
+FLD Score (SDE, gamma=0.01): 81.060970
+FLD Score (SDE, gamma=0.1): 81.850830
+FLD Score (SDE, gamma=0.3): 80.953541
+FLD Score (SDE, gamma=0.5): 79.094431
+FLD Score (SDE, gamma=1.0): 76.930103
+FLD Score (SDE, gamma=2.0): 77.342880
+FLD Score (SDE, gamma=3.0): 77.314153
+FLD Score (SDE, gamma=5.0): 75.855395
+FLD Score (SDE, gamma=8.0): 79.035607
+

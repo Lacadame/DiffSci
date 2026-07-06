@@ -125,8 +125,8 @@ class DimensionAgnosticBatchNorm(torch.nn.Module):
             var = x.var(dim=dims, unbiased=False)
 
             # Update running stats
-            self.running_mean = self.momentum * self.running_mean + (1 - self.momentum) * mean.detach()
-            self.running_var = self.momentum * self.running_var + (1 - self.momentum) * var.detach()
+            self.running_mean = (1 - self.momentum) * self.running_mean + self.momentum * mean.detach()
+            self.running_var = (1 - self.momentum) * self.running_var + self.momentum * var.detach()
         else:
             mean = self.running_mean
             var = self.running_var
@@ -169,6 +169,24 @@ class DimensionAgnosticBatchNorm(torch.nn.Module):
 
         x = x * torch.sqrt(var + self.eps) + mean
         return x
+
+
+class ConstantBatchNorm(torch.nn.Module):
+    def __init__(self, sigma: float = 1.0):
+        super().__init__()
+        self.sigma = sigma
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x / self.sigma
+
+    def unnorm(self, x: torch.Tensor) -> torch.Tensor:
+        return x * self.sigma
+
+    def normalize(self, x: torch.Tensor) -> torch.Tensor:
+        return x / self.sigma
+
+    def unnormalize(self, x: torch.Tensor) -> torch.Tensor:
+        return x * self.sigma
 
 
 class IdentityBatchNorm(torch.nn.Module):

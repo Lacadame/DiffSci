@@ -1,4 +1,6 @@
+import json
 import math
+import time
 
 import torch
 from torch import Tensor
@@ -411,6 +413,25 @@ class MixtureOfGaussiansDataset(AnalyticalDataset):
         self.means = means
         self.weights = weights/torch.sum(weights)  # We guarantee normalization
         self.scale = scale
+        # region agent log
+        with open("/home/ubuntu/repos/DiffSci/.cursor/debug-db569c.log", "a", encoding="utf-8") as _f:
+            _f.write(json.dumps({
+                "sessionId": "db569c",
+                "runId": "pre-fix",
+                "hypothesisId": "H1",
+                "location": "diffsci/data/toy_datasets.py:MixtureOfGaussiansDataset.__init__",
+                "message": "MoG init argument summary",
+                "data": {
+                    "num_samples": int(num_samples),
+                    "means_shape": list(means.shape),
+                    "weights_shape": list(weights.shape),
+                    "scale_type": str(type(scale)),
+                    "scale_dim": int(scale.dim()) if isinstance(scale, Tensor) else None,
+                    "scale_shape": list(scale.shape) if isinstance(scale, Tensor) else None
+                },
+                "timestamp": int(time.time() * 1000)
+            }) + "\n")
+        # endregion
         super().__init__(num_samples)
 
     def sample(self
@@ -419,9 +440,43 @@ class MixtureOfGaussiansDataset(AnalyticalDataset):
                                     self.num_samples,
                                     replacement=True)
         means = self.means[indexes, ...]
+        # region agent log
+        with open("/home/ubuntu/repos/DiffSci/.cursor/debug-db569c.log", "a", encoding="utf-8") as _f:
+            _f.write(json.dumps({
+                "sessionId": "db569c",
+                "runId": "pre-fix",
+                "hypothesisId": "H2",
+                "location": "diffsci/data/toy_datasets.py:MixtureOfGaussiansDataset.sample",
+                "message": "MoG sample before scale branch",
+                "data": {
+                    "indexes_shape": list(indexes.shape),
+                    "means_shape": list(means.shape),
+                    "scale_is_float": isinstance(self.scale, float),
+                    "scale_type": str(type(self.scale)),
+                    "scale_dim": int(self.scale.dim()) if isinstance(self.scale, Tensor) else None,
+                    "scale_shape": list(self.scale.shape) if isinstance(self.scale, Tensor) else None
+                },
+                "timestamp": int(time.time() * 1000)
+            }) + "\n")
+        # endregion
         if isinstance(self.scale, float):
             scale = self.scale
         else:
+            # region agent log
+            with open("/home/ubuntu/repos/DiffSci/.cursor/debug-db569c.log", "a", encoding="utf-8") as _f:
+                _f.write(json.dumps({
+                    "sessionId": "db569c",
+                    "runId": "pre-fix",
+                    "hypothesisId": "H3",
+                    "location": "diffsci/data/toy_datasets.py:MixtureOfGaussiansDataset.sample",
+                    "message": "MoG sample taking tensor scale branch",
+                    "data": {
+                        "about_to_index_scale": True,
+                        "scale_dim": int(self.scale.dim()) if isinstance(self.scale, Tensor) else None
+                    },
+                    "timestamp": int(time.time() * 1000)
+                }) + "\n")
+            # endregion
             scale = self.scale[indexes].unsqueeze(-1)
         noise = scale * torch.randn_like(means)
         return means + noise
@@ -507,6 +562,239 @@ class MixtureOfGaussiansDataset(AnalyticalDataset):
         return grad_logp
 
 
+class GeneralMixtureOfGaussiansDataset(AnalyticalDataset):
+    """
+    A dataset which is a mixture of multivariate gaussian distributions with
+    full covariance matrices.
+
+    Parameters:
+        ----------
+        means: torch.Tensor of shape [nmixtures, *shape].
+            The means of the gaussian components.
+        covariances: torch.Tensor of shape [nmixtures, ndim, ndim].
+            The covariance matrices associated to each gaussian component.
+            Here, ndim = prod(shape).
+        weights: torch.Tensor of shape [nmixtures].
+            The set of weights associated to each distribution when sampling.
+        num_samples: int.
+            The number of points to generate.
+    """
+    def __init__(
+            self,
+            num_samples: int,
+            means: Float[Tensor, "nmixtures *shape"],  # noqa: F821
+            covariances: Float[Tensor, "nmixtures ndim ndim"],  # noqa: F821
+            weights: Float[Tensor, "nmixtures"],  # noqa: F821
+            ):
+        self.shape = means.shape[1:]
+        self.ndim = math.prod(self.shape)
+        self.nmixtures = means.shape[0]
+        self.means = means
+        self.means_flat = means.reshape(self.nmixtures, self.ndim)
+        self.weights = weights/torch.sum(weights)  # We guarantee normalization
+        self.covariances = covariances
+        if self.covariances.shape != (self.nmixtures, self.ndim, self.ndim):
+            raise ValueError(
+                "covariances must have shape [nmixtures, ndim, ndim], "
+                f"got {tuple(self.covariances.shape)} with ndim={self.ndim}."
+            )
+        super().__init__(num_samples)
+
+    @staticmethod
+    def covariances_from_eigendecomposition(
+            eigenvalues: Float[Tensor, "nmixtures ndim"],  # noqa: F821
+            eigenvectors: Float[Tensor, "nmixtures ndim ndim"],  # noqa: F821
+            ) -> Float[Tensor, "nmixtures ndim ndim"]:  # noqa: F821
+        """
+        Build covariance matrices from eigenvalues/eigenvectors.
+
+        For each component k:
+            Sigma_k = V_k @ diag(lambda_k) @ V_k^T
+        """
+        if eigenvalues.dim() != 2:
+            raise ValueError(
+                "eigenvalues must have shape [nmixtures, ndim], "
+                f"got {tuple(eigenvalues.shape)}."
+            )
+        if eigenvectors.dim() != 3:
+            raise ValueError(
+                "eigenvectors must have shape [nmixtures, ndim, ndim], "
+                f"got {tuple(eigenvectors.shape)}."
+            )
+        nmixtures, ndim = eigenvalues.shape
+        if eigenvectors.shape != (nmixtures, ndim, ndim):
+            raise ValueError(
+                "eigenvectors must match eigenvalues shape as "
+                "[nmixtures, ndim, ndim], "
+                f"got {tuple(eigenvectors.shape)} for "
+                f"eigenvalues {tuple(eigenvalues.shape)}."
+            )
+        if torch.any(eigenvalues <= 0):
+            raise ValueError("All eigenvalues must be strictly positive.")
+
+        diag_eigs = torch.diag_embed(eigenvalues)
+        covariances = eigenvectors @ diag_eigs @ eigenvectors.transpose(-1, -2)
+        return covariances
+
+    @classmethod
+    def from_eigendecomposition(
+            cls,
+            num_samples: int,
+            means: Float[Tensor, "nmixtures *shape"],  # noqa: F821
+            eigenvalues: Float[Tensor, "nmixtures ndim"],  # noqa: F821
+            eigenvectors: Float[Tensor, "nmixtures ndim ndim"],  # noqa: F821
+            weights: Float[Tensor, "nmixtures"],  # noqa: F821
+            ) -> "GeneralMixtureOfGaussiansDataset":
+        """
+        Construct a Gaussian mixture from per-component eigendecomposition.
+
+        Parameters:
+            eigenvalues: variances along principal axes.
+            eigenvectors: principal directions (columns of V).
+        """
+        covariances = cls.covariances_from_eigendecomposition(
+            eigenvalues=eigenvalues,
+            eigenvectors=eigenvectors,
+        )
+        return cls(
+            num_samples=num_samples,
+            means=means,
+            covariances=covariances,
+            weights=weights,
+        )
+
+    def _resolve_scaling(
+            self,
+            scaling: float | Float[Tensor, "batch"],  # noqa: F821
+            batch: int,
+            x: Tensor
+            ) -> Float[Tensor, "batch"]:  # noqa: F821
+        if isinstance(scaling, float) or isinstance(scaling, int):
+            return torch.full(
+                (batch,),
+                float(scaling),
+                dtype=x.dtype,
+                device=x.device,
+            )
+        if scaling.dim() == 0:
+            return scaling.to(device=x.device, dtype=x.dtype).expand(batch)
+        return scaling.to(device=x.device, dtype=x.dtype)
+
+    def _component_logprob_and_score(
+            self,
+            x: Float[Tensor, "batch *shape"],  # noqa: F821
+            sigma: Float[Tensor, "batch"],  # noqa: F821
+            scaling: float | Float[Tensor, "batch"] = 1.0  # noqa: F821
+            ) -> tuple[
+                Float[Tensor, "batch nmixtures"],  # noqa: F821
+                Float[Tensor, "batch nmixtures ndim"],  # noqa: F821
+            ]:
+        batch = x.shape[0]
+        sigma = sigma.to(device=x.device, dtype=x.dtype)
+        scaling_tensor = self._resolve_scaling(scaling, batch, x)
+        x_flat = x.reshape(batch, self.ndim)
+        means_flat = self.means_flat.to(device=x.device, dtype=x.dtype)
+        covariances = self.covariances.to(device=x.device, dtype=x.dtype)
+        eye = torch.eye(self.ndim, dtype=x.dtype, device=x.device)
+
+        means_scaled = scaling_tensor[:, None, None] * means_flat[None, :, :]
+        sigma2 = sigma[:, None, None, None] ** 2
+        cov = covariances[None, :, :, :] + sigma2 * eye[None, None, :, :]
+        cov = (scaling_tensor[:, None, None, None] ** 2) * cov
+
+        diff = x_flat[:, None, :] - means_scaled  # [b, n, d]
+        chol = torch.linalg.cholesky(cov)  # [b, n, d, d]
+        solved = torch.cholesky_solve(diff.unsqueeze(-1), chol).squeeze(-1)
+        quad = (diff * solved).sum(dim=-1)  # [b, n]
+
+        logdet = 2 * torch.log(
+            torch.diagonal(chol, dim1=-2, dim2=-1)
+        ).sum(dim=-1)  # [b, n]
+        normalizer = self.ndim * math.log(2 * math.pi)
+        log_weights = torch.log(self.weights).to(device=x.device, dtype=x.dtype)
+        log_components = -0.5 * (quad + logdet + normalizer) + log_weights
+        score_components = -solved  # [b, n, d]
+        return log_components, score_components
+
+    def sample(self
+               ) -> Shaped[Tensor, "num_samples *shape"]:  # noqa: F821
+        indexes = torch.multinomial(self.weights,
+                                    self.num_samples,
+                                    replacement=True)
+        means = self.means_flat[indexes, :]  # [num_samples, ndim]
+        covariances = self.covariances[indexes, :, :]  # [num_samples, ndim, ndim]
+        chol = torch.linalg.cholesky(covariances)
+        noise = torch.matmul(
+            chol,
+            torch.randn(
+                self.num_samples,
+                self.ndim,
+                1,
+                dtype=means.dtype,
+                device=means.device,
+            ),
+        ).squeeze(-1)
+        samples = means + noise
+        return samples.reshape(self.num_samples, *self.shape)
+
+    def prob(self,
+             x: Float[Tensor, "batch *shape"],  # noqa: F821
+             sigma: Float[Tensor, "batch"],  # noqa: F821
+             scaling: float | Float[Tensor, "batch"] = 1.0  # noqa: F821
+             ) -> Float[Tensor, "batch"]:  # noqa: F821
+        """
+        Calculate the probability of x.
+
+        Parameters:
+        ----------
+        x : torch.Tensor of shape (batch, *shape).
+        sigma : torch.Tensor of shape (batch).
+        scaling : float | torch.Tensor of shape (batch).
+            Optional scaling applied to both means and covariance.
+
+        Returns:
+        -------
+        prob : torch.Tensor of shape (batch,).
+        """
+        log_components, _ = self._component_logprob_and_score(
+            x=x,
+            sigma=sigma,
+            scaling=scaling,
+        )
+        return torch.exp(torch.logsumexp(log_components, dim=1))
+
+    def gradlogprob(self,
+                    x: Float[Tensor, "batch *shape"],  # noqa: F821
+                    sigma: Float[Tensor, "batch"],  # noqa: F821
+                    scaling: float | Float[Tensor, "batch"] = 1.0  # noqa: F821
+                    ) -> Float[Tensor, "batch *shape"]:  # noqa: F821
+        """
+        Calculate the grad log-probability of x.
+
+        Parameters:
+        ----------
+        x : torch.Tensor of shape (batch, *shape).
+        sigma : torch.Tensor of shape (batch).
+        scaling : float | torch.Tensor of shape (batch).
+            Optional scaling applied to both means and covariance.
+
+        Returns:
+        -------
+        grad_logp : torch.Tensor of shape (batch, *shape).
+        """
+        log_components, score_components = self._component_logprob_and_score(
+            x=x,
+            sigma=sigma,
+            scaling=scaling,
+        )
+        responsibilities = torch.softmax(log_components, dim=1)
+        grad_logp = torch.sum(
+            responsibilities[..., None] * score_components,
+            dim=1,
+        )
+        return grad_logp.reshape(x.shape[0], *self.shape)
+
+
 class DiagonalGaussianDataset(AnalyticalDataset):
     """
     A dataset consisting of a generator of a multivariate gaussian with
@@ -587,7 +875,8 @@ class Single1DUniformDataset(AnalyticalDataset):
 
     def prob(self,
              x: Tensor,  # noqa: F821
-             sigma: Tensor  # noqa: F821
+             sigma: Tensor,  # noqa: F821
+             scaling: float | Tensor = 1.0  # noqa: F821
              ) -> Tensor:  # noqa: F821
         """
         Calculate the probability of x.
@@ -677,7 +966,8 @@ class MixtureOf1DUniformsDataset(AnalyticalDataset):
 
     def prob(self,
              x: Tensor,  # noqa: F821
-             sigma: Tensor  # noqa: F821
+             sigma: Tensor,  # noqa: F821
+             scaling: float | Tensor = 1.0  # noqa: F821
              ) -> Tensor:  # noqa: F821
         """
         Calculate the probability of x for the mixture distribution.
@@ -693,13 +983,20 @@ class MixtureOf1DUniformsDataset(AnalyticalDataset):
         """
         normal_dist = Normal(0, 1)
         sigma = broadcast_from_below(sigma, x)
-        total_prob = torch.zeros(x.shape)
+        if isinstance(scaling, float) or isinstance(scaling, int):
+            scaling_tensor = torch.full_like(sigma, float(scaling))
+        else:
+            scaling_tensor = broadcast_from_below(scaling, x)
+        sigma_scaled = scaling_tensor * sigma
+        total_prob = torch.zeros_like(x)
 
         # Sum the probabilities from each uniform component in the mixture
         for i, (a, b) in enumerate(self.intervals):
-            phi_a = normal_dist.cdf((x - a) / sigma)
-            phi_b = normal_dist.cdf((x - b) / sigma)
-            prob_i = 1 / (b - a) * (phi_a - phi_b)
+            a_scaled = scaling_tensor * a
+            b_scaled = scaling_tensor * b
+            phi_a = normal_dist.cdf((x - a_scaled) / sigma_scaled)
+            phi_b = normal_dist.cdf((x - b_scaled) / sigma_scaled)
+            prob_i = 1 / (b_scaled - a_scaled) * (phi_a - phi_b)
             total_prob += self.weights[i] * prob_i
 
         total_prob = total_prob.squeeze(-1)
@@ -708,6 +1005,7 @@ class MixtureOf1DUniformsDataset(AnalyticalDataset):
     def gradlogprob(self,
                     x: Tensor,  # noqa: F821
                     sigma: Tensor,  # noqa: F821
+                    scaling: float | Tensor = 1.0,  # noqa: F821
                     epsilon: float = 1e-15
                     ) -> Tensor:  # noqa: F821
         """
@@ -724,20 +1022,27 @@ class MixtureOf1DUniformsDataset(AnalyticalDataset):
         """
         normal_dist = Normal(0, 1)
         sigma = broadcast_from_below(sigma, x)
-        total_p = torch.zeros(x.shape)
-        total_gradp = torch.zeros(x.shape)
+        if isinstance(scaling, float) or isinstance(scaling, int):
+            scaling_tensor = torch.full_like(sigma, float(scaling))
+        else:
+            scaling_tensor = broadcast_from_below(scaling, x)
+        sigma_scaled = scaling_tensor * sigma
+        total_p = torch.zeros_like(x)
+        total_gradp = torch.zeros_like(x)
 
         # Sum the gradients from each uniform component in the mixture
         for i, (a, b) in enumerate(self.intervals):
-            pdf_a = normal_dist.log_prob((x - a) / sigma).exp()
-            pdf_b = normal_dist.log_prob((x - b) / sigma).exp()
-            phi_a = normal_dist.cdf((x - a) / sigma)
-            phi_b = normal_dist.cdf((x - b) / sigma)
+            a_scaled = scaling_tensor * a
+            b_scaled = scaling_tensor * b
+            pdf_a = normal_dist.log_prob((x - a_scaled) / sigma_scaled).exp()
+            pdf_b = normal_dist.log_prob((x - b_scaled) / sigma_scaled).exp()
+            phi_a = normal_dist.cdf((x - a_scaled) / sigma_scaled)
+            phi_b = normal_dist.cdf((x - b_scaled) / sigma_scaled)
 
-            gradp = (pdf_a - pdf_b) / (b-a)
-            p = (phi_a - phi_b) / (b-a)
+            gradp = (pdf_a - pdf_b) / (b_scaled - a_scaled)
+            p = (phi_a - phi_b) / (b_scaled - a_scaled)
             total_gradp += self.weights[i] * gradp
             total_p += self.weights[i] * p
 
-        grad_logp = total_gradp / (total_p * sigma + epsilon)
+        grad_logp = total_gradp / (total_p * sigma_scaled + epsilon)
         return grad_logp

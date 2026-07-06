@@ -1,7 +1,7 @@
 DiffSci
 ==============================
 
-Neural networks for porous media
+Diffusion models for scientific and engineering applications
 
 --------
 

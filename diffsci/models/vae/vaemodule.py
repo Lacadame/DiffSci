@@ -1,9 +1,10 @@
 import math
-from typing import Literal, Dict, Callable
+from typing import Literal
 
 import torch
 import torchvision
 import lightning
+import lightning.pytorch.callbacks as pl_callbacks
 from torch import Tensor
 from jaxtyping import Float
 
@@ -17,8 +18,21 @@ TeachingMode = Literal["both", "encoder", "decoder"]
 def default_scheduler(optimizer):
     return torch.optim.lr_scheduler.LambdaLR(
         optimizer,
-        lr_lambda=lambda step: 1.0 + 0*step
+        lr_lambda=lambda step: 1.0 + 0 * step
     )
+
+
+# Add KL annealing for stable training
+class KLAnnealingCallback(pl_callbacks.Callback):
+    def __init__(self, n_epochs=5, maximum_kl_weight=0.1):
+        self.n_epochs = n_epochs
+        self.maximum_kl_weight = maximum_kl_weight
+
+    def on_train_epoch_start(self, trainer, pl_module):
+        epoch = trainer.current_epoch
+        if epoch < self.n_epochs:
+            weight = min(1.0, (epoch / self.n_epochs)) * self.maximum_kl_weight
+            pl_module.loss_module.config.kl_weight = weight
 
 
 class VAEModuleConfig:
@@ -34,17 +48,20 @@ class VAEModuleConfig:
         trainable_logvar: Whether the log variance is a trainable parameter.
         reduce_mean: If True, reduce losses by mean; otherwise, sum and divide by batch size.
         adversarial_weight: Weight for the adversarial loss term.
+        latent_matching_type: Distance metric for latent matching in distillation (default: 'wasserstein').
+        teaching_mode: What to distill - 'encoder', 'decoder', or 'both'.
+        distillation_alpha: Weight for distillation loss (1.0 = distillation only).
     """
     def __init__(self,
                  kl_weight: float = 1e-3,
                  nll_weight: float = 1.0,
                  logvar_init: float = 0.0,
-                 trainable_logvar: bool = True,
-                 reduce_mean: bool = False,
+                 trainable_logvar: bool = False,
+                 reduce_mean: bool = True,
                  teacher_encdec: torch.nn.Module | None = None,
                  teaching_mode: TeachingMode = "both",
                  distillation_alpha: float = 0.5,
-                 latent_matching_type: LatentMatchingType = "kl",
+                 latent_matching_type: LatentMatchingType = "wasserstein",
                  adversarial_weight: float = 0.01,
                  num_channels: int | None = None,
                  initial_norm: bool = False,
@@ -55,7 +72,7 @@ class VAEModuleConfig:
                  loss_preprocessor: Literal['edges', 'none'] | torch.nn.Module = 'none',
                  total_variation_weight: float = 0.0):
         self.kl_weight = kl_weight
-        self.nll_weight = nll_weight  # Unused for now
+        self.nll_weight = nll_weight
         self.logvar_init = logvar_init
         self.trainable_logvar = trainable_logvar
         self.reduce_mean = reduce_mean
@@ -209,6 +226,7 @@ class VAELoss(torch.nn.Module):
 
     def freeze_teacher(self):
         if self.config.teacher_encdec is not None:
+            self.config.teacher_encdec.eval()
             for param in self.config.teacher_encdec.parameters():
                 param.requires_grad = False
 
@@ -225,13 +243,13 @@ class VAELoss(torch.nn.Module):
             loss, logs = self.distillation_loss(x, vae_module, y, None, None)
             if return_intermediates:
                 # For distillation-only, we still need to compute these
-                encoder_outputs = vae_module.encode(x, y)
+                encoder_outputs = vae_module.encode(x, y, preencode=False)
                 x_recon = vae_module.decode(encoder_outputs['zsample'], y)
                 return loss, logs, encoder_outputs, x_recon
             return loss, logs
 
-        encoder_outputs = vae_module.encode(x, y)
-        x_recon = vae_module.decode(encoder_outputs['zsample'], y)
+        encoder_outputs = vae_module.encode(x, y, preencode=False)
+        x_recon = vae_module.decode(encoder_outputs['zsample'], y, postdecode=False)
         zdistrib = encoder_outputs['zdistrib']
 
         reduce_mean = self.config.reduce_mean
@@ -282,44 +300,76 @@ class VAELoss(torch.nn.Module):
         nsamples = x.shape[0]  # Duplicated but it is fine, extremely cheap operation
         reduce_mean = self.config.reduce_mean
 
-        if zdistrib is None:
-            if self.config.teaching_mode == "decoder":
-                zdistrib = DiagonalGaussianDistribution(
-                    self.config.teacher_encdec.encoder(x))
-                zsample = zdistrib.sample()
-            else:
-                zdistrib = vae_module.encode(x, y)['zdistrib']
-                zsample = zdistrib.sample()
-
-        if x_recon is None:
-            if self.config.teaching_mode == "encoder":
-                x_recon = 0.0  # It will be ignored
-            else:
-                x_recon = vae_module.decode(zsample, y)
+        # Always freeze & eval teacher
+        self.config.teacher_encdec.eval()
 
         if self.config.teaching_mode == "decoder":
+            # Decoder KD: drive both decoders with the SAME teacher latent
+            with torch.no_grad():
+                teacher_z = self.config.teacher_encdec.encoder(x)  # [b, 2*zdim, ...]
+                teacher_zdistrib = DiagonalGaussianDistribution(teacher_z)
+                # Use mode for stability (deterministic, no sampling noise)
+                z_for_both = teacher_zdistrib.mode()
+
+            # Run both decoders on the SAME latent
+            student_x_recon = vae_module.decode(z_for_both, y, postdecode=False)
+            teacher_x_recon = self.config.teacher_encdec.decoder(z_for_both)
+
+            # Output matching
+            output_matching_loss = self.reconstruction_loss_fn(
+                self.loss_preprocessor(student_x_recon),
+                self.loss_preprocessor(teacher_x_recon),
+                reduction='none'
+            )
+            if reduce_mean:
+                output_matching_loss = torch.mean(output_matching_loss)
+            else:
+                output_matching_loss = torch.sum(output_matching_loss) / nsamples
+
             latent_space_matching_loss = torch.tensor(0.0).to(x)
-            teacher_zsample = zsample
-        else:
-            teacher_z = self.config.teacher_encdec.encoder(x)  # [b, 2*zdim, ...]
-            teacher_zdistrib = DiagonalGaussianDistribution(teacher_z)
-            teacher_zsample = teacher_zdistrib.sample()
+
+        elif self.config.teaching_mode == "encoder":
+            # Encoder KD: match latent distributions
+            if zdistrib is None:
+                zdistrib = vae_module.encode(x, y, preencode=False)['zdistrib']
+
+            with torch.no_grad():
+                teacher_z = self.config.teacher_encdec.encoder(x)  # [b, 2*zdim, ...]
+                teacher_zdistrib = DiagonalGaussianDistribution(teacher_z)
+
+            latent_space_matching_loss = self.calculate_latent_space_matching_loss(
+                zdistrib, teacher_zdistrib, reduce_mean, nsamples)
+            output_matching_loss = torch.tensor(0.0).to(x)
+
+        else:  # teaching_mode == "both"
+            # Match both encoder and decoder
+            if zdistrib is None:
+                zdistrib = vae_module.encode(x, y, preencode=False)['zdistrib']
+                zsample = zdistrib.sample()
+            else:
+                zsample = zdistrib.sample()
+
+            if x_recon is None:
+                x_recon = vae_module.decode(zsample, y, postdecode=False)
+
+            with torch.no_grad():
+                teacher_z = self.config.teacher_encdec.encoder(x)  # [b, 2*zdim, ...]
+                teacher_zdistrib = DiagonalGaussianDistribution(teacher_z)
+                teacher_zsample = teacher_zdistrib.sample()
+                teacher_x_recon = self.config.teacher_encdec.decoder(teacher_zsample)
+
             latent_space_matching_loss = self.calculate_latent_space_matching_loss(
                 zdistrib, teacher_zdistrib, reduce_mean, nsamples)
 
-        if self.config.teaching_mode == "encoder":
-            output_matching_loss = torch.tensor(0.0).to(x)
-        else:
-            teacher_x_recon = self.config.teacher_encdec.decoder(teacher_zsample)  # [b, c, ...]
             output_matching_loss = self.reconstruction_loss_fn(
                 self.loss_preprocessor(x_recon),
                 self.loss_preprocessor(teacher_x_recon),
                 reduction='none'
             )
             if reduce_mean:
-                output_matching_loss = torch.mean(output_matching_loss)  # []
+                output_matching_loss = torch.mean(output_matching_loss)
             else:
-                output_matching_loss = torch.sum(output_matching_loss) / nsamples  # []
+                output_matching_loss = torch.sum(output_matching_loss) / nsamples
 
         loss = latent_space_matching_loss + output_matching_loss
         logs = {
@@ -354,7 +404,8 @@ class VAEModule(lightning.LightningModule):
                  config: VAEModuleConfig,
                  discriminator: torch.nn.Module | None = None,
                  conditional: bool = False,
-                 verbose: bool = False):
+                 verbose: bool = False,
+                 encoder_outputs_tensor: bool=False):
         super().__init__()
         self.encdec = encdec
         assert hasattr(self.encdec, "encoder") and hasattr(self.encdec, "decoder"), \
@@ -375,7 +426,7 @@ class VAEModule(lightning.LightningModule):
 
         self.set_optimizer_and_scheduler()
         self.verbose = verbose
-
+        self.encoder_outputs_tensor = encoder_outputs_tensor
         if self.config.has_initial_norm:
             num_channels = self.config.num_channels if self.config.num_channels is not None else 1
             self.initial_norm = batchnorm.DimensionAgnosticBatchNorm(
@@ -407,7 +458,7 @@ class VAEModule(lightning.LightningModule):
     def encode(self, x: Float[Tensor, "batch channels *shape"],  # noqa: F821, F722
                y: Float[Tensor, "batch *yshape"] | None = None,  # noqa: F821, F722
                sample: bool = True,
-               preencode: bool = None):
+               preencode: bool | None = None):
         if preencode is None:
             preencode = not self.training
         if preencode:
@@ -418,11 +469,14 @@ class VAEModule(lightning.LightningModule):
             zsample = zdistrib.sample()
         else:
             zsample = zdistrib.mode()
-        return {'zdistrib': zdistrib, 'zsample': zsample}
+        if self.encoder_outputs_tensor:
+            return zsample
+        else:
+            return {'zdistrib': zdistrib, 'zsample': zsample}
 
     def decode(self, zsample: Float[Tensor, "batch zdim *shape"],  # noqa: F821, F722
-               y: Float[Tensor, "batch *yshape"] | None = None,
-               postdecode: bool = None):  # noqa: F821, F722
+               y: Float[Tensor, "batch *yshape"] | None = None,  # noqa: F821, F722
+               postdecode: bool = None):
         if postdecode is None:
             postdecode = not self.training
         x_recon = self.decoder(zsample, y) if self.conditional else self.decoder(zsample)
@@ -476,8 +530,8 @@ class VAEModule(lightning.LightningModule):
         x = self.preencode(x, y)
         # Generate fake samples (no gradients to generator)
         with torch.no_grad():
-            encoder_outputs = self.encode(x, y)
-            x_fake = self.decode(encoder_outputs['zsample'], y)
+            encoder_outputs = self.encode(x, y, preencode=False)
+            x_fake = self.decode(encoder_outputs['zsample'], y, postdecode=False)
 
         # Discriminator predictions
         if self.conditional and y is not None:
@@ -552,8 +606,13 @@ class VAEModule(lightning.LightningModule):
 
     def log_images_to_tensorboard(self, x, x_recon, batch_idx, max_images=4):
         # Only log up to max_images
-        x = x[:max_images]
-        x_recon = x_recon[:max_images]
+        # Take first slice if 5D tensor, otherwise keep as is
+        if x.dim() == 5:
+            x = x[:max_images, ..., 0]
+            x_recon = x_recon[:max_images, ..., 0]
+        else:
+            x = x[:max_images]
+            x_recon = x_recon[:max_images]
         # Assume images are [B, C, H, W] and in range [0, 1] or [0, 255]
         # If not, normalize as needed
         grid = torch.cat([x, x_recon], dim=0)  # Stack originals and reconstructions
@@ -565,14 +624,17 @@ class VAEModule(lightning.LightningModule):
     def validation_step(self, batch, batch_idx):
 
         # TODO: Remove this
+        # TODO: Check with Danilo if this is correct
+        """
         if batch_idx == 0:  # Only log for the first batch to avoid flooding
             x, y = self.select_batch(batch)
             x = self.preencode(x, y)
-            encoder_outputs = self.encode(x, y)
-            x_recon = self.decode(encoder_outputs['zsample'], y)
+            encoder_outputs = self.encode(x, y, preencode=False)
+            x_recon = self.decode(encoder_outputs['zsample'], y, postdecode=False)
+            # x_recon = self.postdecode(x_recon, y)
             # Log images
             self.log_images_to_tensorboard(x, x_recon, batch_idx)
-
+        """
         if not self.is_adversarial:
             # Standard VAE validation
             loss, logs = self.loss_fn(batch)
@@ -745,6 +807,30 @@ class DiagonalGaussianDistribution(torch.nn.Module):
                 torch.pow(self.mean - other.mean, 2) / other.var
                 + self.var / other.var - 1.0 - self.logvar + other.logvar,
                 dim=dims)
+        return result
+
+    def kl_thresholded(
+        self,
+        other: "DiagonalGaussianDistribution | None" = None,
+        reduce_mean: bool = False,
+        threshold: float = 0.5
+    ):
+        dims = list(range(2, len(self.mean.shape)))
+        if not reduce_mean:
+            raise NotImplementedError("kl_thresholded only supports reduce_mean=True")
+        reduce_operator = torch.mean if reduce_mean else torch.sum
+        if other is None:
+            result = 0.5 * reduce_operator((torch.pow(self.mean, 2)
+                                            + self.var - 1.0 - self.logvar),
+                                           dim=dims)
+        else:  # Other is the unit Gaussian
+            result = 0.5 * reduce_operator(
+                torch.pow(self.mean - other.mean, 2) / other.var
+                + self.var / other.var - 1.0 - self.logvar + other.logvar,
+                dim=dims)
+        
+        threshold = threshold * torch.ones((result.shape[0], 1)).to(result)
+        result = torch.maximum(result, threshold)
         return result
 
     def nll(self, sample: Float[Tensor, "batch zdim *shape"], reduce_mean: bool = False):  # noqa: F821, F722

@@ -40,6 +40,7 @@ class VAENetConfig:
         patch_size: int = None,            # Patch size for patch-based convolutions
         memory_efficient_variant: bool = False,  # Use memory efficient decoding
         use_flash_attention: bool = True,  # Use torch.nn.functional.scaled_dot_product_attention
+        minimal_rf_mode: bool = False,  # Enable minimal receptive field architecture
     ):
         assert dimension in [1, 2, 3], f"Dimension must be 1, 2, or 3, got {dimension}"
 
@@ -67,6 +68,7 @@ class VAENetConfig:
         self.patch_size = patch_size
         self.memory_efficient_variant = memory_efficient_variant
         self.use_flash_attention = use_flash_attention
+        self.minimal_rf_mode = minimal_rf_mode
 
     def export_description(self) -> dict:
         """Export configuration as a dictionary."""
@@ -93,7 +95,8 @@ class VAENetConfig:
             "num_groups": self.num_groups,
             "patch_size": self.patch_size,
             "memory_efficient_variant": self.memory_efficient_variant,
-            "use_flash_attention": self.use_flash_attention
+            "use_flash_attention": self.use_flash_attention,
+            "minimal_rf_mode": self.minimal_rf_mode
         }
 
     @classmethod
@@ -322,6 +325,95 @@ class ResnetBlock(nn.Module):
         return x + h
 
 
+class MinimalResnetBlock(nn.Module):
+    """
+    Minimal ResNet block with single 3x3 conv and gating.
+    Receptive field growth: +2 per block (vs +4 for standard ResnetBlock)
+    """
+
+    def __init__(self, *, dimension, in_channels, out_channels=None,
+                 dropout, temb_channels=0, num_groups=32, patch_size=None):
+        super().__init__()
+        self.dimension = dimension
+        self.in_channels = in_channels
+        out_channels = in_channels if out_channels is None else out_channels
+        self.out_channels = out_channels
+        self.patch_size = patch_size
+
+        Conv = DimensionHelper.get_patch_conv_cls(dimension)
+
+        # Single convolution path
+        self.norm = get_norm(in_channels, num_groups=num_groups)
+        self.conv = Conv(in_channels, out_channels, kernel_size=3, stride=1, padding=1,
+                         patch_size=patch_size)
+        self.dropout = nn.Dropout(dropout)
+
+        # Gating mechanism for better gradient flow
+        self.gate = Conv(in_channels, out_channels, kernel_size=1, stride=1, padding=0,
+                         patch_size=patch_size)
+
+        # Time embedding projection if needed
+        if temb_channels > 0:
+            self.temb_proj = nn.Linear(temb_channels, out_channels)
+
+        # Channel adjustment if needed
+        if self.in_channels != self.out_channels:
+            self.channel_adjust = Conv(in_channels, out_channels, kernel_size=1,
+                                       stride=1, padding=0, patch_size=patch_size)
+        else:
+            self.channel_adjust = nn.Identity()
+
+    def forward(self, x, temb=None):
+        # Normalize and activate
+        h = self.norm(x)
+        h = nonlinearity(h)
+
+        # Main conv path
+        h = self.conv(h)
+
+        # Add time embedding if present
+        if temb is not None and hasattr(self, 'temb_proj'):
+            temb_h = self.temb_proj(nonlinearity(temb))
+            broadcast_shape = DimensionHelper.get_shape_for_broadcast(
+                self.dimension, h.shape[0], temb_h.shape[1])
+            h = h + temb_h.view(*broadcast_shape)
+
+        h = self.dropout(h)
+
+        # Gated residual connection
+        gate = torch.sigmoid(self.gate(x))
+        x_adjusted = self.channel_adjust(x)
+
+        return x_adjusted + gate * h
+
+
+def make_resblock(config, dimension, in_channels, out_channels=None,
+                  conv_shortcut=False, dropout=0.0, temb_channels=0,
+                  num_groups=32, patch_size=None):
+    """Factory function to create appropriate ResBlock based on config."""
+    if getattr(config, 'minimal_rf_mode', False):
+        return MinimalResnetBlock(
+            dimension=dimension,
+            in_channels=in_channels,
+            out_channels=out_channels,
+            dropout=dropout,
+            temb_channels=temb_channels,
+            num_groups=num_groups,
+            patch_size=patch_size
+        )
+    else:
+        return ResnetBlock(
+            dimension=dimension,
+            in_channels=in_channels,
+            out_channels=out_channels,
+            conv_shortcut=conv_shortcut,
+            dropout=dropout,
+            temb_channels=temb_channels,
+            num_groups=num_groups,
+            patch_size=patch_size
+        )
+
+
 class AttnBlock(nn.Module):
     """Self-attention block with dimension flexibility."""
 
@@ -540,11 +632,11 @@ class Upsample(nn.Module):
 
     def forward(self, x):
         if self.dimension == 1:
-            x = F.interpolate(x, scale_factor=2.0, mode="nearest")
+            x = F.interpolate(x, scale_factor=2.0, mode="area")
         elif self.dimension == 2:
-            x = F.interpolate(x, scale_factor=2.0, mode="nearest")
+            x = F.interpolate(x, scale_factor=2.0, mode="area")
         elif self.dimension == 3:
-            x = F.interpolate(x, scale_factor=2.0, mode="nearest")
+            x = F.interpolate(x, scale_factor=2.0, mode="area")
 
         if self.with_conv:
             x = self.conv(x)
@@ -591,7 +683,7 @@ class Downsample(nn.Module):
 
 
 class VAEEncoder(nn.Module):
-    """Multi-dimensional VAE encoder."""
+    """Multi-dimensional VAE encoder with RF calculation."""
 
     def __init__(self, config: VAENetConfig):
         super().__init__()
@@ -637,7 +729,8 @@ class VAEEncoder(nn.Module):
 
             block_out = config.ch * config.ch_mult[i_level]
             for i_block in range(config.num_res_blocks):
-                block.append(ResnetBlock(
+                block.append(make_resblock(
+                    config,
                     dimension=config.dimension,
                     in_channels=block_in,
                     out_channels=block_out,
@@ -671,7 +764,8 @@ class VAEEncoder(nn.Module):
 
         # Middle block
         self.mid = nn.Module()
-        self.mid.block_1 = ResnetBlock(
+        self.mid.block_1 = make_resblock(
+            config,
             dimension=config.dimension,
             in_channels=block_in,
             out_channels=block_in,
@@ -691,7 +785,8 @@ class VAEEncoder(nn.Module):
                 use_flash_attention=config.use_flash_attention,
             )
 
-        self.mid.block_2 = ResnetBlock(
+        self.mid.block_2 = make_resblock(
+            config,
             dimension=config.dimension,
             in_channels=block_in,
             out_channels=block_in,
@@ -780,6 +875,75 @@ class VAEEncoder(nn.Module):
 
         return h
 
+    def calculate_receptive_field(self):
+        """
+        Calculate theoretical receptive field in input space.
+        Returns dict with RF info and trace.
+        """
+        config = self.config
+
+        # Check for attention
+        has_attention = (
+            (config.has_mid_attn and config.attn_type != 'none') or
+            (len(config.attn_resolutions) > 0 and config.attn_type != 'none')
+        )
+
+        if has_attention:
+            return {
+                'rf_input': float('inf'),
+                'rf_latent': float('inf'),
+                'has_attention': True,
+                'feasible_chunking': False
+            }
+
+        # Determine RF growth per ResBlock
+        rf_per_block = 2 if getattr(config, 'minimal_rf_mode', False) else 4
+
+        rf = 1
+        trace = []
+
+        # Input conv
+        rf += 2
+        trace.append(f"conv_in: RF = {rf}")
+
+        # Downsampling blocks
+        current_stride = 1
+        for i_level in range(config.num_resolutions):
+            num_blocks = config.num_res_blocks
+            rf += num_blocks * rf_per_block
+            trace.append(f"down[{i_level}] ({num_blocks} blocks): RF = {rf}")
+
+            if i_level != config.num_resolutions - 1:
+                # Downsampling adds to RF (but we track in input space)
+                if config.resamp_with_conv:
+                    rf += 2  # 3x3 strided conv
+                else:
+                    rf += 1  # 2x2 pooling
+                current_stride *= 2
+                trace.append(f"down[{i_level}].downsample: RF = {rf}")
+
+        # Middle blocks
+        rf += 2 * rf_per_block
+        trace.append(f"mid blocks: RF = {rf}")
+
+        # Output convs
+        rf += 2  # conv_out
+        trace.append(f"conv_out: RF = {rf}")
+        # quant_conv is 1x1, no RF change
+
+        rf_at_latent = rf // current_stride
+
+        return {
+            'rf_input': rf,
+            'rf_latent': rf_at_latent,
+            'downsampling_factor': current_stride,
+            'has_attention': False,
+            'feasible_chunking': True,
+            'trace': trace,
+            'rf_per_block': rf_per_block,
+            'mode': 'minimal' if getattr(config, 'minimal_rf_mode', False) else 'standard'
+        }
+
 
 class VAEDecoder(nn.Module):
     """Multi-dimensional VAE decoder."""
@@ -825,7 +989,8 @@ class VAEDecoder(nn.Module):
 
         # Middle block
         self.mid = nn.Module()
-        self.mid.block_1 = ResnetBlock(
+        self.mid.block_1 = make_resblock(
+            config,
             dimension=config.dimension,
             in_channels=block_in,
             out_channels=block_in,
@@ -845,7 +1010,8 @@ class VAEDecoder(nn.Module):
                 use_flash_attention=config.use_flash_attention,
             )
 
-        self.mid.block_2 = ResnetBlock(
+        self.mid.block_2 = make_resblock(
+            config,
             dimension=config.dimension,
             in_channels=block_in,
             out_channels=block_in,
@@ -869,7 +1035,8 @@ class VAEDecoder(nn.Module):
             else:
                 block_out = config.ch * config.ch_mult[i_level]
             for i_block in range(config.num_res_blocks + 1):
-                block.append(ResnetBlock(
+                block.append(make_resblock(
+                    config,
                     dimension=config.dimension,
                     in_channels=block_in,
                     out_channels=block_out,
@@ -972,9 +1139,97 @@ class VAEDecoder(nn.Module):
 
         return h
 
+    def calculate_receptive_field(self):
+        """
+        Calculate theoretical receptive field in latent space.
+        This is the critical metric for chunking feasibility.
+        Returns dict with RF info, recommended overlap, and trace.
+        """
+        config = self.config
+        
+        # Check for attention
+        has_attention = (
+            (config.has_mid_attn and config.attn_type != 'none') or
+            (len(config.attn_resolutions) > 0 and config.attn_type != 'none')
+        )
+        
+        if has_attention:
+            return {
+                'rf_latent': float('inf'),
+                'has_attention': True,
+                'feasible_chunking': False,
+                'reason': 'Decoder uses global attention'
+            }
+        
+        # Determine RF growth per ResBlock
+        rf_per_block = 2 if getattr(config, 'minimal_rf_mode', False) else 4
+        
+        rf = 1
+        trace = []
+        
+        # post_quant_conv: 1x1, no RF change
+        trace.append(f"post_quant_conv (1x1): RF = {rf}")
+        
+        # conv_in: 3x3
+        rf += 2
+        trace.append(f"conv_in (3x3): RF = {rf}")
+        
+        # Middle blocks
+        rf += rf_per_block  # mid.block_1
+        trace.append(f"mid.block_1: RF = {rf}")
+        rf += rf_per_block  # mid.block_2
+        trace.append(f"mid.block_2: RF = {rf}")
+        
+        rf_after_middle = rf
+        
+        # Upsampling blocks
+        num_levels = config.num_resolutions
+        for i_level in reversed(range(num_levels)):
+            num_blocks = config.num_res_blocks + 1
+            rf += num_blocks * rf_per_block
+            trace.append(f"up[{i_level}] ({num_blocks} blocks): RF = {rf}")
+            
+            # Upsampling doesn't change RF in latent coordinates
+            if i_level != 0:
+                trace.append(f"up[{i_level}].upsample (no RF change in latent coords)")
+        
+        # Output conv: 3x3
+        rf += 2
+        trace.append(f"conv_out (3x3): RF = {rf}")
+        
+        # Calculate recommended overlap (1.5x safety factor, rounded up)
+        recommended_overlap = int(rf * 1.5)
+        # Round to nice numbers
+        if recommended_overlap <= 16:
+            recommended_overlap = 16
+        elif recommended_overlap <= 24:
+            recommended_overlap = 24
+        elif recommended_overlap <= 32:
+            recommended_overlap = 32
+        else:
+            recommended_overlap = ((recommended_overlap + 15) // 16) * 16
+        
+        # Spatial upsampling factor from latent to output space
+        spatial_factor = 2 ** (num_levels - 1)
+        
+        return {
+            'rf_latent': rf,
+            'rf_after_middle': rf_after_middle,
+            'rf_output': rf * spatial_factor,
+            'min_overlap': rf,
+            'recommended_overlap': recommended_overlap,
+            'spatial_upsampling_factor': spatial_factor,
+            'has_attention': False,
+            'feasible_chunking': True,
+            'trace': trace,
+            'rf_per_block': rf_per_block,
+            'mode': 'minimal' if getattr(config, 'minimal_rf_mode', False) else 'standard',
+            'num_convolutions': len([t for t in trace if 'RF' in t and 'no RF' not in t])
+        }
+
 
 class VAENet(nn.Module):
-    """Dimensionally-flexible VAE architecture."""
+    """Dimensionally-flexible VAE architecture with RF calculation."""
 
     def __init__(self, config: VAENetConfig):
         super().__init__()
@@ -1008,3 +1263,87 @@ class VAENet(nn.Module):
         return {
             "config": self.config.export_description(),
         }
+
+    def calculate_receptive_field(self):
+        """
+        Calculate receptive fields for both encoder and decoder.
+        Returns comprehensive RF analysis.
+        """
+        enc_rf = self.encoder.calculate_receptive_field()
+        dec_rf = self.decoder.calculate_receptive_field()
+
+        return {
+            'encoder': enc_rf,
+            'decoder': dec_rf,
+            'config': {
+                'minimal_rf_mode': getattr(self.config, 'minimal_rf_mode', False),
+                'num_res_blocks': self.config.num_res_blocks,
+                'ch_mult': self.config.ch_mult,
+                'has_mid_attn': self.config.has_mid_attn,
+                'attn_type': self.config.attn_type,
+                'attn_resolutions': self.config.attn_resolutions,
+            }
+        }
+
+    def print_receptive_field_summary(self):
+        """Print human-readable RF summary."""
+        rf_info = self.calculate_receptive_field()
+
+        print("=" * 80)
+        print("VAE RECEPTIVE FIELD ANALYSIS")
+        print("=" * 80)
+
+        print(f"\nConfiguration:")
+        print(f"  Mode: {'MINIMAL RF' if getattr(self.config, 'minimal_rf_mode', False) else 'STANDARD'}")
+        print(f"  Dimension: {self.config.dimension}D")
+        print(f"  ch_mult: {self.config.ch_mult}")
+        print(f"  num_res_blocks: {self.config.num_res_blocks}")
+        print(f"  has_mid_attn: {self.config.has_mid_attn}")
+        print(f"  attn_type: {self.config.attn_type}")
+
+        # Encoder
+        enc = rf_info['encoder']
+        print(f"\n{'='*80}")
+        print("ENCODER")
+        print("="*80)
+        if enc['has_attention']:
+            print("  ❌ Has global attention - RF is INFINITE")
+        else:
+            print(f"  RF in input space: {enc['rf_input']} pixels")
+            print(f"  RF in latent space: {enc['rf_latent']} pixels")
+            print(f"  Downsampling factor: {enc['downsampling_factor']}x")
+
+        # Decoder
+        dec = rf_info['decoder']
+        print(f"\n{'='*80}")
+        print("DECODER (Critical for Chunking)")
+        print("="*80)
+        if dec['has_attention']:
+            print("  ❌ Has global attention - RF is INFINITE")
+            print("  Chunking is NOT FEASIBLE")
+        else:
+            print(f"  RF in latent space: {dec['rf_latent']} pixels")
+            print(f"  RF after middle block: {dec['rf_after_middle']} pixels")
+            print(f"  RF in output space: {dec['rf_output']} pixels")
+            print(f"  Spatial upsampling: {dec['spatial_upsampling_factor']}x")
+
+            print(f"\n  ✓ Chunking is FEASIBLE")
+            print(f"  Minimum overlap: {dec['min_overlap']} latent pixels")
+            print(f"  Recommended overlap: {dec['recommended_overlap']} latent pixels")
+            print(f"  (= {dec['recommended_overlap'] * dec['spatial_upsampling_factor']} output pixels)")
+
+            # Example chunking scenario
+            chunk_size = max(128, dec['recommended_overlap'] * 4)
+            overlap = dec['recommended_overlap']
+            effective = chunk_size - overlap
+            overhead = (overlap / chunk_size) * 100
+
+            print(f"\n  Example chunking with chunk_size={chunk_size}:")
+            print(f"    Overlap: {overlap} pixels ({overhead:.1f}% overhead)")
+            print(f"    Effective new data: {effective} pixels per chunk")
+
+            print(f"\n  Suggested StreamingDecoder parameters:")
+            print(f"    z_chunk_size = {chunk_size}")
+            print(f"    z_overlap = {overlap}")
+
+        print("\n" + "="*80)

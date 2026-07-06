@@ -7,3 +7,4 @@ from .karrasencoder import *
 from .loader import *
 from .autoencoder import *
 from .vae import *
+from .aux_scripts import *

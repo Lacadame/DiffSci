@@ -1,5 +1,9 @@
-import wandb
-
+try:
+    import wandb
+except ImportError:
+    import warnings
+    warnings.warn("wandb not installed, skipping hyperparameter logging")
+    wandb = None
 
 class HyperparameterManager:
     def __init__(self):

@@ -12,6 +12,8 @@ from .autoencoderldm3d import *
 from .punetg_config import PUNetGConfig
 from .punetg_encdec import PUNetGEncoder, PUNetGDecoder
 from .punetg import PUNetG, PUNetGConfig, PUNetGCond
+from .punetg_deterministic_config import PUNetGDeterministicConfig
+from .punetg_deterministic import PUNetGDeterministic, PUNetGDeterministicCond
 from .adm import ADM, ADMConfig
 from .embedder import (TwoPointCorrelationEmbedder,
                        TwoPointCorrelationTransformer,

@@ -89,6 +89,7 @@ saveddata/processed/*
 saveddata/raw/*
 saveddata/savedsamples/*
 saveddata/MNIST/*
+scripts/testing/data/*
 
 # output data
 outputdata/*
@@ -121,3 +122,9 @@ notebooks/exploratory/*
 repopack-output.txt
 
 */old/*
+
+# Claude
+claude/*
+
+# external repos
+external_repos/

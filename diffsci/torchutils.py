@@ -85,3 +85,225 @@ def dict_squeeze(d, dim):
 def dict_to(d, device):
     f = lambda x: x.to(device)  # noqa: E731
     return dict_map(f, d)
+
+
+def load_submodule(model, checkpoint_path, model_name="model"):
+    checkpoint = torch.load(checkpoint_path)
+    state_dict = checkpoint['state_dict']
+
+    # Create new state dict with modified keys
+    new_state_dict = {}
+    prefix = model_name + "."
+    for key, value in state_dict.items():
+        if key.startswith(prefix):
+            new_key = key[len(prefix):]  # Remove prefix
+            new_state_dict[new_key] = value
+
+    # Load the modified state dict
+    model.load_state_dict(new_state_dict)
+    return model
+
+
+def periodic_getitem(tensor, *indices):
+    """Extract periodic slice from tensor with dimension-by-dimension wrapping.
+
+    Usage:
+        periodic_getitem(a, slice(7, 2), slice(None), slice(3, 1))
+        periodic_getitem(a, slice(7, 2))  # for 1D
+    """
+    if not indices:
+        return tensor
+
+    result = tensor
+    offset = 0  # track dimension offset as we squeeze integer indices
+
+    for dim_orig, idx in enumerate(indices):
+        dim = dim_orig - offset
+
+        if isinstance(idx, slice):
+            size = result.shape[dim]
+            start = idx.start if idx.start is not None else 0
+            stop = idx.stop if idx.stop is not None else size
+            step = idx.step if idx.step is not None else 1
+
+            if abs(start - stop) > size:
+                raise ValueError(f"Slice {idx} is too large for dimension {dim} with size {size}")
+            # Normalize negatives
+            start = start % size if start < 0 else start
+            stop = stop % size if stop < 0 else stop
+
+            # Normalize greater than size
+            start = start % size if start > size else start
+            stop = stop % size if stop > size else stop
+
+            if step == 1 and stop < start:
+                # Wrap around
+                tail = result.narrow(dim, start, size - start)
+                head = result.narrow(dim, 0, stop)
+                result = torch.cat([tail, head], dim=dim)
+            elif step == 1:
+                # Normal slice
+                result = result.narrow(dim, start, max(0, stop - start))
+            else:
+                # With step
+                raise NotImplementedError("Only step=1 supported in periodic_getitem")
+        else:
+            raise TypeError(f"Unsupported index type: {type(idx)}")
+
+    return result
+
+
+def periodic_getitem_extended(tensor, *indices):
+    """Extract periodic slice from tensor, supporting slices larger than dimension size.
+
+    This is an extension of periodic_getitem that handles multi-period slices by tiling.
+    Use this when you need to extract a region larger than the tensor size.
+
+    For example, with a size-3 tensor [0, 1, 2] and slice(-2, 7), returns
+    [1, 2, 0, 1, 2, 0, 1, 2, 0] (9 elements from index -2 to 7).
+
+    Args:
+        tensor: Input tensor
+        indices: Slice objects. Each slice(start, stop) extracts (stop - start) elements
+                 starting from index (start % size), tiling as needed.
+
+    Usage:
+        periodic_getitem_extended(a, slice(-5, 37))  # 42 elements from a size-32 tensor
+        periodic_getitem_extended(a, slice(0, 10), slice(None))  # tile first dim only
+    """
+    if not indices:
+        return tensor
+
+    result = tensor
+
+    for dim, idx in enumerate(indices):
+        if isinstance(idx, slice):
+            size = result.shape[dim]
+            start = idx.start if idx.start is not None else 0
+            stop = idx.stop if idx.stop is not None else size
+            step = idx.step if idx.step is not None else 1
+
+            if step != 1:
+                raise NotImplementedError("Only step=1 supported in periodic_getitem_extended")
+
+            # Number of elements requested
+            n_elements = stop - start
+
+            if n_elements <= 0:
+                # Empty slice
+                result = result.narrow(dim, 0, 0)
+            else:
+                # Normalize start to [0, size)
+                start_norm = start % size
+
+                if n_elements <= size - start_norm:
+                    # Fits in one contiguous chunk from start_norm
+                    result = result.narrow(dim, start_norm, n_elements)
+                elif n_elements <= size:
+                    # Wraps around within one period
+                    tail_len = size - start_norm
+                    head_len = n_elements - tail_len
+                    tail = result.narrow(dim, start_norm, tail_len)
+                    head = result.narrow(dim, 0, head_len)
+                    result = torch.cat([tail, head], dim=dim)
+                else:
+                    # Multi-period: need to tile
+                    first_partial_len = size - start_norm
+                    remaining = n_elements - first_partial_len
+                    n_full_copies = remaining // size
+                    last_partial_len = remaining % size
+
+                    parts = []
+
+                    # First partial (from start_norm to end)
+                    if first_partial_len > 0:
+                        parts.append(result.narrow(dim, start_norm, first_partial_len))
+
+                    # Full copies
+                    for _ in range(n_full_copies):
+                        parts.append(result)
+
+                    # Last partial (from beginning)
+                    if last_partial_len > 0:
+                        parts.append(result.narrow(dim, 0, last_partial_len))
+
+                    result = torch.cat(parts, dim=dim)
+        else:
+            raise TypeError(f"Unsupported index type: {type(idx)}")
+
+    return result
+
+
+# Cleaner version without step support (since you said you don't need it)
+def periodic_setitem(tensor, value, *indices):
+    """Assign to periodic slice in tensor (in-place). Only supports step=1.
+
+    Args:
+        tensor: tensor to modify (in-place)
+        indices: tuple of slice objects (step must be None or 1)
+        value: values to assign
+
+    Usage:
+        periodic_setitem_simple(a, (slice(7, 2),), values)
+        periodic_setitem_simple(a, (slice(7, 2), slice(10, 3)), values)
+    """
+    if not isinstance(indices, tuple):
+        indices = (indices,)
+
+    # Analyze each dimension
+    dim_info = []
+    for dim, idx in enumerate(indices):
+        if not isinstance(idx, slice):
+            raise TypeError(f"Only slice indexing supported, got {type(idx)}")
+
+        size = tensor.shape[dim]
+        start = idx.start if idx.start is not None else 0
+        stop = idx.stop if idx.stop is not None else size
+        step = idx.step if idx.step is not None else 1
+
+        # Note: For setitem, we don't support slices larger than size
+        # because it's ambiguous which period to write to
+        if abs(start - stop) > size:
+            raise ValueError(f"Slice {idx} is too large for dimension {dim} with size {size}. "
+                             "periodic_setitem does not support multi-period writes.")
+
+        if step != 1:
+            raise ValueError("Only step=1 supported in simple version")
+
+        # Normalize negatives
+        start = start % size if start < 0 else start
+        stop = stop % size if stop < 0 else stop
+
+        if stop < start:
+            # Wrapping: [start:] + [:stop]
+            n_tail = size - start
+            n_head = stop
+            dim_info.append([
+                (slice(start, size), slice(0, n_tail)),
+                (slice(0, stop), slice(n_tail, n_tail + n_head))
+            ])
+        else:
+            # Normal
+            n_elements = stop - start
+            dim_info.append([
+                (slice(start, stop), slice(0, n_elements))
+            ])
+
+    # Generate all combinations
+    _assign_combinations(tensor, value, dim_info, 0, [], [])
+
+
+def _assign_combinations(tensor, value, dim_info, current_dim, tensor_slices, value_slices):
+    """Recursively assign to all region combinations."""
+    if current_dim >= len(dim_info):
+        # Execute assignment
+        tensor[tuple(tensor_slices)] = value[tuple(value_slices)]
+        return
+
+    # Iterate through regions for current dimension
+    for tensor_slice, value_slice in dim_info[current_dim]:
+        _assign_combinations(
+            tensor, value, dim_info, current_dim + 1,
+            tensor_slices + [tensor_slice],
+            value_slices + [value_slice]
+        )
