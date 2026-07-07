@@ -258,15 +258,16 @@ end
 klrate_instantaneous_expectation_fwd(τ, μ, σ², p) = klrate_d_mv(τ, μ, σ², p) - klrate_e_mv(τ, μ, σ², p)
 
 # r_e, r_d for dH(p̄_τ|p̃_τ)/dτ (expectations under p̄_τ).
+# With ε(x) = c0 (x - μ₀) + c1 and ∇log(p̃/p̄)(x) = -a (x - μ₀) + d/σ̃²,
+# integrating against p̄ = 𝒩(μ₀, σ̄²) gives the closed forms below.
 function klrate_rev_e_mv(τ, μ, σ², p)
     s̃ = σ²
     s̄ = sigmabarsq(τ, p)
     d = μ - p.μ₀
     a = 1 / s̃ - 1 / s̄
-    b = d / s̄
     c0 = (1 - 1 / p.αθ) / s̄
     c1 = (p.μθ - p.μ₀) / (p.αθ * s̄)
-    c0 * a * (s̄ + d^2) - c1 * a * d + c1 * b
+    -c0 * a * s̄ + c1 * d / s̃
 end
 
 function klrate_rev_d_mv(τ, μ, σ², p)
@@ -274,7 +275,7 @@ function klrate_rev_d_mv(τ, μ, σ², p)
     s̄ = sigmabarsq(τ, p)
     a = 1 / s̃ - 1 / s̄
     d = μ - p.μ₀
-    a^2 * (s̄ + d^2) + d^2 / s̄^2 - 2 * a * d^2 / s̄
+    a^2 * s̄ + d^2 / s̃^2
 end
 
 klrate_instantaneous_expectation_rev(τ, μ, σ², p) =
@@ -1971,6 +1972,25 @@ if runtests
     p_const = (; prms_tst..., γ = 1.0)
     @test klrate_e_mv(0.5, mutilde(0.5, p_const), sigmatildesq(0.5, p_const), prms_tst) ≈ klrate_e(0.5, p_const) (rtol = 1e-10)
     @test klrate_d_mv(0.5, mutilde(0.5, p_const), sigmatildesq(0.5, p_const), prms_tst) ≈ klrate_d(0.5, p_const) (rtol = 1e-10)
+
+    # Check the closed-form rates against direct quadrature of the defining
+    # expectations, for both measures (p̃ for fwd, p̄ for rev).
+    let τ = 0.5, μ̃ = mutilde(0.5, p_const), σ̃² = sigmatildesq(0.5, p_const)
+        s̄ = sigmabarsq(τ, prms_tst)
+        ε(x) = -(x - prms_tst.μθ) / (prms_tst.αθ * s̄) + (x - prms_tst.μ₀) / s̄
+        ∇logh(x) = -(x - μ̃) / σ̃² + (x - prms_tst.μ₀) / s̄
+        quadrature(f, dist) = begin
+            lo, hi = mean(dist) - 12std(dist), mean(dist) + 12std(dist)
+            xs = range(lo, hi, length = 200_001)
+            sum(x -> f(x) * pdf(dist, x), xs) * step(xs)
+        end
+        p̃ = Normal(μ̃, √σ̃²)
+        p̄ = Normal(prms_tst.μ₀, √s̄)
+        @test klrate_e_mv(τ, μ̃, σ̃², prms_tst) ≈ quadrature(x -> ε(x) * ∇logh(x), p̃) (rtol = 1e-6)
+        @test klrate_d_mv(τ, μ̃, σ̃², prms_tst) ≈ quadrature(x -> ∇logh(x)^2, p̃) (rtol = 1e-6)
+        @test klrate_rev_e_mv(τ, μ̃, σ̃², prms_tst) ≈ quadrature(x -> ε(x) * ∇logh(x), p̄) (rtol = 1e-6)
+        @test klrate_rev_d_mv(τ, μ̃, σ̃², prms_tst) ≈ quadrature(x -> ∇logh(x)^2, p̄) (rtol = 1e-6)
+    end
 end
 
 if runtests 
