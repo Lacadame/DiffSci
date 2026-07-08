@@ -248,6 +248,13 @@ def compute_entropies_for_checkpoint(
     return gamma_values, sde_entropies, inv_sde_entropies
 
 
+def score_coords(x, t, scheduler_fns):
+    """Input coordinates for score_fn, matching Scheduler.rhs."""
+    if scheduler_fns.constant_scaling_fn:
+        return x
+    return x / scheduler_fns.scaling_fn(t)
+
+
 def error_norm_single_step(
     module,
     step: int,
@@ -263,18 +270,19 @@ def error_norm_single_step(
     t = time[step]
     sigma_scalar = scheduler.scheduler_fns.noise_fn(t)
     sigma = sigma_scalar * torch.ones(x.shape[0])
-    s = scheduler.scheduler_fns.scaling_fn(t)
 
     x_ = x.to(module.device)
     sigma_ = sigma.to(x_)
 
     with torch.no_grad():
-        score = module.get_score(x_ / s, sigma_)
-        analytic_score = dataset.gradlogprob(x / s, sigma).to(score)
+        x_score = score_coords(x_, t, scheduler.scheduler_fns)
+        score = module.get_score(x_score, sigma_)
+        x_score_cpu = score_coords(x, t, scheduler.scheduler_fns)
+        analytic_score = dataset.gradlogprob(x_score_cpu, sigma).to(score)
         score_error = torch.mean((score - analytic_score) ** 2).cpu().item()
 
         x_0 = sde_history[-1, :datasize].cpu()
-        denoiser, _ = module.get_denoiser(x_ / s, sigma_)
+        denoiser, _ = module.get_denoiser(x_score, sigma_)
         denoiser = denoiser.detach().cpu()
         dsm_loss = (torch.mean((denoiser - x_0) ** 2) / sigma_scalar ** 4).item()
 
