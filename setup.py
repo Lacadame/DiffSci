@@ -14,6 +14,7 @@ setup(
     name='diffsci',
     packages=find_packages(),
     install_requires=parse_requirements('requirements.txt'),
+    extras_require={'notebooks': ['jupytext>=1.19,<2']},
     version='0.1.0',
     description='Diffusion models for scientific applications',
     author='UFRJ',

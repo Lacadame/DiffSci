@@ -128,3 +128,9 @@ claude/*
 
 # external repos
 external_repos/
+
+# Generated paper analysis figures, tables, and caches
+/paper_odds/outputs/
+
+# Local paper notebooks; track their Jupytext .py sources instead
+/paper_odds/**/*.ipynb

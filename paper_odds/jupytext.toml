@@ -1,0 +1,4 @@
+# Save notebook inputs beside the local notebook; only the .py file is tracked.
+formats = "ipynb,py:percent"
+notebook_metadata_filter = "all,-widgets,-signature"
+cell_metadata_filter = "all,-execution,-ExecuteTime,-trusted"

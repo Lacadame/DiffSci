@@ -7,6 +7,9 @@ Diffusion models for scientific and engineering applications
 
 For a tutorial, see notebooks/tutorials/0001-basic-usage.ipynb.
 
+For the `paper_odds` notebook source, sync, and rebuild workflow, see the
+[notebook instructions](paper_odds/score_error_analysis/README.md#notebook-sources-and-rebuilding).
+
 
 ==============================
 
