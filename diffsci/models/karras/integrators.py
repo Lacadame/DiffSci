@@ -77,12 +77,21 @@ class KarrasIntegrator(Integrator):
                  s_schurn: float = 40,  # parameters for EDM (fig. 5, App. E.1)
                  s_tmin: float = 0.05,
                  s_tmax: float = 50,
-                 s_noise: float = 1.003) -> None:
+                 s_noise: float = 1.003,
+                 churn_cap: float | None = np.sqrt(2)-1) -> None:
+        """EDM churn and Heun correction; ``churn_cap=None`` disables clipping."""
         super().__init__()
+        if churn_cap is not None and (not np.isfinite(churn_cap) or churn_cap < 0):
+            raise ValueError("churn_cap must be finite and nonnegative, or None")
         self.s_schurn = s_schurn
         self.s_tmin = s_tmin
         self.s_tmax = s_tmax
         self.s_noise = s_noise
+        self.churn_cap = churn_cap
+
+    def _churn_noise(self, x):
+        """Independent standard normals; exploratory variants may override this."""
+        return torch.randn_like(x)
 
     def step(self, x: Float[Tensor, "batch *shape"],  # noqa: F821
              t: Float[Tensor, ""],  # noqa: F722
@@ -91,7 +100,9 @@ class KarrasIntegrator(Integrator):
              scheduler_fns: schedulingfunctions.SchedulingFunctions,
              noise_strength: None | Any = None,  # TODO: Complete this type
              nsteps: int = 100):
-        backstep = min(self.s_schurn/nsteps, np.sqrt(2)-1)
+        backstep = self.s_schurn/nsteps
+        if self.churn_cap is not None:
+            backstep = min(backstep, self.churn_cap)
         if self.s_tmin is not None:
             if not self.s_tmin <= t <= self.s_tmax:
                 backstep = 0
@@ -102,7 +113,7 @@ class KarrasIntegrator(Integrator):
         scale_noise = scheduler_fns.scaling_fn(t_noise)
         std = scale_noise * torch.sqrt(sigma_noise**2 - sigma**2)
         x_noise = ((scale_noise/scale)*x +
-                   std * self.s_noise * torch.randn_like(x))
+                   std * self.s_noise * self._churn_noise(x))
 
         rhs_euler = rhs(x_noise, t_noise)
         dt_noise = (t+dt) - t_noise
